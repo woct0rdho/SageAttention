@@ -140,7 +140,7 @@ def sageattn(
     """
         
     arch = get_cuda_arch_versions()[q.device.index]
-    if arch == "sm80":
+    if arch in {"sm75", "sm80"}:
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
     elif arch == "sm86":
         return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
