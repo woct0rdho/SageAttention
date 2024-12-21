@@ -58,12 +58,18 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
   static_assert(K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp || K_GRAN == QuantGranularity::kPerThread, "K_GRAN must be kPerBlock, kPerWarp or kPerThread");
   static_assert(std::is_same<DTypeSVAccum, float>::value || !use_inst_buffer, "use_inst_buffer only supports DTypeSVAccum as float");
   static_assert(std::is_same<DTypeSVAccum, float>::value || std::is_same<DTypeSVAccum, half>::value, "DTypeSVAccum must be float or half");
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 800)
   static_assert(std::is_same<DTypeOut, half>::value || std::is_same<DTypeOut, nv_bfloat16>::value, "DTypeOut must be half or nv_bfloat16");
+#else
+  static_assert(std::is_same<DTypeOut, half>::value, "DTypeOut must be half");
+#endif
   static_assert(head_dim % 64 == 0, "head_dim must be a multiple of 64");
   static_assert(!fuse_v_mean || std::is_same<DTypeSVAccum, half>::value, "fuse_v_mean only supports half");
   static_assert(CTA_Q / CTA_K <= 2); // for efficient causal implementation
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 800)
   using DTypeOut2 = typename std::conditional<std::is_same<DTypeOut, half>::value, half2, nv_bfloat162>::type;
+#endif
 
   constexpr uint32_t num_warps_q = CTA_Q / WARP_Q;
   constexpr uint32_t num_warps_k = CTA_K / WARP_K;
@@ -144,7 +150,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
       {
 #pragma unroll
         for (uint32_t k = 0; k < 8; k++)
-        {        
+        {
           RO[fq][fv][k] = 0.0f;
         }
       }
@@ -342,7 +348,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
     else
     {
       compute_fp16_sv_permuted_inst_buf<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
-        smem_V, RS_f16, RO, d, V_smem_offset_mma); 
+        smem_V, RS_f16, RO, d, V_smem_offset_mma);
     }
 
     __syncthreads();
@@ -353,7 +359,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
     K_load_idx_lane_base += CTA_K;
     V_load_idx_lane_base += CTA_K;
   }
-  
+
   // second last iter, apply causal mask
   if (num_iterations > 1)
   {
@@ -543,6 +549,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
   // if (get_warp_idx_k<num_warps_q, num_warps_k>() == 0)
   // {
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 800)
   // convert half to bfloat16
   if constexpr (std::is_same<DTypeSVAccum, half>::value && std::is_same<DTypeOut, nv_bfloat16>::value)
   {
@@ -580,6 +587,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
       }
     }
   }
+#endif
 
   // save the result to shared memory
   uint32_t smem_O_row_base = get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / 4;
@@ -597,15 +605,17 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
         uint32_t RO_f16[4];
 #pragma unroll
         for (uint32_t k = 0; k < 4; k++)
-        { 
+        {
           if constexpr (std::is_same<DTypeOut, half>::value)
           {
             ((half2*)RO_f16)[k] = __float22half2_rn(((float2*)RO[fq][fv])[k]);
           }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 800)
           else if constexpr (std::is_same<DTypeOut, nv_bfloat16>::value)
           {
             ((nv_bfloat162*)RO_f16)[k] = __float22bfloat162_rn(((float2*)RO[fq][fv])[k]);
           }
+#endif
         }
 
         ((uint32_t*)(smem_O.base + offset_O))[lane_id % 4] = RO_f16[0];
@@ -622,7 +632,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
 
         // ! permuted, make sure you know what you are doing
         ((uint32_t*)(smem_O.base + (offset_O ^ 0x1)))[lane_id % 4] = ((uint32_t*)RO[fq][fv])[2];
-        ((uint32_t*)(smem_O.base + (offset_O ^ 0x1) + 8 * (O_SMEM_STRIDE / PACK_SIZE_O)))[lane_id % 4] = ((uint32_t*)RO[fq][fv])[3]; 
+        ((uint32_t*)(smem_O.base + (offset_O ^ 0x1) + 8 * (O_SMEM_STRIDE / PACK_SIZE_O)))[lane_id % 4] = ((uint32_t*)RO[fq][fv])[3];
       }
     }
   }
@@ -655,7 +665,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
   }
 
   if constexpr (return_lse)
-  { 
+  {
     uint32_t lse_idx = bx * CTA_Q + lane_id / 4 + 8 * (lane_id % 4) + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>();
     float *lse_lane_ptr = Lse + batch_id * (qo_len * num_qo_heads) + head_id * qo_len + lse_idx;
     uint32_t fq = (lane_id % 4) / 2;
@@ -768,7 +778,7 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn(torch::Tensor query,
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads (" << num_qo_heads << ") must be divisible by num_kv_heads (" << num_kv_heads << ")";
-    throw std::invalid_argument(err_msg.str());  
+    throw std::invalid_argument(err_msg.str());
   }
 
   const int num_kv_groups = num_qo_heads / num_kv_heads;
@@ -810,8 +820,8 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn(torch::Tensor query,
 
             //                                     smem_Q                                     smem_K                            smem_V                     smem_O
             size_t smem_max = std::max(CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(half), CTA_Q * HEAD_DIM * sizeof(half));
-            
-            auto kernel_func = qk_int_sv_f16_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), float, false, DTypeOut, ComputeUnit::kTensorCore, 
+
+            auto kernel_func = qk_int_sv_f16_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), float, false, DTypeOut, ComputeUnit::kTensorCore,
                                                           mask_mode, RETURN_LSE, false>;
 
             cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
@@ -820,7 +830,7 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn(torch::Tensor query,
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
 
             kernel_func<<<grid, block, smem_max>>>(
-              query.data_ptr<int8_t>(), 
+              query.data_ptr<int8_t>(),
               key.data_ptr<int8_t>(),
               reinterpret_cast<half*>(value.data_ptr()),
               reinterpret_cast<DTypeOut*>(output.data_ptr()),
@@ -942,7 +952,7 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads (" << num_qo_heads << ") must be divisible by num_kv_heads (" << num_kv_heads << ")";
-    throw std::invalid_argument(err_msg.str());  
+    throw std::invalid_argument(err_msg.str());
   }
 
   torch::Tensor lse = torch::empty({0});
@@ -960,7 +970,7 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
       DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
         DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
           DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
-              
+
             constexpr int CTA_Q = 128;
             constexpr int CTA_K = 64;
             constexpr int WARP_Q = 32;
@@ -985,8 +995,8 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
 
             //                                     smem_Q                                     smem_K                            smem_V                     smem_O
             size_t smem_max = std::max(CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(half), CTA_Q * HEAD_DIM * sizeof(half));
-            
-            auto kernel_func = qk_int_sv_f16_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), half, false, DTypeOut, ComputeUnit::kTensorCore, 
+
+            auto kernel_func = qk_int_sv_f16_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), half, false, DTypeOut, ComputeUnit::kTensorCore,
                                                           mask_mode, RETURN_LSE, false>;
 
             cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
@@ -995,7 +1005,7 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
 
             kernel_func<<<grid, block, smem_max>>>(
-              query.data_ptr<int8_t>(), 
+              query.data_ptr<int8_t>(),
               key.data_ptr<int8_t>(),
               reinterpret_cast<half*>(value.data_ptr()),
               reinterpret_cast<DTypeOut*>(output.data_ptr()),
@@ -1016,7 +1026,7 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
       });
     });
   });
-  
+
   return lse;
 }
 
@@ -1117,7 +1127,7 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads (" << num_qo_heads << ") must be divisible by num_kv_heads (" << num_kv_heads << ")";
-    throw std::invalid_argument(err_msg.str());  
+    throw std::invalid_argument(err_msg.str());
   }
 
   torch::Tensor lse = torch::empty({0});
@@ -1135,7 +1145,7 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
       DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
         DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
           DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
-              
+
             constexpr int CTA_Q = 128;
             constexpr int CTA_K = 64;
             constexpr int WARP_Q = (HEAD_DIM == 64) ? 32 : 16;
@@ -1160,8 +1170,8 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
 
             //                                     smem_Q                                     smem_K                            smem_V                     smem_O
             size_t smem_max = std::max(CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(half), CTA_Q * HEAD_DIM * sizeof(half));
-            
-            auto kernel_func = qk_int_sv_f16_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), float, true, DTypeOut, ComputeUnit::kTensorCore, 
+
+            auto kernel_func = qk_int_sv_f16_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), float, true, DTypeOut, ComputeUnit::kTensorCore,
                                                           mask_mode, RETURN_LSE, false>;
 
             cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
@@ -1170,7 +1180,7 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
 
             kernel_func<<<grid, block, smem_max>>>(
-              query.data_ptr<int8_t>(), 
+              query.data_ptr<int8_t>(),
               key.data_ptr<int8_t>(),
               reinterpret_cast<half*>(value.data_ptr()),
               reinterpret_cast<DTypeOut*>(output.data_ptr()),
@@ -1191,7 +1201,7 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
       });
     });
   });
-  
+
   return lse;
 }
 
@@ -1296,7 +1306,7 @@ torch::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(torch::Tensor query,
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads (" << num_qo_heads << ") must be divisible by num_kv_heads (" << num_kv_heads << ")";
-    throw std::invalid_argument(err_msg.str());  
+    throw std::invalid_argument(err_msg.str());
   }
 
   torch::Tensor lse = torch::empty({0});
@@ -1317,7 +1327,7 @@ torch::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(torch::Tensor query,
       DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
         DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
           DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
-              
+
             constexpr int CTA_Q = 128;
             constexpr int CTA_K = 64;
             constexpr int WARP_Q = 32;
@@ -1344,8 +1354,8 @@ torch::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(torch::Tensor query,
 
             //                                     smem_Q                                     smem_K                            smem_V                     smem_O
             size_t smem_max = std::max(CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(half), CTA_Q * HEAD_DIM * sizeof(half));
-            
-            auto kernel_func = qk_int_sv_f16_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), half, false, DTypeOut, ComputeUnit::kTensorCore, 
+
+            auto kernel_func = qk_int_sv_f16_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), half, false, DTypeOut, ComputeUnit::kTensorCore,
                                                           mask_mode, RETURN_LSE, true>;
 
             cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
@@ -1354,7 +1364,7 @@ torch::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(torch::Tensor query,
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
 
             kernel_func<<<grid, block, smem_max>>>(
-              query.data_ptr<int8_t>(), 
+              query.data_ptr<int8_t>(),
               key.data_ptr<int8_t>(),
               reinterpret_cast<half*>(value.data_ptr()),
               reinterpret_cast<DTypeOut*>(output.data_ptr()),

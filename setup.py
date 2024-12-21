@@ -149,7 +149,7 @@ if not SKIP_CUDA_BUILD:
         NVCC_FLAGS += NVCC_FLAGS_COMMON
         return NVCC_FLAGS
 
-    if has_capability(("8.0", "8.6", "8.7")):
+    if has_capability(("7.5", "8.0", "8.6", "8.7")):
         ext_modules.append(
             CUDAExtension(
                 name="sageattention._qattn_sm80",
@@ -160,7 +160,7 @@ if not SKIP_CUDA_BUILD:
                 extra_compile_args={
                     "cxx": CXX_FLAGS,
                     # Build binary for sm80 if sm86/87 is detected. No need to build binary for sm86/87
-                    "nvcc": get_nvcc_flags(["8.0"]),
+                    "nvcc": get_nvcc_flags(["7.5", "8.0"]),
                 },
             )
         )
@@ -211,7 +211,7 @@ if not SKIP_CUDA_BUILD:
             ],
             extra_compile_args={
                 "cxx": CXX_FLAGS,
-                "nvcc": get_nvcc_flags(["8.0", "8.9", "9.0", "10.0", "12.0", "12.1"]),
+                "nvcc": get_nvcc_flags(["7.5", "8.0", "8.9", "9.0", "10.0", "12.0", "12.1"]),
             },
         )
     )
