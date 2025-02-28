@@ -3,7 +3,7 @@
  * Copyright (c) 2023 by FlashInfer team.
  *
  * Modifications copyright (c) 2024 by SageAttention team.
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -53,7 +53,11 @@ namespace mma{
 #endif
 
 #if defined(__CUDA_ARCH__)
+#if __CUDA_ARCH__ >= 800
 #define RUNTIME_ASSERT(x) __brkpt()
+#else
+#define RUNTIME_ASSERT(x) do {} while(0)  // Do nothing at runtime
+#endif
 #else
 #include <assert.h>
 #define RUNTIME_ASSERT(x) assert(0 && x)
@@ -581,7 +585,7 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f16(uint32_t* C_u
         "{%8,  %9};\n"
         : "=r"(C_uint32[0]), "=r"(C_uint32[1])
         : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]), "r"(C_uint32[0]), "r"(C_uint32[1]));
-    
+
     asm volatile(
         "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 "
         "{%0,  %1},"
@@ -641,7 +645,7 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
         : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
         : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]), "f"(C[0]), "f"(C[1]),
           "f"(C[2]), "f"(C[3]));
-    
+
     asm volatile(
         "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
         "{%0,  %1,  %2,  %3},"
