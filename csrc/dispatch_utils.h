@@ -72,7 +72,8 @@
     throw std::invalid_argument(err_msg.str());                  \
   }
 
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                \
+// Macro that supports both FP16 and BFloat16 (for SM_80 and above)
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16_FULL(pytorch_dtype, c_type, ...)           \
   if (pytorch_dtype == at::ScalarType::Half) {                                          \
     using c_type = half;                                                                \
     __VA_ARGS__                                                                         \
@@ -84,6 +85,23 @@
     oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype;    \
     TORCH_CHECK(false, oss.str());                                                      \
   }
+
+// Macro that only supports FP16 (for SM_75 and below)
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16_RESTRICTED(pytorch_dtype, c_type, ...)     \
+  if (pytorch_dtype == at::ScalarType::Half) {                                          \
+    using c_type = half;                                                                \
+    __VA_ARGS__                                                                         \
+  } else {                                                                              \
+    std::ostringstream oss;                                                             \
+    oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype;    \
+    TORCH_CHECK(false, oss.str());                                                      \
+  }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16 DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16_FULL
+#else
+  #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16 DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16_RESTRICTED
+#endif
 
 #define DISPATCH_BLOCK_SIZE(block_size, BLOCK_SIZE, ...)        \
   if (block_size == 64) {                                       \
