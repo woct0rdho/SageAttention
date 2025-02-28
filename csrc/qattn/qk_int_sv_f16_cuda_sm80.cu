@@ -83,7 +83,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
   constexpr uint32_t O_SMEM_STRIDE = head_dim;
   constexpr uint32_t V_SMEM_STRIDE = head_dim;
 
-  extern __shared__ int8_t smem[];
+  __align__(16) extern __shared__ int8_t smem[];
 
   const uint32_t lane_id = get_lane_id();
   const uint32_t warp_id = get_warp_id();
@@ -318,7 +318,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
       accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
     }
 
-    uint32_t RS_f16[num_tiles_q][num_tiles_k][4];
+    uint32_t RS_f16[num_tiles_q][num_tiles_k][4] = {{{0}}};
     RS_32_to_16<num_tiles_q, num_tiles_k>(RS_f32, RS_f16);
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kTensorCore)
@@ -416,7 +416,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
       accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
     }
 
-    uint32_t RS_f16[num_tiles_q][num_tiles_k][4];
+    uint32_t RS_f16[num_tiles_q][num_tiles_k][4] = {{{0}}};
     RS_32_to_16<num_tiles_q, num_tiles_k>(RS_f32, RS_f16);
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kTensorCore)
@@ -514,7 +514,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
       accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
     }
 
-    uint32_t RS_f16[num_tiles_q][num_tiles_k][4];
+    uint32_t RS_f16[num_tiles_q][num_tiles_k][4] = {{{0}}};
     RS_32_to_16<num_tiles_q, num_tiles_k>(RS_f32, RS_f16);
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kTensorCore)
@@ -523,7 +523,10 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
     }
 
     // ensure V is ready
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    // TODO: Check if this is needed
     cp_async::wait_group<0>();
+#endif
     __syncthreads();
 
     if constexpr (!use_inst_buffer)
@@ -602,7 +605,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
       if constexpr (std::is_same<DTypeSVAccum, float>::value)
       {
         // convert RO to half
-        uint32_t RO_f16[4];
+        uint32_t RO_f16[4] = {0, 0, 0, 0};
 #pragma unroll
         for (uint32_t k = 0; k < 4; k++)
         {
@@ -971,10 +974,10 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
         DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
           DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
 
-            constexpr int CTA_Q = 128;
-            constexpr int CTA_K = 64;
-            constexpr int WARP_Q = 32;
-            constexpr int WARP_K = 64;
+            constexpr int CTA_Q = (HEAD_DIM == 256) ? 64 : 128;
+            constexpr int CTA_K = (HEAD_DIM == 256) ? 32 : 64;
+            constexpr int WARP_Q = (HEAD_DIM == 256) ? 16 : 32;
+            constexpr int WARP_K = (HEAD_DIM == 256) ? 32 : 64;
 
             constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
 
@@ -996,10 +999,25 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
             //                                     smem_Q                                     smem_K                            smem_V                     smem_O
             size_t smem_max = std::max(CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(half), CTA_Q * HEAD_DIM * sizeof(half));
 
+            cudaError_t pre_launch_error = cudaGetLastError();
+            if (pre_launch_error != cudaSuccess) {
+                std::cerr << "CUDA error before kernel launch: " << cudaGetErrorString(pre_launch_error) << std::endl;
+            }
+
             auto kernel_func = qk_int_sv_f16_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), half, false, DTypeOut, ComputeUnit::kTensorCore,
                                                           mask_mode, RETURN_LSE, false>;
 
+            cudaError_t pre_launch_error2 = cudaGetLastError();
+            if (pre_launch_error2 != cudaSuccess) {
+                std::cerr << "CUDA error before kernel launch2: " << cudaGetErrorString(pre_launch_error2) << std::endl;
+            }
+
             cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+
+            cudaError_t pre_launch_error3 = cudaGetLastError();
+            if (pre_launch_error3 != cudaSuccess) {
+                std::cerr << "CUDA error before kernel launch3: " << cudaGetErrorString(pre_launch_error3) << std::endl;
+            }
 
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
@@ -1021,6 +1039,13 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
               stride_bz_v, stride_seq_v, stride_h_v,
               stride_bz_o, stride_seq_o, stride_h_o,
               sm_scale);
+
+            cudaError_t error = cudaGetLastError();
+            if (error != cudaSuccess) {
+                std::cerr << "CUDA kernel launch! failed with error: " << cudaGetErrorString(error) << std::endl;
+                // You might want to throw an exception or handle the error more gracefully here
+                throw std::runtime_error("CUDA kernel! launch failed");
+            }
           });
         });
       });
