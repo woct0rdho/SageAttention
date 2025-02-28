@@ -2,7 +2,7 @@
  * Copyright (c) 2024 by SageAttention team.
  *
  * Inspired by CUTLASS, https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/numeric_conversion.h
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -30,7 +30,11 @@
 #endif
 
 #if defined(__CUDA_ARCH__)
+#if __CUDA_ARCH__ >= 800
 #define RUNTIME_ASSERT(x) __brkpt()
+#else
+#define RUNTIME_ASSERT(x) do {} while(0)  // Do nothing at runtime
+#endif
 #else
 #include <assert.h>
 #define RUNTIME_ASSERT(x) assert(0 && x)
