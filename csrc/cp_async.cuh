@@ -46,6 +46,10 @@ enum class PrefetchMode {
 __device__ __forceinline__ void commit_group() {
 #ifdef CP_ASYNC_ENABLED
   asm volatile("cp.async.commit_group;\n" ::);
+#else
+  // For SM75, we might need some form of barrier to ensure copies are visible
+  // Adding a lightweight fence
+  __threadfence_block();
 #endif
 }
 
@@ -57,6 +61,9 @@ template <size_t n>
 __device__ __forceinline__ void wait_group() {
 #ifdef CP_ASYNC_ENABLED
   asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
+#else
+  // For SM75, we don't need to wait as we're using synchronous copies
+  __syncthreads();  // Add a barrier for safety
 #endif
 }
 
