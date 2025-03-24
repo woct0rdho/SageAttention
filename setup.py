@@ -197,7 +197,7 @@ ext_modules.append(fused_extension)
 
 setup(
     name='sageattention',
-    version='2.1.1',
+    version='2.1.1' + os.environ.get("SAGEATTENTION_WHEEL_VERSION_SUFFIX", ""),
     author='SageAttention team',
     license='Apache 2.0 License',
     description='Accurate and efficient plug-and-play low-bit attention.',
