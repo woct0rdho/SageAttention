@@ -41,7 +41,7 @@ if os.name == "nt":
 else:
     CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
     EXTRA_LINK_ARGS = ["-lcuda"]
-NVCC_FLAGS = [
+NVCC_FLAGS_COMMON = [
     "-O3",
     "-std=c++17",
     "-U__CUDA_NO_HALF_OPERATORS__",
@@ -54,7 +54,7 @@ NVCC_FLAGS = [
 
 ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0
 CXX_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
-NVCC_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
+NVCC_FLAGS_COMMON += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
 
 if CUDA_HOME is None:
     raise RuntimeError(
@@ -72,21 +72,25 @@ def get_nvcc_cuda_version(cuda_dir: str) -> Version:
     nvcc_cuda_version = parse(output[release_idx].split(",")[0])
     return nvcc_cuda_version
 
-# Iterate over all GPUs on the current machine. Also you can modify this part to specify the architecture if you want to build for specific GPU architectures.
 compute_capabilities = set()
-device_count = torch.cuda.device_count()
-for i in range(device_count):
-    major, minor = torch.cuda.get_device_capability(i)
-    if major < 8:
-        warnings.warn(f"skipping GPU {i} with compute capability {major}.{minor}")
-        continue
-    compute_capabilities.add(f"{major}.{minor}")
+if os.getenv("SAGEATTENTION_CUDA_ARCH_LIST"):
+    for x in os.getenv("SAGEATTENTION_CUDA_ARCH_LIST").split():
+        compute_capabilities.add(x)
+else:
+    # Iterate over all GPUs on the current machine.
+    device_count = torch.cuda.device_count()
+    for i in range(device_count):
+        major, minor = torch.cuda.get_device_capability(i)
+        if major < 8:
+            warnings.warn(f"skipping GPU {i} with compute capability {major}.{minor}")
+            continue
+        compute_capabilities.add(f"{major}.{minor}")
 
 nvcc_cuda_version = get_nvcc_cuda_version(CUDA_HOME)
 if not compute_capabilities:
-    raise RuntimeError("No GPUs found. Please specify the target GPU architectures or build on a machine with GPUs.")
+    raise RuntimeError("No GPUs found. Please specify SAGEATTENTION_CUDA_ARCH_LIST or build on a machine with GPUs.")
 else:
-    print(f"Detect GPUs with compute capabilities: {compute_capabilities}")
+    print(f"Detected compute capabilities: {compute_capabilities}")
 
 # Validate the NVCC CUDA version.
 if nvcc_cuda_version < Version("12.0"):
@@ -101,30 +105,43 @@ if nvcc_cuda_version < Version("12.8") and any(cc.startswith("12.0") for cc in c
     raise RuntimeError(
         "CUDA 12.8 or higher is required for compute capability 12.0.")
 
-# Add target compute capabilities to NVCC flags.
 for capability in compute_capabilities:
     if capability.startswith("8.0"):
         HAS_SM80 = True
-        num = "80"
     elif capability.startswith("8.6"):
         HAS_SM86 = True
-        num = "86"
     elif capability.startswith("8.9"):
         HAS_SM89 = True
-        num = "89"
     elif capability.startswith("9.0"):
         HAS_SM90 = True
-        num = "90a" # need to use sm90a instead of sm90 to use wgmma ptx instruction.
     elif capability.startswith("12.0"):
         HAS_SM120 = True
-        num = "120" # need to use sm120a to use mxfp8/mxfp4/nvfp4 instructions.
-    NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=sm_{num}"]
-    if capability.endswith("+PTX"):
-        NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=compute_{num}"]
+
+# Add target compute capabilities to NVCC flags.
+def get_nvcc_flags(allowed_nums):
+    NVCC_FLAGS = []
+    for capability in compute_capabilities:
+        if capability.startswith("8.0"):
+            num = "80"
+        elif capability.startswith("8.6"):
+            num = "86"
+        elif capability.startswith("8.9"):
+            num = "89"
+        elif capability.startswith("9.0"):
+            num = "90a" # need to use sm90a instead of sm90 to use wgmma ptx instruction.
+        elif capability.startswith("12.0"):
+            num = "120" # need to use sm120a to use mxfp8/mxfp4/nvfp4 instructions.
+        if num not in allowed_nums:
+            continue
+        NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=sm_{num}"]
+        if capability.endswith("+PTX"):
+            NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=compute_{num}"]
+    NVCC_FLAGS += NVCC_FLAGS_COMMON
+    return NVCC_FLAGS
 
 ext_modules = []
 
-if HAS_SM80 or HAS_SM86 or HAS_SM89 or HAS_SM90 or HAS_SM120:
+if HAS_SM80:
     qattn_extension = CUDAExtension(
         name="sageattention._qattn_sm80",
         sources=[
@@ -133,7 +150,7 @@ if HAS_SM80 or HAS_SM86 or HAS_SM89 or HAS_SM90 or HAS_SM120:
         ],
         extra_compile_args={
             "cxx": CXX_FLAGS,
-            "nvcc": NVCC_FLAGS,
+            "nvcc": get_nvcc_flags(["80"]),
         },
     )
     ext_modules.append(qattn_extension)
@@ -147,7 +164,7 @@ if HAS_SM89 or HAS_SM120:
         ],
         extra_compile_args={
             "cxx": CXX_FLAGS,
-            "nvcc": NVCC_FLAGS,
+            "nvcc": get_nvcc_flags(["89", "120"]),
         },
     )
     ext_modules.append(qattn_extension)
@@ -161,7 +178,7 @@ if HAS_SM90:
         ],
         extra_compile_args={
             "cxx": CXX_FLAGS,
-            "nvcc": NVCC_FLAGS,
+            "nvcc": get_nvcc_flags(["90a"]),
         },
         extra_link_args=EXTRA_LINK_ARGS,
     )
@@ -173,20 +190,20 @@ fused_extension = CUDAExtension(
     sources=["csrc/fused/pybind.cpp", "csrc/fused/fused.cu"],
     extra_compile_args={
         "cxx": CXX_FLAGS,
-        "nvcc": NVCC_FLAGS,
+        "nvcc": get_nvcc_flags(["80"]),
     },
 )
 ext_modules.append(fused_extension)
 
 setup(
-    name='sageattention', 
-    version='2.1.1',  
+    name='sageattention',
+    version='2.1.1',
     author='SageAttention team',
-    license='Apache 2.0 License',  
-    description='Accurate and efficient plug-and-play low-bit attention.',  
-    long_description=open('README.md', encoding='utf-8').read(),  
-    long_description_content_type='text/markdown', 
-    url='https://github.com/thu-ml/SageAttention', 
+    license='Apache 2.0 License',
+    description='Accurate and efficient plug-and-play low-bit attention.',
+    long_description=open('README.md', encoding='utf-8').read(),
+    long_description_content_type='text/markdown',
+    url='https://github.com/thu-ml/SageAttention',
     packages=find_packages(),
     python_requires='>=3.9',
     ext_modules=ext_modules,
