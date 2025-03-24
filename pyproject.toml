@@ -1,9 +1,6 @@
 [build-system]
 requires = [
-    "fsspec",
-    "Jinja2",
-    "networkx",
     "numpy",
     "setuptools",
-    "sympy",
+    "torch",
 ]

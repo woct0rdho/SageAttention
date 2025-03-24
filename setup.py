@@ -14,30 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# TODO: Properly install the specific torch version in cibuildwheel
-import importlib
-import os
-import subprocess
-
-CUDA_MINOR_VERSION = os.getenv("CUDA_MINOR_VERSION", "6")
-TORCH_MINOR_VERSION = os.getenv("TORCH_MINOR_VERSION", "6")
-TORCH_PATCH_VERSION = os.getenv("TORCH_PATCH_VERSION", "0")
-TORCH_PATCH_VERSION_NEXT = str(int(TORCH_PATCH_VERSION) + 1)
-TORCH_VERSION = f"2.{TORCH_MINOR_VERSION}.{TORCH_PATCH_VERSION}"
-TORCH_VERSION_NEXT = f"2.{TORCH_MINOR_VERSION}.{TORCH_PATCH_VERSION_NEXT}"
-print("======= Begin dirty hack to install torch =======")
-print("where python")
-subprocess.run("where python")
-print("where python3")
-subprocess.run("where python3")
-if os.getenv("TORCH_IS_NIGHTLY") == "1":
-    # TORCH_VERSION_NEXT is needed to find the latest nightly version with the given patch version
-    subprocess.run(f"python -m pip install --no-deps --pre torch>={TORCH_VERSION},<{TORCH_VERSION_NEXT} --index-url https://download.pytorch.org/whl/nightly/cu12{CUDA_MINOR_VERSION}")
-else:
-    subprocess.run(f"python -m pip install --no-deps torch=={TORCH_VERSION} --index-url https://download.pytorch.org/whl/cu12{CUDA_MINOR_VERSION}")
-importlib.invalidate_caches()
-print("======= End dirty hack to install torch =======")
-
 import os
 import subprocess
 from packaging.version import parse, Version
@@ -221,7 +197,7 @@ ext_modules.append(fused_extension)
 
 setup(
     name='sageattention',
-    version=f'2.1.1+cu12{CUDA_MINOR_VERSION}torch2.{TORCH_MINOR_VERSION}.{TORCH_PATCH_VERSION}',
+    version='2.1.1' + os.environ.get("SAGEATTENTION_WHEEL_VERSION_SUFFIX", ""),
     author='SageAttention team',
     license='Apache 2.0 License',
     description='Accurate and efficient plug-and-play low-bit attention.',
