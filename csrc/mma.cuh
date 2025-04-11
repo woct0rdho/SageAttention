@@ -690,7 +690,120 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_s8s8s32(int32_t* C, u
           "r"(0), "r"(0));
   }
 #else  // SM_75 fallback path
-  RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction"); //this
+  // Emulate m16n16k32 using eight m8n8k16 instructions (4 for spatial tiles x 2 for K dimension)
+  // Assumes A layout: A[0]=r0-7 k0-15, A[1]=r0-7 k16-31, A[2]=r8-15 k0-15, A[3]=r8-15 k16-31
+  // Assumes B layout: B[0]=k0-15 c0-7, B[1]=k16-31 c0-7, B[2]=k0-15 c8-15, B[3]=k16-31 c8-15
+
+  // Temporary accumulators if needed, or use C directly. Let's use C directly.
+  int32_t c_tmp[8]; // Use temp array to avoid reading potentially uninitialized C in kInit mode
+
+  if constexpr (mma_mode == MMAMode::kInit) {
+      // Initialize accumulators to 0
+      // (Note: Use explicit 0 in asm operands for kInit)
+      #pragma unroll
+      for (int i=0; i<8; ++i) c_tmp[i] = 0; // Use temps for kInit path intermediate accumulation
+  } else {
+      // Copy C input to temps for kInplaceUpdate intermediate accumulation
+      #pragma unroll
+      for (int i=0; i<8; ++i) c_tmp[i] = C[i];
+  }
+
+
+  // --- K Chunk 0 (k = 0..15) ---
+  // MMA 1.0: Rows 0-7, Cols 0-7, K 0-15
+  asm volatile(
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+      "{%0,  %1},"                  // D = c_tmp[0..1]
+      "{%2},"                       // A = A[0]
+      "{%3},"                       // B = B[0]
+      "{%4,  %5};\n"                 // C = c_tmp[0..1] (or {0,0} if kInit was handled outside)
+      : "=r"(c_tmp[0]), "=r"(c_tmp[1])
+      : "r"(A[0]), "r"(B[0]),
+        "r"(c_tmp[0]), "r"(c_tmp[1])
+  );
+  // MMA 2.0: Rows 8-15, Cols 0-7, K 0-15
+  asm volatile(
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+      "{%0,  %1},"                  // D = c_tmp[2..3]
+      "{%2},"                       // A = A[2]
+      "{%3},"                       // B = B[0]
+      "{%4,  %5};\n"                 // C = c_tmp[2..3]
+      : "=r"(c_tmp[2]), "=r"(c_tmp[3])
+      : "r"(A[2]), "r"(B[0]),
+        "r"(c_tmp[2]), "r"(c_tmp[3])
+  );
+  // MMA 3.0: Rows 0-7, Cols 8-15, K 0-15
+  asm volatile(
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+      "{%0,  %1},"                  // D = c_tmp[4..5]
+      "{%2},"                       // A = A[0]
+      "{%3},"                       // B = B[2]
+      "{%4,  %5};\n"                 // C = c_tmp[4..5]
+      : "=r"(c_tmp[4]), "=r"(c_tmp[5])
+      : "r"(A[0]), "r"(B[2]),
+        "r"(c_tmp[4]), "r"(c_tmp[5])
+  );
+  // MMA 4.0: Rows 8-15, Cols 8-15, K 0-15
+  asm volatile(
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+      "{%0,  %1},"                  // D = c_tmp[6..7]
+      "{%2},"                       // A = A[2]
+      "{%3},"                       // B = B[2]
+      "{%4,  %5};\n"                 // C = c_tmp[6..7]
+      : "=r"(c_tmp[6]), "=r"(c_tmp[7])
+      : "r"(A[2]), "r"(B[2]),
+        "r"(c_tmp[6]), "r"(c_tmp[7])
+  );
+
+  // --- K Chunk 1 (k = 16..31) --- Accumulate results
+  // MMA 1.1: Rows 0-7, Cols 0-7, K 16-31
+  asm volatile(
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+      "{%0,  %1},"                  // D = c_tmp[0..1]
+      "{%2},"                       // A = A[1]
+      "{%3},"                       // B = B[1]
+      "{%4,  %5};\n"                 // C = c_tmp[0..1] (Accumulate)
+      : "=r"(c_tmp[0]), "=r"(c_tmp[1])
+      : "r"(A[1]), "r"(B[1]),
+        "r"(c_tmp[0]), "r"(c_tmp[1]) // Input is result from K chunk 0
+  );
+  // MMA 2.1: Rows 8-15, Cols 0-7, K 16-31
+  asm volatile(
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+      "{%0,  %1},"                  // D = c_tmp[2..3]
+      "{%2},"                       // A = A[3]
+      "{%3},"                       // B = B[1]
+      "{%4,  %5};\n"                 // C = c_tmp[2..3] (Accumulate)
+      : "=r"(c_tmp[2]), "=r"(c_tmp[3])
+      : "r"(A[3]), "r"(B[1]),
+        "r"(c_tmp[2]), "r"(c_tmp[3]) // Input is result from K chunk 0
+  );
+  // MMA 3.1: Rows 0-7, Cols 8-15, K 16-31
+  asm volatile(
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+      "{%0,  %1},"                  // D = c_tmp[4..5]
+      "{%2},"                       // A = A[1]
+      "{%3},"                       // B = B[3]
+      "{%4,  %5};\n"                 // C = c_tmp[4..5] (Accumulate)
+      : "=r"(c_tmp[4]), "=r"(c_tmp[5])
+      : "r"(A[1]), "r"(B[3]),
+        "r"(c_tmp[4]), "r"(c_tmp[5]) // Input is result from K chunk 0
+  );
+  // MMA 4.1: Rows 8-15, Cols 8-15, K 16-31
+  asm volatile(
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+      "{%0,  %1},"                  // D = c_tmp[6..7]
+      "{%2},"                       // A = A[3]
+      "{%3},"                       // B = B[3]
+      "{%4,  %5};\n"                 // C = c_tmp[6..7] (Accumulate)
+      : "=r"(c_tmp[6]), "=r"(c_tmp[7])
+      : "r"(A[3]), "r"(B[3]),
+        "r"(c_tmp[6]), "r"(c_tmp[7]) // Input is result from K chunk 0
+  );
+
+  // Write final accumulated results from temps back to C
+  #pragma unroll
+  for (int i=0; i<8; ++i) C[i] = c_tmp[i];
 #endif
 }
 
