@@ -46,7 +46,7 @@ NVCC_FLAGS_COMMON = [
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "--use_fast_math",
     "--threads=8",
-    "-Xptxas=-v",
+    # "-Xptxas=-v",
     "-diag-suppress=174", # suppress the specific warning
 ]
 
