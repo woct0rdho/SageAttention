@@ -48,6 +48,7 @@ NVCC_FLAGS_COMMON = [
     f"--threads={os.cpu_count()}",
     # "-Xptxas=-v",
     "-diag-suppress=174", # suppress the specific warning
+    "-diag-suppress=177",
 ]
 
 ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0
