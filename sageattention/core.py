@@ -52,10 +52,12 @@ from .quant import per_channel_fp8
 from typing import Any, List, Literal, Optional, Tuple, Union
 import warnings
 
+import functools
 import subprocess
 import re
 
 
+@functools.cache
 def get_cuda_version():
     try:
         output = subprocess.check_output(['nvcc', '--version']).decode()
