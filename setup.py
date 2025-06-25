@@ -49,6 +49,7 @@ NVCC_FLAGS_COMMON = [
     # "-Xptxas=-v",
     "-diag-suppress=174", # suppress the specific warning
     "-diag-suppress=177",
+    "-diag-suppress=221",
 ]
 
 ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0
