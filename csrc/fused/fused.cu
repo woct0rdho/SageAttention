@@ -369,7 +369,7 @@ __global__ void MeanScaleKernel(T *__restrict__ input, int8_t *__restrict__ outp
 
   float block_max_val = vllm::blockReduceMax(max_val);
   float block_min_val = vllm::blockReduceMin(min_val);
-  float block_sum_val;
+  float block_sum_val = 0.0f;
 
   if constexpr (sub_mean)
   {
