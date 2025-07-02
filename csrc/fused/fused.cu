@@ -15,7 +15,7 @@
  */
 
 #include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
+#include <torch/all.h>
 
 #include "../dispatch_utils.h"
 #include "../utils.cuh"
@@ -459,13 +459,13 @@ __global__ void MeanScaleKernel(T *__restrict__ input, int8_t *__restrict__ outp
   }
 }
 
-void quant_per_block_int8_cuda(
+void quant_per_block_int8_scale_cuda(
                 torch::Tensor input,
                 torch::Tensor output,
                 torch::Tensor scale,
-                float sm_scale,
-                int block_size,
-                int tensor_layout)
+                double sm_scale,
+                int64_t block_size,
+                int64_t tensor_layout)
 {
   CHECK_CUDA(input);
   CHECK_CUDA(output);
@@ -546,8 +546,8 @@ void quant_per_block_int8_cuda(
                 torch::Tensor input,
                 torch::Tensor output,
                 torch::Tensor scale,
-                int block_size,
-                int tensor_layout)
+                int64_t block_size,
+                int64_t tensor_layout)
 {
   CHECK_CUDA(input);
   CHECK_CUDA(output);
@@ -629,8 +629,8 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
                 torch::Tensor mean,
                 torch::Tensor output,
                 torch::Tensor scale,
-                int block_size,
-                int tensor_layout)
+                int64_t block_size,
+                int64_t tensor_layout)
 {
   CHECK_CUDA(input);
   CHECK_CUDA(mean);
@@ -719,9 +719,9 @@ void quant_per_warp_int8_cuda(
                 torch::Tensor input,
                 torch::Tensor output,
                 torch::Tensor scale,
-                int block_size,
-                int warp_block_size,
-                int tensor_layout)
+                int64_t block_size,
+                int64_t warp_block_size,
+                int64_t tensor_layout)
 {
   CHECK_CUDA(input);
   CHECK_CUDA(output);
@@ -804,7 +804,7 @@ void sub_mean_cuda(
                 torch::Tensor input,
                 torch::Tensor mean,
                 torch::Tensor output,
-                int tensor_layout)
+                int64_t tensor_layout)
 {
   CHECK_CUDA(input);
   CHECK_CUDA(mean);
@@ -883,7 +883,7 @@ void sub_mean_cuda(
 void transpose_pad_permute_cuda(
                 torch::Tensor input,
                 torch::Tensor output,
-                int tensor_layout)
+                int64_t tensor_layout)
 {
   CHECK_CUDA(input);
   CHECK_CUDA(output);
@@ -959,9 +959,9 @@ void scale_fuse_quant_cuda(
                 torch::Tensor input,
                 torch::Tensor output,
                 torch::Tensor scale,
-                int num_tokens,
-                float scale_max,
-                int tensor_layout)
+                int64_t num_tokens,
+                double scale_max,
+                int64_t tensor_layout)
 {
   CHECK_CUDA(input);
   CHECK_CUDA(output);
@@ -1037,9 +1037,9 @@ void mean_scale_fuse_quant_cuda(
                 torch::Tensor output,
                 torch::Tensor mean,
                 torch::Tensor scale,
-                int num_tokens,
-                float scale_max,
-                int tensor_layout)
+                int64_t num_tokens,
+                double scale_max,
+                int64_t tensor_layout)
 {
   CHECK_CUDA(input);
   CHECK_CUDA(output);
