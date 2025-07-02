@@ -24,18 +24,9 @@ from setuptools import setup, find_packages
 import torch
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 
-HAS_SM80 = False
-HAS_SM86 = False
-HAS_SM89 = False
-HAS_SM90 = False
-HAS_SM120 = False
-
-# Supported NVIDIA GPU architectures.
-SUPPORTED_ARCHS = {"8.0", "8.6", "8.9", "9.0", "12.0"}
-
 # Compiler flags.
 if os.name == "nt":
-    # TODO: Detect MSVC
+    # TODO: Detect MSVC rather than OS
     CXX_FLAGS = ["/O2", "/openmp", "/std:c++17", "-DENABLE_BF16"]
 else:
     CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
@@ -93,56 +84,46 @@ if not compute_capabilities:
 else:
     print(f"Detected compute capabilities: {compute_capabilities}")
 
+def has_capability(target):
+    return any(cc.startswith(target) for cc in compute_capabilities)
+
 # Validate the NVCC CUDA version.
 if nvcc_cuda_version < Version("12.0"):
     raise RuntimeError("CUDA 12.0 or higher is required to build the package.")
-if nvcc_cuda_version < Version("12.4") and any(cc.startswith("8.9") for cc in compute_capabilities):
+if nvcc_cuda_version < Version("12.4") and has_capability("8.9"):
     raise RuntimeError(
         "CUDA 12.4 or higher is required for compute capability 8.9.")
-if nvcc_cuda_version < Version("12.3") and any(cc.startswith("9.0") for cc in compute_capabilities):
+if nvcc_cuda_version < Version("12.3") and has_capability("9.0"):
     raise RuntimeError(
         "CUDA 12.3 or higher is required for compute capability 9.0.")
-if nvcc_cuda_version < Version("12.8") and any(cc.startswith("12.0") for cc in compute_capabilities):
+if nvcc_cuda_version < Version("12.8") and has_capability("12.0"):
     raise RuntimeError(
         "CUDA 12.8 or higher is required for compute capability 12.0.")
 
-for capability in compute_capabilities:
-    if capability.startswith("8.0"):
-        HAS_SM80 = True
-    elif capability.startswith("8.6"):
-        HAS_SM86 = True
-    elif capability.startswith("8.9"):
-        HAS_SM89 = True
-    elif capability.startswith("9.0"):
-        HAS_SM90 = True
-    elif capability.startswith("12.0"):
-        HAS_SM120 = True
-
 # Add target compute capabilities to NVCC flags.
-def get_nvcc_flags(allowed_nums):
+def get_nvcc_flags(allowed_capabilities):
     NVCC_FLAGS = []
     for capability in compute_capabilities:
-        if capability.startswith("8.0"):
-            num = "80"
-        elif capability.startswith("8.6"):
-            num = "86"
-        elif capability.startswith("8.9"):
-            num = "89"
-        elif capability.startswith("9.0"):
-            num = "90a" # need to use sm90a instead of sm90 to use wgmma ptx instruction.
-        elif capability.startswith("12.0"):
-            num = "120" # need to use sm120a to use mxfp8/mxfp4/nvfp4 instructions.
-        if num not in allowed_nums:
+        if capability not in allowed_capabilities:
             continue
+
+        # capability: "8.0+PTX" -> num: "80"
+        num = capability.split("+")[0].replace(".", "")
+        if num in {"90", "120"}:
+            # need to use sm90a instead of sm90 to use wgmma ptx instruction.
+            # need to use sm120a to use mxfp8/mxfp4/nvfp4 instructions.
+            num += "a"
+
         NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=sm_{num}"]
         if capability.endswith("+PTX"):
             NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=compute_{num}"]
+
     NVCC_FLAGS += NVCC_FLAGS_COMMON
     return NVCC_FLAGS
 
 ext_modules = []
 
-if HAS_SM80:
+if has_capability(("8.0",)):
     qattn_extension = CUDAExtension(
         name="sageattention._qattn_sm80",
         sources=[
@@ -151,12 +132,12 @@ if HAS_SM80:
         ],
         extra_compile_args={
             "cxx": CXX_FLAGS,
-            "nvcc": get_nvcc_flags(["80"]),
+            "nvcc": get_nvcc_flags(["8.0"]),
         },
     )
     ext_modules.append(qattn_extension)
 
-if HAS_SM89 or HAS_SM90 or HAS_SM120:
+if has_capability(("8.9", "12.0")):
     qattn_extension = CUDAExtension(
         name="sageattention._qattn_sm89",
         sources=[
@@ -168,16 +149,15 @@ if HAS_SM89 or HAS_SM90 or HAS_SM120:
             "csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn.cu",
             "csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf.cu",
             "csrc/qattn/sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf.cu"
-            #"csrc/qattn/qk_int_sv_f8_cuda_sm89.cu",
         ],
         extra_compile_args={
             "cxx": CXX_FLAGS,
-            "nvcc": get_nvcc_flags(["89", "120"]),
+            "nvcc": get_nvcc_flags(["8.9", "12.0"]),
         },
     )
     ext_modules.append(qattn_extension)
 
-if HAS_SM90:
+if has_capability(("9.0",)):
     qattn_extension = CUDAExtension(
         name="sageattention._qattn_sm90",
         sources=[
@@ -187,7 +167,7 @@ if HAS_SM90:
         libraries=["cuda"],
         extra_compile_args={
             "cxx": CXX_FLAGS,
-            "nvcc": get_nvcc_flags(["90a"]),
+            "nvcc": get_nvcc_flags(["9.0"]),
         },
     )
     ext_modules.append(qattn_extension)
@@ -198,7 +178,7 @@ fused_extension = CUDAExtension(
     sources=["csrc/fused/pybind.cpp", "csrc/fused/fused.cu"],
     extra_compile_args={
         "cxx": CXX_FLAGS,
-        "nvcc": get_nvcc_flags(["80", "89", "90a", "120"]),
+        "nvcc": get_nvcc_flags(["8.0", "8.9", "9.0", "12.0"]),
     },
 )
 ext_modules.append(fused_extension)
