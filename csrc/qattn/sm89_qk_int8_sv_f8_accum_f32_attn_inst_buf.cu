@@ -6,11 +6,11 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(torch::Tensor query,
                     torch::Tensor output,
                     torch::Tensor query_scale,
                     torch::Tensor key_scale,
-                    int tensor_layout,
-                    int is_causal,
-                    int qk_quant_gran,
-                    float sm_scale,
-                    int return_lse)
+                    int64_t tensor_layout,
+                    int64_t is_causal,
+                    int64_t qk_quant_gran,
+                    double sm_scale,
+                    int64_t return_lse)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
