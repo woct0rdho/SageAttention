@@ -1,5 +1,7 @@
-from . import _qattn_sm89
 import torch
+
+from . import _qattn_sm89
+_qattn_sm89 = torch.ops.sageattention_qattn_sm89
 
 
 @torch.library.custom_op("sageattention_sm89::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn", mutates_args={"output"}, device_types="cuda")

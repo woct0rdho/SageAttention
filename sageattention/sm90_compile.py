@@ -1,5 +1,7 @@
-from . import _qattn_sm90
 import torch
+
+from . import _qattn_sm90
+_qattn_sm90 = torch.ops.sageattention_qattn_sm90
 
 
 @torch.library.custom_op("sageattention_sm90::qk_int8_sv_f8_accum_f32_attn_inst_buf", mutates_args={"output"}, device_types="cuda")
