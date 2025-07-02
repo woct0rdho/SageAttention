@@ -18,6 +18,7 @@ import torch
 from typing import Any, List, Literal, Optional, Tuple, Union
 
 from . import _fused
+_fused = torch.ops.sageattention_fused
 
 def per_block_int8(
     q: torch.Tensor, 
