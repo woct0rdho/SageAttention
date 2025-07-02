@@ -1,6 +1,9 @@
 import torch
 from flash_attn.utils.benchmark import benchmark_forward
-import sageattention._qattn_sm90 as qattn
+
+import sageattention._qattn_sm90
+qattn = torch.ops.sageattention_qattn_sm90
+
 import argparse
 
 parser = argparse.ArgumentParser(description='Benchmark QK Int8 PV FP8 SM90')
