@@ -19,7 +19,7 @@
 #include <cuda_runtime_api.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
-#include <torch/extension.h>
+#include <torch/all.h>
 
 inline c10::cuda::CUDAGuard make_device_guard(const torch::Tensor &tensor) {
   return c10::cuda::CUDAGuard(tensor.get_device());
