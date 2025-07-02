@@ -1,6 +1,6 @@
 import torch
 from flash_attn.utils.benchmark import benchmark_forward
-import sageattention._qattn_sm90 as qattn
+import sageattention._qattn_sm90
 import argparse
 
 parser = argparse.ArgumentParser(description='Benchmark QK Int8 PV FP8 SM90')
@@ -23,7 +23,7 @@ print(f"batch: {batch}, head: {head}, headdim: {headdim}")
 WARP_Q = 32
 WARP_K = 64
 
-kernel = qattn.qk_int8_sv_f8_accum_f32_attn_inst_buf
+kernel = torch.ops.sageattention_qattn_sm90.qk_int8_sv_f8_accum_f32_attn_inst_buf
 
 _qk_quant_gran = 3 if args.quant_gran == 'per_thread' else 2
 

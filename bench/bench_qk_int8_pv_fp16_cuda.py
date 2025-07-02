@@ -1,7 +1,7 @@
 import torch
 from flash_attn.utils.benchmark import benchmark_forward
 
-import sageattention._qattn_sm80 as qattn
+import sageattention._qattn_sm80
 
 import argparse
 
@@ -24,11 +24,11 @@ WARP_Q = 16 if (headdim == 128 and args.pv_accum_dtype == "fp16+fp32") else 32
 WARP_K = 64
 
 if args.pv_accum_dtype == 'fp32':
-    kernel = qattn.qk_int8_sv_f16_accum_f32_attn # the kernel with fully fp32 accumulator
+    kernel = torch.ops.sageattention_qattn_sm80.qk_int8_sv_f16_accum_f32_attn # the kernel with fully fp32 accumulator
 elif args.pv_accum_dtype == 'fp16+fp32':
-    kernel = qattn.qk_int8_sv_f16_accum_f16_attn_inst_buf # the kernel with fp32 longterm buffer and fp16 shortterm accumulator
+    kernel = torch.ops.sageattention_qattn_sm80.qk_int8_sv_f16_accum_f16_attn_inst_buf # the kernel with fp32 longterm buffer and fp16 shortterm accumulator
 elif args.pv_accum_dtype == 'fp16':
-    kernel = qattn.qk_int8_sv_f16_accum_f16_attn # the kernel with fully fp16 accumulator
+    kernel = torch.ops.sageattention_qattn_sm80.qk_int8_sv_f16_accum_f16_attn # the kernel with fully fp16 accumulator
 
 _qk_quant_gran = 3 if args.quant_gran == 'per_thread' else 2
 
