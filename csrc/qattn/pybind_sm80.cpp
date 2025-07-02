@@ -39,7 +39,7 @@ extern "C" {
 }
 
 // Defines the operators
-TORCH_LIBRARY(sageattention, m) {
+TORCH_LIBRARY(sageattention_qattn_sm80, m) {
     m.def("qk_int8_sv_f16_accum_f32_attn("
             "Tensor query, "
             "Tensor key, "
@@ -51,7 +51,7 @@ TORCH_LIBRARY(sageattention, m) {
             "int is_causal, "
             "int qk_quant_gran, "
             "float sm_scale, "
-            "int return_lse, "
+            "int return_lse"
           ") -> Tensor");
     m.def("qk_int8_sv_f16_accum_f16_attn("
             "Tensor query, "
@@ -64,7 +64,7 @@ TORCH_LIBRARY(sageattention, m) {
             "int is_causal, "
             "int qk_quant_gran, "
             "float sm_scale, "
-            "int return_lse, "
+            "int return_lse"
           ") -> Tensor");
     m.def("qk_int8_sv_f16_accum_f16_attn_inst_buf("
             "Tensor query, "
@@ -77,7 +77,7 @@ TORCH_LIBRARY(sageattention, m) {
             "int is_causal, "
             "int qk_quant_gran, "
             "float sm_scale, "
-            "int return_lse, "
+            "int return_lse"
           ") -> Tensor");
     m.def("qk_int8_sv_f16_accum_f16_fuse_v_mean_attn("
             "Tensor query, "
@@ -91,12 +91,12 @@ TORCH_LIBRARY(sageattention, m) {
             "int is_causal, "
             "int qk_quant_gran, "
             "float sm_scale, "
-            "int return_lse, "
+            "int return_lse"
           ") -> Tensor");
 }
 
 // Registers CUDA implementations
-TORCH_LIBRARY_IMPL(sageattention, CUDA, m) {
+TORCH_LIBRARY_IMPL(sageattention_qattn_sm80, CUDA, m) {
     m.impl("qk_int8_sv_f16_accum_f32_attn", &qk_int8_sv_f16_accum_f32_attn);
     m.impl("qk_int8_sv_f16_accum_f16_attn", &qk_int8_sv_f16_accum_f16_attn);
     m.impl("qk_int8_sv_f16_accum_f16_attn_inst_buf", &qk_int8_sv_f16_accum_f16_attn_inst_buf);
