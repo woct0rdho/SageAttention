@@ -1,7 +1,8 @@
 import torch
 from flash_attn.utils.benchmark import benchmark_forward
 
-import sageattention._qattn_sm89 as qattn
+import sageattention._qattn_sm89
+qattn = torch.ops.sageattention_qattn_sm89
 
 import argparse
 
