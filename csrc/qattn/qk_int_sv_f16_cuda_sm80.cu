@@ -58,7 +58,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
   static_assert(K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp || K_GRAN == QuantGranularity::kPerThread, "K_GRAN must be kPerBlock, kPerWarp or kPerThread");
   static_assert(std::is_same<DTypeSVAccum, float>::value || !use_inst_buffer, "use_inst_buffer only supports DTypeSVAccum as float");
   static_assert(std::is_same<DTypeSVAccum, float>::value || std::is_same<DTypeSVAccum, half>::value, "DTypeSVAccum must be float or half");
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 800)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
   static_assert(std::is_same<DTypeOut, half>::value || std::is_same<DTypeOut, nv_bfloat16>::value, "DTypeOut must be half or nv_bfloat16");
 #else
   static_assert(std::is_same<DTypeOut, half>::value, "DTypeOut must be half");
@@ -67,7 +67,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
   static_assert(!fuse_v_mean || std::is_same<DTypeSVAccum, half>::value, "fuse_v_mean only supports half");
   static_assert(CTA_Q / CTA_K <= 2); // for efficient causal implementation
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 800)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
   using DTypeOut2 = typename std::conditional<std::is_same<DTypeOut, half>::value, half2, nv_bfloat162>::type;
 #endif
 
@@ -552,7 +552,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
   // if (get_warp_idx_k<num_warps_q, num_warps_k>() == 0)
   // {
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 800)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
   // convert half to bfloat16
   if constexpr (std::is_same<DTypeSVAccum, half>::value && std::is_same<DTypeOut, nv_bfloat16>::value)
   {
@@ -613,7 +613,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
           {
             ((half2*)RO_f16)[k] = __float22half2_rn(((float2*)RO[fq][fv])[k]);
           }
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 800)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
           else if constexpr (std::is_same<DTypeOut, nv_bfloat16>::value)
           {
             ((nv_bfloat162*)RO_f16)[k] = __float22bfloat162_rn(((float2*)RO[fq][fv])[k]);
