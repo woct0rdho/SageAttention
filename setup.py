@@ -71,6 +71,7 @@ if not SKIP_CUDA_BUILD:
     else:
         CXX_FLAGS = ["-O3", "-DENABLE_BF16"]
         LINK_FLAGS = []
+    CXX_FLAGS += ["-DPy_LIMITED_API=0x030A0000"]
 
     NVCC_FLAGS_COMMON = [
         "-O3",
@@ -82,6 +83,7 @@ if not SKIP_CUDA_BUILD:
         "-diag-suppress=174",
         "-diag-suppress=177",
         "-diag-suppress=221",
+        "-DPy_LIMITED_API=0x030A0000",
     ]
     if os.name == "nt":
         # https://github.com/pytorch/pytorch/issues/148317
@@ -210,6 +212,7 @@ if not SKIP_CUDA_BUILD:
                     "nvcc": get_nvcc_flags(["8.0"]),
                 },
                 extra_link_args=LINK_FLAGS,
+                py_limited_api=True,
             )
         )
 
@@ -232,6 +235,7 @@ if not SKIP_CUDA_BUILD:
                     "nvcc": get_nvcc_flags(["8.9", "10.0", "12.0", "12.1"]),
                 },
                 extra_link_args=LINK_FLAGS,
+                py_limited_api=True,
             )
         )
 
@@ -249,6 +253,7 @@ if not SKIP_CUDA_BUILD:
                     "nvcc": get_nvcc_flags(["9.0"]),
                 },
                 extra_link_args=LINK_FLAGS,
+                py_limited_api=True,
             )
         )
 
@@ -264,6 +269,7 @@ if not SKIP_CUDA_BUILD:
                 "nvcc": get_nvcc_flags(["8.0", "8.9", "9.0", "10.0", "12.0", "12.1"]),
             },
             extra_link_args=LINK_FLAGS,
+            py_limited_api=True,
         )
     )
 
@@ -318,7 +324,8 @@ setup(
     long_description_content_type='text/markdown',
     url='https://github.com/thu-ml/SageAttention',
     packages=find_packages(),
-    python_requires='>=3.9',
+    python_requires='>=3.10',
     ext_modules=ext_modules,
     cmdclass=cmdclass,
+    options={"bdist_wheel": {"py_limited_api": "cp310"}},
 )
