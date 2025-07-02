@@ -51,7 +51,7 @@ TORCH_LIBRARY(sageattention_qattn_sm90, m) {
             "int is_causal, "
             "int qk_quant_gran, "
             "float sm_scale, "
-            "int return_lse, "
+            "int return_lse"
           ") -> Tensor");
     m.def("qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf("
             "Tensor query, "
@@ -65,7 +65,7 @@ TORCH_LIBRARY(sageattention_qattn_sm90, m) {
             "int is_causal, "
             "int qk_quant_gran, "
             "float sm_scale, "
-            "int return_lse, "
+            "int return_lse"
           ") -> Tensor");
 }
 
