@@ -39,7 +39,7 @@ extern "C" {
 }
 
 // Defines the operators
-TORCH_LIBRARY(sageattention, m) {
+TORCH_LIBRARY(sageattention_fused, m) {
     m.def("quant_per_block_int8_scale_cuda("
             "Tensor input, "
             "Tensor(a!) output, "
@@ -102,7 +102,7 @@ TORCH_LIBRARY(sageattention, m) {
 }
 
 // Registers CUDA implementations
-TORCH_LIBRARY_IMPL(sageattention, CUDA, m) {
+TORCH_LIBRARY_IMPL(sageattention_fused, CUDA, m) {
     m.impl("quant_per_block_int8_scale_cuda", &quant_per_block_int8_scale_cuda);
     m.impl("quant_per_block_int8_cuda", &quant_per_block_int8_cuda);
     m.impl("quant_per_block_int8_fuse_sub_mean_cuda", &quant_per_block_int8_fuse_sub_mean_cuda);
