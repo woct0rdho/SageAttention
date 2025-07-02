@@ -39,21 +39,21 @@ extern "C" {
 }
 
 // Defines the operators
-TORCH_LIBRARY(sageattention, m) {
+TORCH_LIBRARY(sageattention_fused, m) {
     m.def("quant_per_block_int8_scale_cuda("
             "Tensor input, "
             "Tensor(a!) output, "
             "Tensor scale, "
             "float sm_scale, "
             "int block_size, "
-            "int tensor_layout, "
+            "int tensor_layout"
           ") -> ()");
     m.def("quant_per_block_int8_cuda("
             "Tensor input, "
             "Tensor(a!) output, "
             "Tensor scale, "
             "int block_size, "
-            "int tensor_layout, "
+            "int tensor_layout"
           ") -> ()");
     m.def("quant_per_block_int8_fuse_sub_mean_cuda("
             "Tensor input, "
@@ -61,7 +61,7 @@ TORCH_LIBRARY(sageattention, m) {
             "Tensor(a!) output, "
             "Tensor scale, "
             "int block_size, "
-            "int tensor_layout, "
+            "int tensor_layout"
           ") -> ()");
     m.def("quant_per_warp_int8_cuda("
             "Tensor input, "
@@ -69,18 +69,18 @@ TORCH_LIBRARY(sageattention, m) {
             "Tensor scale, "
             "int block_size, "
             "int wrap_block_size, "
-            "int tensor_layout, "
+            "int tensor_layout"
           ") -> ()");
     m.def("sub_mean_cuda("
             "Tensor input, "
             "Tensor mean, "
             "Tensor(a!) output, "
-            "int tensor_layout, "
+            "int tensor_layout"
           ") -> ()");
     m.def("transpose_pad_permute_cuda("
             "Tensor input, "
             "Tensor(a!) output, "
-            "int tensor_layout, "
+            "int tensor_layout"
           ") -> ()");
     m.def("scale_fuse_quant_cuda("
             "Tensor input, "
@@ -88,7 +88,7 @@ TORCH_LIBRARY(sageattention, m) {
             "Tensor scale, "
             "int num_tokens, "
             "float scale_max, "
-            "int tensor_layout, "
+            "int tensor_layout"
           ") -> ()");
     m.def("mean_scale_fuse_quant_cuda("
             "Tensor input, "
@@ -97,12 +97,12 @@ TORCH_LIBRARY(sageattention, m) {
             "Tensor scale, "
             "int num_tokens, "
             "float scale_max, "
-            "int tensor_layout, "
+            "int tensor_layout"
           ") -> ()");
 }
 
 // Registers CUDA implementations
-TORCH_LIBRARY_IMPL(sageattention, CUDA, m) {
+TORCH_LIBRARY_IMPL(sageattention_fused, CUDA, m) {
     m.impl("quant_per_block_int8_scale_cuda", &quant_per_block_int8_scale_cuda);
     m.impl("quant_per_block_int8_cuda", &quant_per_block_int8_cuda);
     m.impl("quant_per_block_int8_fuse_sub_mean_cuda", &quant_per_block_int8_fuse_sub_mean_cuda);
