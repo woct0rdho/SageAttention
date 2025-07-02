@@ -51,7 +51,7 @@ TORCH_LIBRARY(sageattention_qattn_sm80, m) {
             "int is_causal, "
             "int qk_quant_gran, "
             "float sm_scale, "
-            "int return_lse, "
+            "int return_lse"
           ") -> Tensor");
     m.def("qk_int8_sv_f16_accum_f16_attn("
             "Tensor query, "
@@ -64,7 +64,7 @@ TORCH_LIBRARY(sageattention_qattn_sm80, m) {
             "int is_causal, "
             "int qk_quant_gran, "
             "float sm_scale, "
-            "int return_lse, "
+            "int return_lse"
           ") -> Tensor");
     m.def("qk_int8_sv_f16_accum_f16_attn_inst_buf("
             "Tensor query, "
@@ -77,7 +77,7 @@ TORCH_LIBRARY(sageattention_qattn_sm80, m) {
             "int is_causal, "
             "int qk_quant_gran, "
             "float sm_scale, "
-            "int return_lse, "
+            "int return_lse"
           ") -> Tensor");
     m.def("qk_int8_sv_f16_accum_f16_fuse_v_mean_attn("
             "Tensor query, "
@@ -91,7 +91,7 @@ TORCH_LIBRARY(sageattention_qattn_sm80, m) {
             "int is_causal, "
             "int qk_quant_gran, "
             "float sm_scale, "
-            "int return_lse, "
+            "int return_lse"
           ") -> Tensor");
 }
 
