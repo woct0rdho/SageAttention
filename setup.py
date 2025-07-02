@@ -30,6 +30,7 @@ if os.name == "nt":
     CXX_FLAGS = ["/O2", "/openmp", "/std:c++17", "/permissive-", "-DENABLE_BF16"]
 else:
     CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
+CXX_FLAGS += ["-DPy_LIMITED_API=0x03090000"]
 
 NVCC_FLAGS_COMMON = [
     "-O3",
@@ -142,6 +143,7 @@ if has_capability(("8.0", "8.6")):
             # Build binary for sm80 if sm86 is detected. No need to build binary for sm86
             "nvcc": get_nvcc_flags(["8.0"]),
         },
+        py_limited_api=True,
     )
     ext_modules.append(qattn_extension)
 
@@ -162,6 +164,7 @@ if has_capability(("8.9", "12.0")):
             "cxx": CXX_FLAGS,
             "nvcc": get_nvcc_flags(["8.9", "12.0"]),
         },
+        py_limited_api=True,
     )
     ext_modules.append(qattn_extension)
 
@@ -177,6 +180,7 @@ if has_capability(("9.0",)):
             "cxx": CXX_FLAGS,
             "nvcc": get_nvcc_flags(["9.0"]),
         },
+        py_limited_api=True,
     )
     ext_modules.append(qattn_extension)
 
@@ -188,6 +192,7 @@ fused_extension = CUDAExtension(
         "cxx": CXX_FLAGS,
         "nvcc": get_nvcc_flags(["8.0", "8.9", "9.0", "12.0"]),
     },
+    py_limited_api=True,
 )
 ext_modules.append(fused_extension)
 
@@ -242,4 +247,5 @@ setup(
     python_requires='>=3.9',
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtensionSeparateDir} if ext_modules else {},
+    options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
