@@ -41,7 +41,7 @@ def main():
 
     out_sage = sageattn(q, k, v)
     print("sage vs math:", get_rtol_atol(out_sage, out_math))
-    print("The above should be < 0.05, except max_rtol")
+    print("The above (except max_rtol) should be < 0.05 (on RTX 20xx/30xx) or < 0.1 (on RTX 40xx/50xx)")
 
 
 if __name__ == "__main__":
