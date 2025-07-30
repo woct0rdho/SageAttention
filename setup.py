@@ -73,8 +73,9 @@ def get_nvcc_cuda_version(cuda_dir: str) -> Version:
     return nvcc_cuda_version
 
 compute_capabilities = set()
-if os.getenv("SAGEATTENTION_CUDA_ARCH_LIST"):
-    for x in os.getenv("SAGEATTENTION_CUDA_ARCH_LIST").split():
+if os.getenv("TORCH_CUDA_ARCH_LIST"):
+    # TORCH_CUDA_ARCH_LIST is separated by space or semicolon
+    for x in os.getenv("TORCH_CUDA_ARCH_LIST").replace(";", " ").split():
         compute_capabilities.add(x)
 else:
     # Iterate over all GPUs on the current machine.
@@ -88,7 +89,7 @@ else:
 
 nvcc_cuda_version = get_nvcc_cuda_version(CUDA_HOME)
 if not compute_capabilities:
-    raise RuntimeError("No GPUs found. Please specify SAGEATTENTION_CUDA_ARCH_LIST or build on a machine with GPUs.")
+    raise RuntimeError("No GPUs found. Please specify TORCH_CUDA_ARCH_LIST or build on a machine with GPUs.")
 else:
     print(f"Detected compute capabilities: {compute_capabilities}")
 
