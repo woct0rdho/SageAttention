@@ -68,6 +68,7 @@ def get_cuda_version():
         print("Failed to get CUDA version:", e)
     return None, None
 
+@functools.cache
 def get_cuda_arch_versions():
     cuda_archs = []
     for i in range(torch.cuda.device_count()):
