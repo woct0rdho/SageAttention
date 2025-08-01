@@ -33,6 +33,21 @@ on:
         required: true
         type: string
         default: '1'
+      extra_cuda_arch:
+        description: Extra CUDA arch
+        required: false
+        type: string
+        default: ''
+      extra_wheel_version_suffix:
+        description: Extra wheel version suffix
+        required: false
+        type: string
+        default: ''
+      is_python_abi3:
+        description: Is Python ABI3
+        required: false
+        type: string
+        default: ''
 
 jobs:
   build-sageattn:
@@ -78,26 +93,32 @@ jobs:
           $Env:PIP_INDEX_URL = "http://127.0.0.1:8000"
 
           $Env:DISTUTILS_USE_SDK = "1"
+          $Env:TORCH_CUDA_ARCH_LIST = "8.0 8.6 8.9 9.0 "
           if ($Env:CUDA_MINOR_VERSION -gt "6")
           {
-            $Env:TORCH_CUDA_ARCH_LIST = "8.0 8.6 8.9 9.0 12.0"
+            $Env:TORCH_CUDA_ARCH_LIST += "12.0 "
           }
-          else
-          {
-            $Env:TORCH_CUDA_ARCH_LIST = "8.0 8.6 8.9 9.0"
-          }
+          $Env:TORCH_CUDA_ARCH_LIST += "${{ inputs.extra_cuda_arch }}"
           $Env:SAGEATTENTION_WHEEL_VERSION_SUFFIX = "+cu12${{ inputs.cuda_minor }}torch2.${{ inputs.torch_minor }}.${{ inputs.torch_patch }}"
-          if ($Env:TORCH_MINOR_VERSION -gt "5")
+          $Env:SAGEATTENTION_WHEEL_VERSION_SUFFIX += "${{ inputs.extra_wheel_version_suffix }}"
+          if ("${{ inputs.is_python_abi3 }}")
           {
-            $Env:CIBW_BUILD = "{cp39-win_amd64,cp310-win_amd64,cp311-win_amd64,cp312-win_amd64,cp313-win_amd64}"
+            $Env:CIBW_BUILD = "{cp39-win_amd64,}"
           }
           else
           {
-            $Env:CIBW_BUILD = "{cp39-win_amd64,cp310-win_amd64,cp311-win_amd64,cp312-win_amd64}"
+            if ($Env:TORCH_MINOR_VERSION -gt "5")
+            {
+              $Env:CIBW_BUILD = "{cp39-win_amd64,cp310-win_amd64,cp311-win_amd64,cp312-win_amd64,cp313-win_amd64}"
+            }
+            else
+            {
+              $Env:CIBW_BUILD = "{cp39-win_amd64,cp310-win_amd64,cp311-win_amd64,cp312-win_amd64}"
+            }
           }
           $Env:CIBW_BUILD_VERBOSITY = "1"
-          # torch may conflict with cibuildwheel's pinned dependency versions
-          $Env:CIBW_DEPENDENCY_VERSIONS = "latest"
+          # Sometimes torch may conflict with cibuildwheel's pinned dependency versions
+          # $Env:CIBW_DEPENDENCY_VERSIONS = "latest"
           cibuildwheel .
 
       - uses: actions/upload-artifact@v4
