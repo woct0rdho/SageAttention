@@ -1,0 +1,8 @@
+[distutils]
+index-servers =
+    github
+
+[github]
+repository = https://github.com/OWNER/REPO/packages/pypi
+username = __token__
+password = ${GITHUB_TOKEN} 
