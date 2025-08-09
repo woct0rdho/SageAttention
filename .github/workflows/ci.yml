@@ -33,6 +33,19 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
+    - name: Free Disk Space
+      uses: jlumbroso/free-disk-space@main
+      with:
+        # Keep tool cache since we need Python and build tools
+        tool-cache: false
+        # Remove other large packages we don't need
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        docker-images: true
+        swap-storage: true
+
     - name: Build wheel using docker-bake
       run: |
         docker buildx bake --file docker-bake.hcl \
