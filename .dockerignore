@@ -4,9 +4,8 @@ docker-bake.hcl
 CI_CD.md
 .git
 .gitignore
-README.md
 LICENSE
-*.md
+CI_CD.md
 tests/
 example/
 bench/
