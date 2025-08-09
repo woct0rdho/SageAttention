@@ -22,6 +22,10 @@ variable "TORCH_PATCH_VERSION" {
   default = "0"
 }
 
+variable "CUDA_MINOR_VERSION" {
+  default = "9"
+}
+
 group "default" {
   targets = ["wheel"]
 }
@@ -38,6 +42,24 @@ target "wheel" {
     TORCH_CUDA_ARCH_LIST = TORCH_CUDA_ARCH_LIST
     TORCH_MINOR_VERSION = TORCH_MINOR_VERSION
     TORCH_PATCH_VERSION = TORCH_PATCH_VERSION
+    CUDA_MINOR_VERSION = CUDA_MINOR_VERSION
+  }
+  cache-from = ["type=gha"]
+  cache-to = ["type=gha,mode=max"]
+}
+
+# Test the built wheel
+target "test" {
+  dockerfile = "dockerfile.builder"
+  target = "sageattention-test"
+  platforms = [BUILD_PLATFORM]
+  args = {
+    CUDA_VERSION = CUDA_VERSION
+    PYTHON_VERSION = PYTHON_VERSION
+    TORCH_CUDA_ARCH_LIST = TORCH_CUDA_ARCH_LIST
+    TORCH_MINOR_VERSION = TORCH_MINOR_VERSION
+    TORCH_PATCH_VERSION = TORCH_PATCH_VERSION
+    CUDA_MINOR_VERSION = CUDA_MINOR_VERSION
   }
   cache-from = ["type=gha"]
   cache-to = ["type=gha,mode=max"]

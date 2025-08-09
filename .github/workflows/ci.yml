@@ -21,9 +21,10 @@ jobs:
         include:
           - cuda-version: 12.9.1
             python-version: 3.12
-            torch-version: 2.7.0
             cuda-arch-list: "7.0;7.5;8.0;8.6;8.9;9.0"
-            wheel-suffix: "cu129torch270"
+            torch-minor-version: 7
+            torch-patch-version: 0
+            cuda-minor-version: 9
     
     steps:
     - name: Checkout repository
@@ -38,8 +39,9 @@ jobs:
           --set "*.args.CUDA_VERSION=${{ matrix.cuda-version }}" \
           --set "*.args.PYTHON_VERSION=${{ matrix.python-version }}" \
           --set "*.args.TORCH_CUDA_ARCH_LIST=${{ matrix.cuda-arch-list }}" \
-          --set "*.args.TORCH_MINOR_VERSION=7" \
-          --set "*.args.TORCH_PATCH_VERSION=0"
+          --set "*.args.TORCH_MINOR_VERSION=${{ matrix.torch-minor-version }}" \
+          --set "*.args.TORCH_PATCH_VERSION=${{ matrix.torch-patch-version }}" \
+          --set "*.args.CUDA_MINOR_VERSION=${{ matrix.cuda-minor-version }}"
 
     - name: Rename wheel with proper naming convention
       run: |
@@ -48,57 +50,34 @@ jobs:
           if [[ -f "$wheel" ]]; then
             # Extract version from wheel name
             version=$(echo "$wheel" | sed -n 's/sageattention-\([^-]*\)-.*/\1/p')
+            # Generate wheel suffix dynamically
+            wheel_suffix="cu${matrix.cuda-minor-version}9torch${matrix.torch-minor-version}${matrix.torch-patch-version}"
             # Create new name with proper convention
-            new_name="sageattention-${version}+${matrix.wheel-suffix}-cp${matrix.python-version//./}-cp${matrix.python-version//./}-linux_x86_64.whl"
+            new_name="sageattention-${version}+${wheel_suffix}-cp${matrix.python-version//./}-cp${matrix.python-version//./}-linux_x86_64.whl"
             mv "$wheel" "$new_name"
             echo "Renamed $wheel to $new_name"
           fi
         done
 
+    - name: Test wheel using Docker
+      run: |
+        docker buildx bake --file docker-bake.hcl test \
+          --set "*.args.CUDA_VERSION=${{ matrix.cuda-version }}" \
+          --set "*.args.PYTHON_VERSION=${{ matrix.python-version }}" \
+          --set "*.args.TORCH_CUDA_ARCH_LIST=${{ matrix.cuda-arch-list }}" \
+          --set "*.args.TORCH_MINOR_VERSION=${{ matrix.torch-minor-version }}" \
+          --set "*.args.TORCH_PATCH_VERSION=${{ matrix.torch-patch-version }}" \
+          --set "*.args.CUDA_MINOR_VERSION=${{ matrix.cuda-minor-version }}"
+
     - name: Upload wheel artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: sageattention-2.7.0+cu129torch270-cp312-cp312-linux_x86_64
+        name: sageattention-wheel
         path: wheels/*.whl
-        retention-days: 30
-
-  test-wheel:
-    needs: build-wheel
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-
-    - name: Download wheel artifacts
-      uses: actions/download-artifact@v4
-      with:
-        name: sageattention-2.7.0+cu129torch270-cp312-cp312-linux_x86_64
-
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.12'
-
-    - name: Install PyTorch
-      run: |
-        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu129
-
-    - name: Install and test wheel
-      run: |
-        # Install the wheel
-        pip install wheels/*.whl
-        
-        # Test import
-        python -c "import sageattention; print('SageAttention imported successfully')"
-        
-        # Run basic tests if available
-        if [ -f "tests/test_sageattn.py" ]; then
-          python -m pytest tests/test_sageattn.py -v
-        fi
+        retention-days: 7
 
   publish-wheel:
-    needs: [build-wheel, test-wheel]
+    needs: build-wheel
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     
@@ -109,7 +88,7 @@ jobs:
     - name: Download wheel artifacts
       uses: actions/download-artifact@v4
       with:
-        name: sageattention-2.7.0+cu129torch270-cp312-cp312-linux_x86_64
+        name: sageattention-wheel
 
     - name: Set up Python
       uses: actions/setup-python@v4

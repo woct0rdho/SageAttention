@@ -13,7 +13,8 @@ ENV PYTHONUNBUFFERED=1
 
 # Set CUDA architecture list for building (common architectures)
 # This allows building without requiring actual GPUs
-ENV TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"
+ARG TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"
+ENV TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -39,11 +40,14 @@ RUN pip install --upgrade pip setuptools wheel packaging
 # Set PyTorch version environment variables
 ARG TORCH_MINOR_VERSION=7
 ARG TORCH_PATCH_VERSION=0
+ARG CUDA_MINOR_VERSION=9
+ARG PYTHON_VERSION=3.12
+ARG CUDA_VERSION=12.9.1
 ENV TORCH_MINOR_VERSION=$TORCH_MINOR_VERSION
 ENV TORCH_PATCH_VERSION=$TORCH_PATCH_VERSION
-
-# Update pyproject.toml with correct PyTorch version
-RUN python update_pyproject.py
+ENV CUDA_MINOR_VERSION=$CUDA_MINOR_VERSION
+ENV PYTHON_VERSION=$PYTHON_VERSION
+ENV CUDA_VERSION=$CUDA_VERSION
 
 # Install PyTorch with CUDA 12.9 support (latest available version)
 RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cu129
@@ -52,6 +56,9 @@ RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/c
 WORKDIR /build
 COPY . /build/SageAttention/
 WORKDIR /build/SageAttention
+
+# Update pyproject.toml with correct PyTorch version
+RUN python update_pyproject.py
 
 # Install SageAttention build dependencies
 RUN pip install -e .
