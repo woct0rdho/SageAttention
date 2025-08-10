@@ -73,7 +73,7 @@ else:
     device_count = torch.cuda.device_count()
     for i in range(device_count):
         major, minor = torch.cuda.get_device_capability(i)
-        if major < 8:
+        if major < 7:
             warnings.warn(f"skipping GPU {i} with compute capability {major}.{minor}")
             continue
         compute_capabilities.add(f"{major}.{minor}")
@@ -88,8 +88,8 @@ def has_capability(target):
     return any(cc.startswith(target) for cc in compute_capabilities)
 
 # Validate the NVCC CUDA version.
-if nvcc_cuda_version < Version("12.0"):
-    raise RuntimeError("CUDA 12.0 or higher is required to build the package.")
+# if nvcc_cuda_version < Version("12.0"):
+#     raise RuntimeError("CUDA 12.0 or higher is required to build the package.")
 if nvcc_cuda_version < Version("12.4") and has_capability("8.9"):
     raise RuntimeError(
         "CUDA 12.4 or higher is required for compute capability 8.9.")
@@ -123,7 +123,7 @@ def get_nvcc_flags(allowed_capabilities):
 
 ext_modules = []
 
-if has_capability(("8.0",)):
+if has_capability(("8.0", "8.6")):
     qattn_extension = CUDAExtension(
         name="sageattention._qattn_sm80",
         sources=[
@@ -132,6 +132,7 @@ if has_capability(("8.0",)):
         ],
         extra_compile_args={
             "cxx": CXX_FLAGS,
+            # Build binary for sm80 if sm86 is detected. No need to build binary for sm86
             "nvcc": get_nvcc_flags(["8.0"]),
         },
     )
