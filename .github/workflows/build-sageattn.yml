@@ -79,7 +79,7 @@ jobs:
           pip install --upgrade cibuildwheel simpleindex
 
           git config --global core.autocrlf false
-          git clone --branch ${{ inputs.git_tag }} --depth 1 https://github.com/woct0rdho/SageAttention.git
+          git clone --branch ${{ inputs.git_tag }} --depth 1 https://github.com/pixeloven/SageAttention.git
           cd SageAttention
           git rev-parse HEAD
 
