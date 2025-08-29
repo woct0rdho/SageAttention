@@ -64,9 +64,10 @@ jobs:
             # Extract version from wheel name
             version=$(echo "$wheel" | sed -n 's/sageattention-\([^-]*\)-.*/\1/p')
             # Generate wheel suffix dynamically
-            wheel_suffix="cu${matrix.cuda-minor-version}9torch${matrix.torch-minor-version}${matrix.torch-patch-version}"
+            wheel_suffix="cu${{ matrix.cuda-minor-version }}9torch${{ matrix.torch-minor-version }}${{ matrix.torch-patch-version }}"
             # Create new name with proper convention
-            new_name="sageattention-${version}+${wheel_suffix}-cp${matrix.python-version//./}-cp${matrix.python-version//./}-linux_x86_64.whl"
+            python_version_clean=$(echo ${{ matrix.python-version }} | tr -d '.')
+            new_name="sageattention-${version}+${wheel_suffix}-cp${python_version_clean}-cp${python_version_clean}-linux_x86_64.whl"
             mv "$wheel" "$new_name"
             echo "Renamed $wheel to $new_name"
           fi
