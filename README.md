@@ -17,29 +17,38 @@ SageAttention is an efficient and accurate attention mechanism that uses **low-b
 
 This fork extends the original SageAttention project with:
 
-1. **Automated CI/CD Pipeline** - Builds wheels for multiple configurations automatically
-2. **GitHub Packages Distribution** - Pre-built wheels available for easy installation
-3. **Docker-based Build System** - Consistent builds across different environments
-4. **Multi-version Support** - Wheels built for different Python/PyTorch/CUDA combinations
+1. **Unified Build System** - Simple `python build.py` commands for all build needs
+2. **Hybrid Build Approach** - Docker for consistency, cibuildwheel for performance
+3. **Automated CI/CD Pipeline** - Builds wheels for multiple configurations automatically
+4. **GitHub Packages Distribution** - Pre-built wheels available for easy installation
+5. **Multi-platform Support** - Linux and Windows builds with Python 3.12 focus
 
-## CI/CD Pipeline
+## Build System
 
-Our GitHub Actions CI pipeline automatically:
+Our hybrid build system combines the best of both approaches:
 
-1. **Builds wheels** for the following configuration:
-   - Python: 3.12
-   - PyTorch: 2.7.0
-   - CUDA: 12.9.1
-   - Supported GPU architectures: 7.0, 7.5, 8.0, 8.6, 8.9, 9.0
+- **Docker builds** for development and testing (consistent environment)
+- **cibuildwheel builds** for CI/CD and production (faster builds)
 
-2. **Tests the wheels** using Docker containers to ensure compatibility
+The system automatically builds wheels for:
+- **Platforms**: Linux and Windows
+- **Python**: 3.12 (primary support)
+- **PyTorch**: 2.7.0, 2.8.0
+- **CUDA**: 12.9, 13.0
+- **GPU Architectures**: 8.0, 8.6, 8.9, 9.0, 12.0
 
-3. **Publishes to GitHub Packages** with proper naming convention:
-   ```
-   sageattention-{version}+cu{minor}9torch{major}{patch}-cp{python_version}-linux_x86_64.whl
-   ```
+### Quick Build Commands
 
-4. **Triggers on** pushes to main branch (not on pull requests)
+```bash
+# Development build (Docker - consistent)
+python build.py docker
+
+# Production build (cibuildwheel - fast)
+python build.py cibuildwheel
+
+# Test wheels
+python build.py test
+```
 
 ## Available Packages
 
@@ -50,38 +59,74 @@ Once the CI pipeline completes successfully, pre-built wheels are available in t
 ### Prerequisites
 
 - CUDA 12.0 or higher
-- Python 3.9+
+- Python 3.12 (primary support)
 - PyTorch with CUDA support
 - Compatible GPU (compute capability 8.0+)
 
-### Method 1: Direct Installation
+### Quick Build Options
 
+#### Option 1: Docker Build (Recommended for Development)
 ```bash
-# Clone the repository
-git clone https://github.com/pixeloven/SageAttention.git
-cd SageAttention
+# Build using Docker (consistent environment)
+docker build -f dockerfile.builder -t sageattention-dev .
 
-# Install dependencies (adjust torch version as needed)
+# Or use the unified build script
+python build.py docker
+```
+
+#### Option 2: cibuildwheel Build (Recommended for Production)
+```bash
+# Install cibuildwheel
+pip install cibuildwheel
+
+# Build for current platform
+python build.py cibuildwheel
+
+# Build for specific platform
+python build.py cibuildwheel --platform linux
+```
+
+#### Option 3: Direct Installation
+```bash
+# Install dependencies
 pip install torch==2.7.0+cu129 --index-url https://download.pytorch.org/whl/cu129
 
 # Install SageAttention
 python setup.py install
 ```
 
-### Method 2: Docker Build
+### Environment Variables
 
+Set these for custom builds:
 ```bash
-# Build using Docker (requires Docker Buildx)
-docker buildx bake --file docker-bake.hcl wheel
-
-# The wheel will be available in the ./wheels directory
+export TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0"
+export CUDA_MINOR_VERSION="13"
+export TORCH_MINOR_VERSION="8"
+export TORCH_PATCH_VERSION="0"
 ```
 
-### Method 3: Development Installation
+### Testing Built Wheels
 
 ```bash
-# For development with editable installation
-pip install -e .
+# Test wheels using Docker (maintains consistency)
+python build.py test
+```
+
+### Troubleshooting
+
+**Common Issues:**
+
+1. **CUDA not found**: Ensure `CUDA_HOME` is set and CUDA toolkit is installed
+2. **PyTorch version mismatch**: Install the correct PyTorch version for your CUDA
+3. **Build failures on Windows**: Use Developer Command Prompt and ensure MSVC is in PATH
+4. **Memory issues**: Reduce parallel builds with `export EXT_PARALLEL=2`
+
+**Debug Commands:**
+```bash
+# Check environment
+python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}')"
+nvcc --version
+nvidia-smi
 ```
 
 ## Using in Downstream Projects

@@ -15,7 +15,7 @@ variable "BUILD_PLATFORM" {
 }
 
 variable "TORCH_MINOR_VERSION" {
-  default = "7"
+  default = "8"
 }
 
 variable "TORCH_PATCH_VERSION" {
@@ -23,7 +23,7 @@ variable "TORCH_PATCH_VERSION" {
 }
 
 variable "CUDA_MINOR_VERSION" {
-  default = "9"
+  default = "13"
 }
 
 group "default" {

@@ -1,0 +1,36 @@
+# cibuildwheel configuration for SageAttention
+# This file configures the build process for both Linux and Windows platforms
+
+[build]
+# Common build settings for all platforms
+before-all = "pip install --upgrade pip setuptools wheel packaging"
+before-build = "python update_pyproject.py"
+
+# Environment variables
+[build.env]
+SAGEATTENTION_WHEEL_VERSION_SUFFIX = "+{platform_tag}"
+
+# Platform-specific overrides
+[build.overrides]
+# Linux builds
+linux = { 
+    before-all = "apt-get update && apt-get install -y build-essential git",
+    before-build = "python update_pyproject.py && export TORCH_CUDA_ARCH_LIST='8.0 8.6 8.9 9.0 12.0'"
+}
+
+# Windows builds  
+windows = { 
+    before-all = "echo Windows build environment ready",
+    before-build = "python update_pyproject.py && set TORCH_CUDA_ARCH_LIST=8.0 8.6 8.9 9.0 12.0"
+}
+
+# Build options
+[build]
+# Focus on Python 3.12 initially
+only = "cp312-*"
+# Skip macOS for now
+skip = "*-macosx-*"
+
+# Wheel output
+[build]
+output-dir = "wheelhouse"

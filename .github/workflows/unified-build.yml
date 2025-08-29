@@ -1,0 +1,224 @@
+name: Unified Build and Publish SageAttention Wheels
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      torch_version:
+        description: "PyTorch version"
+        required: false
+        default: "2.7.0"
+      cuda_version:
+        description: "CUDA version"
+        required: false
+        default: "12.9"
+      python_version:
+        description: "Python version"
+        required: false
+        default: "3.12"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Job 1: Build wheels using cibuildwheel (production builds)
+  build-wheels:
+    strategy:
+      matrix:
+        include:
+          # Linux builds
+          - os: ubuntu-latest
+            platform: linux
+            python-version: "3.12"
+            cuda-version: "12.9"
+            torch-version: "2.7.0"
+            cuda-arch: "8.0 8.6 8.9 9.0 12.0"
+            cuda-minor: "9"
+            torch-minor: "7"
+            torch-patch: "0"
+          # Linux builds - PyTorch 2.8
+          - os: ubuntu-latest
+            platform: linux
+            python-version: "3.12"
+            cuda-version: "13.0"
+            torch-version: "2.8.0"
+            cuda-arch: "8.0 8.6 8.9 9.0 12.0"
+            cuda-minor: "13"
+            torch-minor: "8"
+            torch-patch: "0"
+          # Windows builds
+          - os: windows-latest
+            platform: windows
+            python-version: "3.12"
+            cuda-version: "12.9"
+            torch-version: "2.7.0"
+            cuda-arch: "8.0 8.6 8.9 9.0 12.0"
+            cuda-minor: "9"
+            torch-minor: "7"
+            torch-patch: "0"
+          # Windows builds - PyTorch 2.8
+          - os: windows-latest
+            platform: windows
+            python-version: "3.12"
+            cuda-version: "13.0"
+            torch-version: "2.8.0"
+            cuda-arch: "8.0 8.6 8.9 9.0 12.0"
+            cuda-minor: "13"
+            torch-minor: "8"
+            torch-patch: "0"
+
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Platform-specific setup
+      - name: Set up CUDA (Linux/Windows)
+        uses: Jimver/cuda-toolkit@v0.2.22
+        with:
+          cuda: ${{ matrix.cuda-version }}
+
+      - name: Set up MSVC (Windows)
+        if: matrix.platform == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # Install cibuildwheel
+      - name: Install cibuildwheel
+        run: |
+          python -m pip install --upgrade pip
+          pip install cibuildwheel
+
+      # Set environment variables
+      - name: Set build environment
+        run: |
+          echo "TORCH_CUDA_ARCH_LIST=${{ matrix.cuda-arch }}" >> $GITHUB_ENV
+          echo "CUDA_MINOR_VERSION=${{ matrix.cuda-minor }}" >> $GITHUB_ENV
+          echo "TORCH_MINOR_VERSION=${{ matrix.torch-minor }}" >> $GITHUB_ENV
+          echo "TORCH_PATCH_VERSION=${{ matrix.torch-patch }}" >> $GITHUB_ENV
+          echo "SAGEATTENTION_WHEEL_VERSION_SUFFIX=+cu${{ matrix.cuda-minor }}torch${{ matrix.torch-minor }}.${{ matrix.torch-patch }}" >> $GITHUB_ENV
+
+      # Build wheels using cibuildwheel
+      - name: Build wheels
+        run: |
+          # Set cibuildwheel environment variables
+          export CIBW_BUILD="cp312-${{ matrix.platform }}_x86_64"
+          export CIBW_BEFORE_BUILD="python update_pyproject.py"
+          export CIBW_BEFORE_ALL="pip install --upgrade pip setuptools wheel packaging"
+          
+          # Build for the specific platform
+          cibuildwheel --platform ${{ matrix.platform }} --output-dir wheelhouse .
+
+      # Upload wheel artifacts
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sageattention-wheels-${{ matrix.platform }}
+          path: wheelhouse/*.whl
+          retention-days: 7
+
+  # Job 2: Test wheels using Docker (maintains consistency)
+  test-wheels:
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cuda-version: [12.9.1]
+        python-version: [3.12]
+        torch-version: [2.7.0]
+        include:
+          - cuda-version: 12.9.1
+            python-version: 3.12
+            cuda-arch-list: "7.0;7.5;8.0;8.6;8.9;9.0"
+            torch-minor-version: 7
+            torch-patch-version: 0
+            cuda-minor-version: 9
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      # Download wheels for testing
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: sageattention-wheels-linux
+
+      # Test wheels using Docker (maintains consistency)
+      - name: Test wheels using Docker
+        run: |
+          docker buildx bake --file docker-bake.hcl test \
+            --set "*.args.CUDA_VERSION=${{ matrix.cuda-version }}" \
+            --set "*.args.PYTHON_VERSION=${{ matrix.python-version }}" \
+            --set "*.args.TORCH_CUDA_ARCH_LIST=${{ matrix.cuda-arch-list }}" \
+            --set "*.args.TORCH_MINOR_VERSION=${{ matrix.torch-minor-version }}" \
+            --set "*.args.TORCH_PATCH_VERSION=${{ matrix.torch-patch-version }}" \
+            --set "*.args.CUDA_MINOR_VERSION=${{ matrix.cuda-minor-version }}"
+
+  # Job 3: Publish wheels
+  publish-wheels:
+    needs: [build-wheels, test-wheels]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sageattention-wheels-*
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install twine
+        run: |
+          pip install twine
+
+      - name: Create PyPI configuration
+        run: |
+          cat > ~/.pypirc << EOF
+          [distutils]
+          index-servers =
+              github
+          
+          [github]
+          repository = https://github.com/${{ github.repository }}/packages/pypi
+          username = ${{ github.actor }}
+          password = ${{ secrets.GITHUB_TOKEN }}
+          EOF
+
+      - name: Publish to GitHub Packages
+        run: |
+          # Find all wheel files
+          find . -name "*.whl" -type f | while read wheel; do
+            echo "Uploading $wheel to GitHub Packages..."
+            twine upload --repository github "$wheel"
+          done

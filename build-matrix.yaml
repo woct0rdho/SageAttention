@@ -1,0 +1,48 @@
+# Build matrix configuration for SageAttention
+# Defines all supported platform, Python, and CUDA combinations
+
+builds:
+  linux:
+    - python: "3.12"
+      cuda: "12.8"
+      torch: "2.6.0"
+      arch: "x86_64"
+      platform: "linux"
+      cuda_arch: "8.0 8.6 8.9 9.0 12.0"
+    - python: "3.12"
+      cuda: "12.9"
+      torch: "2.7.0"
+      arch: "x86_64"
+      platform: "linux"
+      cuda_arch: "8.0 8.6 8.9 9.0 12.0"
+    - python: "3.12"
+      cuda: "13.0"
+      torch: "2.8.0"
+      arch: "x86_64"
+      platform: "linux"
+      cuda_arch: "8.0 8.6 8.9 9.0 12.0"
+  
+  windows:
+    - python: "3.12"
+      cuda: "12.8"
+      torch: "2.6.0"
+      arch: "amd64"
+      platform: "windows"
+      cuda_arch: "8.0 8.6 8.9 9.0 12.0"
+    - python: "3.12"
+      cuda: "12.9"
+      torch: "2.7.0"
+      arch: "amd64"
+      platform: "windows"
+      cuda_arch: "8.0 8.6 8.9 9.0 12.0"
+    - python: "3.12"
+      cuda: "13.0"
+      torch: "2.8.0"
+      arch: "amd64"
+      platform: "windows"
+      cuda_arch: "8.0 8.6 8.9 9.0 12.0"
+
+# Future expansion (commented out for now)
+# python_versions: ["3.9", "3.10", "3.11", "3.12"]
+# cuda_versions: ["12.8", "12.9", "13.0"]
+# torch_versions: ["2.6.0", "2.7.0", "2.8.0"]
