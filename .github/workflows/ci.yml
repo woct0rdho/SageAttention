@@ -58,7 +58,7 @@ jobs:
 
     - name: Rename wheel with proper naming convention
       run: |
-        cd wheels/wheels
+        cd wheels
         for wheel in *.whl; do
           if [[ -f "$wheel" ]]; then
             # Extract version from wheel name
@@ -87,7 +87,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: sageattention-wheel
-        path: wheels/wheels/*.whl
+        path: wheels/*.whl
         retention-days: 7
 
   publish-wheel:
@@ -128,7 +128,6 @@ jobs:
 
     - name: Publish to GitHub Packages
       run: |
-        cd wheels
         for wheel in *.whl; do
           if [[ -f "$wheel" ]]; then
             echo "Uploading $wheel to GitHub Packages..."
