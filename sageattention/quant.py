@@ -23,7 +23,7 @@ def per_block_int8(
     q: torch.Tensor, 
     k: torch.Tensor, 
     km: Optional[torch.Tensor] = None,
-    BLKQ: int = 128, 
+    BLKQ: int = 64, 
     BLKK: int = 64, 
     sm_scale: Optional[float] = None, 
     tensor_layout: str ="HND"
