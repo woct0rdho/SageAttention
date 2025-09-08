@@ -23,10 +23,28 @@ import warnings
 from setuptools import setup, find_packages
 import torch
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
+from wheel.bdist_wheel import bdist_wheel
 
-# Compiler flags.
-if os.name == "nt":
-    # TODO: Detect MSVC rather than OS
+# Compiler flags - detect MSVC compiler rather than OS
+def is_msvc_compiler():
+    """Detect if we're using MSVC compiler."""
+    try:
+        # Try to import distutils compiler to detect MSVC
+        from distutils.msvccompiler import MSVCCompiler
+        from distutils.util import get_platform
+        from setuptools._distutils.msvccompiler import MSVCCompiler as SetuptoolsMSVCCompiler
+        
+        # Check if we're on Windows and likely using MSVC
+        if os.name == "nt":
+            # Additional check: look for cl.exe in PATH or VS environment
+            import shutil
+            return shutil.which("cl.exe") is not None or os.environ.get("VCINSTALLDIR") is not None
+        return False
+    except ImportError:
+        # Fallback to OS detection if distutils unavailable
+        return os.name == "nt"
+
+if is_msvc_compiler():
     CXX_FLAGS = ["/O2", "/openmp", "/std:c++17", "-DENABLE_BF16"]
 else:
     CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
@@ -47,16 +65,48 @@ ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0
 CXX_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
 NVCC_FLAGS_COMMON += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
 
+# Try to find CUDA_HOME if it's not set
 if CUDA_HOME is None:
-    raise RuntimeError(
-        "Cannot find CUDA_HOME. CUDA must be available to build the package.")
+    # Check common CUDA installation paths
+    cuda_paths = [
+        "/usr/local/cuda",
+        "/usr/local/cuda-12.9",
+        "/usr/local/cuda-12.8",
+        "/usr/local/cuda-12.4",
+        "/usr/local/cuda-12.3",
+        "/usr/local/cuda-12.0",
+        os.getenv("CUDA_HOME"),
+        os.getenv("CUDA_ROOT"),
+    ]
+    
+    for cuda_path in cuda_paths:
+        if cuda_path and os.path.exists(cuda_path):
+            nvcc_path = os.path.join(cuda_path, "bin", "nvcc")
+            if os.path.isfile(nvcc_path):
+                os.environ["CUDA_HOME"] = cuda_path
+                print(f"Found CUDA at: {cuda_path}")
+                break
+            else:
+                print(f"Found CUDA directory at {cuda_path} but nvcc compiler not found")
+    else:
+        raise RuntimeError(
+            "Cannot find CUDA_HOME with nvcc compiler. CUDA toolkit must be installed to build the package. "
+            "Tried paths: /usr/local/cuda, /usr/local/cuda-12.9, /usr/local/cuda-12.8, "
+            "/usr/local/cuda-12.4, /usr/local/cuda-12.3, /usr/local/cuda-12.0")
+    
+    # Update CUDA_HOME variable
+    CUDA_HOME = os.environ["CUDA_HOME"]
 
 def get_nvcc_cuda_version(cuda_dir: str) -> Version:
     """Get the CUDA version from nvcc.
 
     Adapted from https://github.com/NVIDIA/apex/blob/8b7a1ff183741dd8f9b87e7bafd04cfde99cea28/setup.py
     """
-    nvcc_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"],
+    nvcc_path = os.path.join(cuda_dir, "bin", "nvcc")
+    if not os.path.isfile(nvcc_path):
+        raise RuntimeError(f"nvcc not found at {nvcc_path}. CUDA compiler is required to build the package.")
+    
+    nvcc_output = subprocess.check_output([nvcc_path, "-V"],
                                           universal_newlines=True)
     output = nvcc_output.split()
     release_idx = output.index("release") + 1
@@ -83,6 +133,48 @@ if not compute_capabilities:
     raise RuntimeError("No GPUs found. Please specify TORCH_CUDA_ARCH_LIST or build on a machine with GPUs.")
 else:
     print(f"Detected compute capabilities: {compute_capabilities}")
+
+def get_build_tag():
+    """Generate build tag with PyTorch and CUDA versions for wheel naming (PEP 427 compliant)."""
+    try:
+        # Try to get versions from environment variables first (Docker build args)
+        torch_version = os.getenv('TORCH_VERSION')
+        cuda_version_str = os.getenv('CUDA_VERSION')
+        
+        # Fallback to detecting from installed PyTorch/CUDA if not in env vars
+        if not torch_version:
+            torch_version = torch.__version__.split('+')[0]  # Remove any +cu suffix
+        if not cuda_version_str:
+            cuda_version_str = str(nvcc_cuda_version)  # e.g., "12.9.1"
+            
+        print(f"Using PyTorch version: {torch_version}")
+        print(f"Using CUDA version: {cuda_version_str}")
+        
+        if torch_version and cuda_version_str:
+            # Convert to compact format: 2.8.0 -> torch280, 12.9.1 -> cu129
+            torch_ver = torch_version.replace('.', '')  # "280"
+            cuda_ver = '.'.join(cuda_version_str.split('.')[:2]).replace('.', '')  # "129"
+            
+            build_tag = f"{torch_ver}.{cuda_ver}"
+            
+            # Add optional wheel version suffix from environment
+            wheel_suffix = os.environ.get("SAGEATTENTION_WHEEL_VERSION_SUFFIX", "")
+            if wheel_suffix:
+                # Remove leading + if present for build tag format
+                wheel_suffix = wheel_suffix.lstrip('+')
+                build_tag += f".{wheel_suffix}"
+                print(f"Added wheel suffix: {wheel_suffix}")
+            
+            print(f"Generated build tag: {build_tag}")
+            return build_tag
+        else:
+            print("Warning: Missing PyTorch or CUDA version information")
+    except Exception as e:
+        print(f"Warning: Could not generate build tag: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return ""
 
 def has_capability(target):
     return any(cc.startswith(target) for cc in compute_capabilities)
@@ -221,17 +313,22 @@ class BuildExtensionSeparateDir(BuildExtension):
         return objects
 
 
+class bdist_wheel_with_build_tag(bdist_wheel):
+    """Custom bdist_wheel command that sets build tag for PEP 427 compliance."""
+    
+    def initialize_options(self):
+        super().initialize_options()
+        # Set build tag from our function
+        build_tag = get_build_tag()
+        if build_tag:
+            self.build_number = build_tag
+
+
 setup(
-    name='sageattention',
-    version='2.2.0' + os.environ.get("SAGEATTENTION_WHEEL_VERSION_SUFFIX", ""),
-    author='SageAttention team',
-    license='Apache 2.0 License',
-    description='Accurate and efficient plug-and-play low-bit attention.',
-    long_description=open('README.md', encoding='utf-8').read(),
-    long_description_content_type='text/markdown',
-    url='https://github.com/thu-ml/SageAttention',
     packages=find_packages(),
-    python_requires='>=3.9',
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtensionSeparateDir} if ext_modules else {},
+    cmdclass={
+        "build_ext": BuildExtensionSeparateDir,
+        "bdist_wheel": bdist_wheel_with_build_tag
+    } if ext_modules else {"bdist_wheel": bdist_wheel_with_build_tag},
 )

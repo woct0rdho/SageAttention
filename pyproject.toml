@@ -4,7 +4,35 @@ requires = [
     "packaging",
     "pybind11",
     "setuptools",
-
+    "wheel",
     # torch version will be added by update_pyproject.py
     "torch",
 ]
+
+[project]
+name = "sageattention"
+version = "2.2.0"
+description = "Accurate and efficient plug-and-play low-bit attention."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+authors = [
+    {name = "SageAttention team"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/thu-ml/SageAttention"
+Repository = "https://github.com/thu-ml/SageAttention"
+Issues = "https://github.com/thu-ml/SageAttention/issues"

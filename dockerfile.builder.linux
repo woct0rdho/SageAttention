@@ -1,0 +1,126 @@
+# SageAttention Builder - Clean multi-stage build for SageAttention wheels
+# Architecture: runtime → builder → extraction → test
+
+# Declare build arguments that are used in FROM statements
+ARG CUDA_VERSION=12.9.1
+ARG PYTHON_VERSION=3.12
+ARG TORCH_VERSION=2.8.0
+ARG TORCH_CUDA_ARCH_LIST=8.0;8.6;8.9;9.0;12.0
+
+# Stage 1: Runtime environment with PyTorch and dependencies
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
+
+# Re-declare ARGs after FROM
+ARG CUDA_VERSION
+ARG PYTHON_VERSION
+ARG TORCH_VERSION
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=$CUDA_HOME/bin:$PATH
+ENV LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+ENV PYTHONUNBUFFERED=1
+ENV TORCH_VERSION=${TORCH_VERSION}
+ENV CUDA_VERSION=${CUDA_VERSION}
+
+# Install system dependencies (cached layer)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+    python${PYTHON_VERSION} \
+    python${PYTHON_VERSION}-dev \
+    python${PYTHON_VERSION}-venv \
+    python3-pip \
+    build-essential \
+    git \
+    wget \
+    curl \
+    ca-certificates \
+    && ln -sf python${PYTHON_VERSION} /usr/bin/python3 \
+    && ln -sf python${PYTHON_VERSION} /usr/bin/python \
+    && apt-get autoremove -y \
+    && apt-get autoclean \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /tmp/* \
+    && rm -rf /var/tmp/*
+
+# Create virtual environment (cached layer)
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Upgrade pip and install build tools (cached layer)
+RUN pip install --upgrade pip setuptools wheel packaging
+
+# Install PyTorch with caching optimization
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$CUDA_VERSION" = "12.8.1" ]; then \
+        pip install torch==${TORCH_VERSION} torchvision --index-url https://download.pytorch.org/whl/cu128; \
+    else \
+        pip install torch==${TORCH_VERSION} torchvision --index-url https://download.pytorch.org/whl/cu129; \
+    fi
+
+# Stage 2: Builder - compiles SageAttention wheel (wheel stays embedded)
+FROM runtime AS builder
+
+# Re-declare build ARGs for this stage
+ARG TORCH_VERSION
+ARG PYTHON_VERSION
+ARG TORCH_CUDA_ARCH_LIST
+
+# Set build environment variables
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+ENV PYTHON_VERSION=${PYTHON_VERSION}
+
+# Verify build configuration
+RUN echo "Build Configuration:" && \
+    echo "  TORCH_VERSION: ${TORCH_VERSION}" && \
+    echo "  PYTHON_VERSION: ${PYTHON_VERSION}" && \
+    echo "  CUDA_VERSION: ${CUDA_VERSION}" && \
+    echo "  TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}"
+
+# Copy source code for compilation
+WORKDIR /src
+COPY . .
+
+# Update pyproject.toml with correct PyTorch version
+RUN python update_pyproject.py
+
+# Install build dependencies
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install numpy packaging pybind11
+
+# Build SageAttention wheel with cache mount for compilation artifacts
+RUN --mount=type=cache,target=/tmp/ccache \
+    --mount=type=cache,target=/root/.cache/pip \
+    CCACHE_DIR=/tmp/ccache \
+    python setup.py bdist_wheel
+
+# Stage 3: Wheel extraction - outputs ONLY wheel files with automatic version naming
+FROM scratch AS wheel
+COPY --from=builder /src/dist/*.whl /
+
+# Stage 4: Test - verifies the built wheel works correctly  
+FROM runtime AS test
+
+# Re-declare ARGs for test stage
+ARG TORCH_VERSION
+ARG PYTHON_VERSION
+ARG CUDA_VERSION
+
+# Set test environment variables
+ENV TORCH_VERSION=${TORCH_VERSION}
+ENV PYTHON_VERSION=${PYTHON_VERSION}
+ENV CUDA_VERSION=${CUDA_VERSION}
+
+# Install and test the wheel directly from builder
+COPY --from=builder /src/dist/*.whl /tmp/
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install /tmp/*.whl \
+    && rm -rf /tmp/*
+
+# Test SageAttention import and basic functionality
+RUN python -c "import sageattention; print('SageAttention imported successfully')"
