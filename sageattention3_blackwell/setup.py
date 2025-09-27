@@ -68,13 +68,7 @@ if not SKIP_CUDA_BUILD:
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
     repo_dir = Path(this_dir)
-    cutlass_dir = repo_dir / "csrc" / "cutlass"
-    (repo_dir / "csrc").mkdir(parents=True, exist_ok=True)
-    if not cutlass_dir.exists():
-        subprocess.run(
-            ["git", "clone", "--depth", "1", "https://github.com/NVIDIA/cutlass.git", str(cutlass_dir)],
-            check=True
-        )
+    cutlass_dir = repo_dir / "cutlass"
     nvcc_flags = [
         "-O3",
         # "-O0",
@@ -99,7 +93,6 @@ if not SKIP_CUDA_BUILD:
         "-DDQINRMEM",
     ]
     include_dirs = [
-        repo_dir / "sageattn3",
         cutlass_dir / "include",
         cutlass_dir / "tools" / "util" / "include",
     ]
@@ -107,7 +100,7 @@ if not SKIP_CUDA_BUILD:
     ext_modules.append(
         CUDAExtension(
             name="fp4attn_cuda",
-            sources=["sageattn3/blackwell/api.cu"],
+            sources=["csrc/blackwell/api.cu"],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
                 "nvcc": append_nvcc_threads(
@@ -122,7 +115,7 @@ if not SKIP_CUDA_BUILD:
     ext_modules.append(
         CUDAExtension(
             name="fp4quant_cuda",
-            sources=["sageattn3/quantization/fp4_quantization_4d.cu"],
+            sources=["csrc/quantization/fp4_quantization_4d.cu"],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
                 "nvcc": append_nvcc_threads(
