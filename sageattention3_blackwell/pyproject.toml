@@ -1,0 +1,10 @@
+[build-system]
+requires = [
+    "numpy",
+    "packaging",
+    "pybind11",
+    "setuptools",
+
+    # torch version will be added by update_pyproject.py
+    "torch",
+]

@@ -152,7 +152,7 @@ class CachedWheelsCommand(bdist_wheel):
 
 setup(
     name=PACKAGE_NAME,
-    version="1.0.0",
+    version="1.0.0" + os.environ.get("SAGEATTENTION_WHEEL_VERSION_SUFFIX", ""),
     packages=find_packages(),
     description="FP4FlashAttention",
     long_description_content_type="text/markdown",
@@ -166,8 +166,4 @@ setup(
     if ext_modules
     else {"bdist_wheel": CachedWheelsCommand},
     python_requires=">=3.9",
-    install_requires=[
-        "torch",
-        "einops",
-    ],
 )
