@@ -13,16 +13,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/all.h>
-#include <torch/python.h>
-#include <torch/nn/functional.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <cuda_runtime_api.h>
-#include <cuda_runtime.h>
 
+#include <torch/all.h>
+// #include <torch/python.h>
+// #include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+// #include <c10/cuda/CUDAGuard.h>
+// #include <cuda_runtime_api.h>
+// #include <cuda_runtime.h>
+
+// #include <ATen/cuda/CUDAContext.h>
+// #include <c10/cuda/CUDAGuard.h>
 
 #include <cuda_fp8.h>
 
@@ -388,7 +389,7 @@ __global__ void scaled_fp4_quant_trans_kernel(
 void scaled_fp4_quant(torch::Tensor const& input,
                             torch::Tensor const& output,
                             torch::Tensor const& output_sf,
-                            int tensor_layout) {
+                            int64_t tensor_layout) {
   constexpr int BLOCK_SIZE = 128;
   
   CHECK_CUDA(input);
@@ -466,7 +467,7 @@ void scaled_fp4_quant(torch::Tensor const& input,
 void scaled_fp4_quant_permute(torch::Tensor const& input,
                             torch::Tensor const& output,
                             torch::Tensor const& output_sf,
-                            int tensor_layout) {
+                            int64_t tensor_layout) {
   constexpr int BLOCK_SIZE = 128;
 
   CHECK_CUDA(input);
@@ -545,7 +546,7 @@ void scaled_fp4_quant_permute(torch::Tensor const& input,
 void scaled_fp4_quant_trans(torch::Tensor const& input,
                             torch::Tensor const& output,
                             torch::Tensor const& output_sf,
-                            int tensor_layout) {
+                            int64_t tensor_layout) {
   constexpr int BLOCK_SIZE = 128;
   
   CHECK_CUDA(input);
@@ -621,8 +622,53 @@ void scaled_fp4_quant_trans(torch::Tensor const& input,
   });
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("scaled_fp4_quant", &scaled_fp4_quant);
-  m.def("scaled_fp4_quant_permute", &scaled_fp4_quant_permute);
-  m.def("scaled_fp4_quant_trans", &scaled_fp4_quant_trans);
+#include <Python.h>
+#include <torch/library.h>
+
+extern "C" {
+    /* Creates a dummy empty _C module that can be imported from Python.
+       The import from Python will load the .so consisting of this file
+       in this extension, so that the TORCH_LIBRARY static initializers
+       below are run. */
+    PyObject* PyInit_fp4quant_cuda(void)
+    {
+        static struct PyModuleDef module_def = {
+            PyModuleDef_HEAD_INIT,
+            "fp4quant_cuda",  /* name of module */
+            NULL,             /* module documentation, may be NULL */
+            -1,               /* size of per-interpreter state of the module,
+                                 or -1 if the module keeps state in global variables. */
+            NULL,             /* methods */
+        };
+        return PyModule_Create(&module_def);
+    }
+}
+
+// Defines the operators
+TORCH_LIBRARY(sageattn3_fp4quant_cuda, m) {
+    m.def("scaled_fp4_quant("
+            "Tensor input, "
+            "Tensor(a!) output, "
+            "Tensor(b!) output_sf, "
+            "int tensor_layout"
+          ") -> ()");
+    m.def("scaled_fp4_quant_permute("
+            "Tensor input, "
+            "Tensor(a!) output, "
+            "Tensor(b!) output_sf, "
+            "int tensor_layout"
+          ") -> ()");
+    m.def("scaled_fp4_quant_trans("
+            "Tensor input, "
+            "Tensor(a!) output, "
+            "Tensor(b!) output_sf, "
+            "int tensor_layout"
+          ") -> ()");
+}
+
+// Registers CUDA implementations
+TORCH_LIBRARY_IMPL(sageattn3_fp4quant_cuda, CUDA, m) {
+    m.impl("scaled_fp4_quant", &scaled_fp4_quant);
+    m.impl("scaled_fp4_quant_permute", &scaled_fp4_quant_permute);
+    m.impl("scaled_fp4_quant_trans", &scaled_fp4_quant_trans);
 }
