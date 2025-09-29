@@ -30,6 +30,7 @@ if os.name == "nt":
     CXX_FLAGS = ["/O2", "/openmp", "/std:c++17", "/permissive-", "-DENABLE_BF16"]
 else:
     CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
+
 NVCC_FLAGS_COMMON = [
     "-O3",
     "-std=c++17",
@@ -42,6 +43,12 @@ NVCC_FLAGS_COMMON = [
     "-diag-suppress=177",
     "-diag-suppress=221",
 ]
+if os.name == "nt":
+    # https://github.com/pytorch/pytorch/issues/148317
+    NVCC_FLAGS_COMMON += [
+        "-D_WIN32=1",
+        "-DUSE_CUDA=1",
+    ]
 
 ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0
 CXX_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
