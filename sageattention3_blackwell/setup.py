@@ -108,6 +108,12 @@ if not SKIP_CUDA_BUILD:
         "-diag-suppress=550",
         "-diag-suppress=3357",
     ]
+    if os.name == "nt":
+        # https://github.com/pytorch/pytorch/issues/148317
+        nvcc_flags += [
+            "-D_WIN32=1",
+            "-DUSE_CUDA=1",
+        ]
 
     include_dirs = [
         cutlass_dir / "include",
