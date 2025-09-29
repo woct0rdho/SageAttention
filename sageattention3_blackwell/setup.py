@@ -100,6 +100,7 @@ if not SKIP_CUDA_BUILD:
         CXX_FLAGS = ["/O2", "/std:c++17", "/permissive-"]
     else:
         CXX_FLAGS = ["-O3", "-std=c++17"]
+    CXX_FLAGS += ["-DPy_LIMITED_API=0x03090000"]
 
     nvcc_flags = [
         "-O3",
@@ -136,7 +137,7 @@ if not SKIP_CUDA_BUILD:
 
     include_dirs = [
         cutlass_dir / "include",
-        cutlass_dir / "tools" / "util" / "include",
+        # cutlass_dir / "tools" / "util" / "include",
     ]
 
     ext_modules.append(
@@ -151,7 +152,8 @@ if not SKIP_CUDA_BUILD:
             },
             include_dirs=include_dirs,
             # Without this we get and error about cuTensorMapEncodeTiled not defined
-            libraries=["cuda"]
+            libraries=["cuda"],
+            py_limited_api=True,
         )
     )
     ext_modules.append(
@@ -165,8 +167,7 @@ if not SKIP_CUDA_BUILD:
                 ),
             },
             include_dirs=include_dirs,
-            # Without this we get and error about cuTensorMapEncodeTiled not defined
-            libraries=["cuda"]
+            py_limited_api=True,
         )
     )
 
@@ -192,4 +193,5 @@ setup(
     if ext_modules
     else {"bdist_wheel": CachedWheelsCommand},
     python_requires=">=3.9",
+    options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
