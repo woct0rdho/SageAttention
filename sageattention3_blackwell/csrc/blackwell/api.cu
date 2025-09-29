@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 
+#include <torch/all.h>
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
-#include <torch/python.h>
-#include <torch/nn/functional.h>
+// #include <torch/python.h>
+// #include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+// #include <c10/cuda/CUDAGuard.h>
 
 #include <cutlass/numeric_types.h>
 
@@ -208,9 +209,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
         const at::Tensor &sfk,
         const at::Tensor &sfv,
         const at::Tensor &delta_s,
-        int unpadded_k,
-        c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
-        const float softmax_scale,
+        int64_t unpadded_k,
+        // c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
+        double softmax_scale,
         bool is_causal, 
         bool per_block_mean,
         bool is_bf16
@@ -333,9 +334,47 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
     return {out, softmax_lse};
 }
 
+#include <Python.h>
+#include <torch/library.h>
 
+extern "C" {
+    /* Creates a dummy empty _C module that can be imported from Python.
+       The import from Python will load the .so consisting of this file
+       in this extension, so that the TORCH_LIBRARY static initializers
+       below are run. */
+    PyObject* PyInit_fp4attn_cuda(void)
+    {
+        static struct PyModuleDef module_def = {
+            PyModuleDef_HEAD_INIT,
+            "fp4attn_cuda",  /* name of module */
+            NULL,            /* module documentation, may be NULL */
+            -1,              /* size of per-interpreter state of the module,
+                                or -1 if the module keeps state in global variables. */
+            NULL,            /* methods */
+        };
+        return PyModule_Create(&module_def);
+    }
+}
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "FlashAttention";
-    m.def("fwd", &mha_fwd, "Forward pass");
+// Defines the operators
+TORCH_LIBRARY(sageattn3_fp4attn_cuda, m) {
+    m.def("fwd("
+            "Tensor q, "
+            "Tensor k, "
+            "Tensor v, "
+            "Tensor sfq, "
+            "Tensor sfk, "
+            "Tensor sfv, "
+            "Tensor delta_s, "
+            "int unpadded_k, "
+            "float softmax_scale, "
+            "bool is_causal, "
+            "bool per_block_mean, "
+            "bool is_bf16"
+          ") -> Tensor[]");
+}
+
+// Registers CUDA implementations
+TORCH_LIBRARY_IMPL(sageattn3_fp4attn_cuda, CUDA, m) {
+    m.impl("fwd", &mha_fwd);
 }
