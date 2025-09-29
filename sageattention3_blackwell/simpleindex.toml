@@ -1,0 +1,14 @@
+# Use simpleindex to route torch
+
+[routes."torch"]
+source = "http"
+# CUDA version will be set by update_pyproject.py
+to = "https://download.pytorch.org/whl/cu126/torch"
+
+[routes."{project}"]
+source = "http"
+to = "https://pypi.org/simple/{project}/"
+
+[server]
+host = "127.0.0.1"
+port = 8000
