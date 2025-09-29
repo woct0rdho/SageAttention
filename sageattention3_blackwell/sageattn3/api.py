@@ -23,6 +23,9 @@ from torch.nn.functional import scaled_dot_product_attention as sdpa
 from . import fp4attn_cuda
 from . import fp4quant_cuda
 
+fp4attn_cuda = torch.ops.sageattn3_fp4attn_cuda
+fp4quant_cuda = torch.ops.sageattn3_fp4quant_cuda
+
 
 @triton.jit
 def group_mean_kernel(
@@ -126,7 +129,7 @@ def blockscaled_fp4_attn(qlist: Tuple,
                          is_bf16: bool = True
                         ):
     softmax_scale = (qlist[0].shape[-1] * 2) ** (-0.5)
-    return fp4attn_cuda.fwd(qlist[0], klist[0], vlist[0], qlist[1], klist[1], vlist[1], delta_s, KL, None, softmax_scale, is_causal, per_block_mean, is_bf16)
+    return fp4attn_cuda.fwd(qlist[0], klist[0], vlist[0], qlist[1], klist[1], vlist[1], delta_s, KL, softmax_scale, is_causal, per_block_mean, is_bf16)
 
 
 def sageattn3_blackwell(q, k, v, attn_mask = None, is_causal = False, per_block_mean = True, **kwargs):

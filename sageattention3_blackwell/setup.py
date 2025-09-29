@@ -138,6 +138,7 @@ if not SKIP_CUDA_BUILD:
     else:
         CXX_FLAGS = ["-O3"]
         LINK_FLAGS = []
+    CXX_FLAGS += ["-DPy_LIMITED_API=0x030A0000"]
 
     nvcc_flags = [
         "-O3",
@@ -163,6 +164,7 @@ if not SKIP_CUDA_BUILD:
         "-diag-suppress=221",
         "-diag-suppress=550",
         "-diag-suppress=3357",
+        "-DPy_LIMITED_API=0x030A0000",
     ]
     if os.name == "nt":
         # https://github.com/pytorch/pytorch/issues/148317
@@ -183,7 +185,7 @@ if not SKIP_CUDA_BUILD:
 
     include_dirs = [
         cutlass_dir / "include",
-        cutlass_dir / "tools" / "util" / "include",
+        # cutlass_dir / "tools" / "util" / "include",
     ]
 
     ext_modules.append(
@@ -199,7 +201,8 @@ if not SKIP_CUDA_BUILD:
             extra_link_args=LINK_FLAGS,
             include_dirs=include_dirs,
             # Without this we get and error about cuTensorMapEncodeTiled not defined
-            libraries=["cuda"]
+            libraries=["cuda"],
+            py_limited_api=True,
         )
     )
     ext_modules.append(
@@ -214,8 +217,7 @@ if not SKIP_CUDA_BUILD:
             },
             extra_link_args=LINK_FLAGS,
             include_dirs=include_dirs,
-            # Without this we get and error about cuTensorMapEncodeTiled not defined
-            libraries=["cuda"]
+            py_limited_api=True,
         )
     )
 
@@ -240,5 +242,6 @@ setup(
     cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": BuildExtension}
     if ext_modules
     else {"bdist_wheel": CachedWheelsCommand},
-    python_requires=">=3.9",
+    python_requires=">=3.10",
+    options={"bdist_wheel": {"py_limited_api": "cp310"}},
 )
