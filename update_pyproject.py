@@ -21,11 +21,12 @@ with open("./pyproject.toml", "w") as f:
 with open("./simpleindex.toml", "r") as f:
     text = f.read()
 
+CUDA_MAJOR_VERSION = os.getenv("CUDA_MAJOR_VERSION", "12")
 CUDA_MINOR_VERSION = os.getenv("CUDA_MINOR_VERSION", "6")
 if os.getenv("TORCH_IS_NIGHTLY") == "1":
-    text = text.replace("/cu126/", f"/nightly/cu12{CUDA_MINOR_VERSION}/")
+    text = text.replace("/cu126/", f"/nightly/cu{CUDA_MAJOR_VERSION}{CUDA_MINOR_VERSION}/")
 else:
-    text = text.replace("/cu126/", f"/cu12{CUDA_MINOR_VERSION}/")
+    text = text.replace("/cu126/", f"/cu{CUDA_MAJOR_VERSION}{CUDA_MINOR_VERSION}/")
 
 with open("./simpleindex.toml", "w") as f:
     f.write(text)
