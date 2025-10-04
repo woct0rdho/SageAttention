@@ -23,8 +23,10 @@ with open("./simpleindex.toml", "r") as f:
 
 CUDA_MAJOR_VERSION = os.getenv("CUDA_MAJOR_VERSION", "12")
 CUDA_MINOR_VERSION = os.getenv("CUDA_MINOR_VERSION", "6")
-if os.getenv("TORCH_IS_NIGHTLY") == "1":
+if os.getenv("TORCH_IS_NIGHTLY") in ["1", "nightly"]:
     text = text.replace("/cu126/", f"/nightly/cu{CUDA_MAJOR_VERSION}{CUDA_MINOR_VERSION}/")
+elif os.getenv("TORCH_IS_NIGHTLY") == "test":
+    text = text.replace("/cu126/", f"/test/cu{CUDA_MAJOR_VERSION}{CUDA_MINOR_VERSION}/")
 else:
     text = text.replace("/cu126/", f"/cu{CUDA_MAJOR_VERSION}{CUDA_MINOR_VERSION}/")
 
