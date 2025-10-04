@@ -150,14 +150,25 @@ struct Flash_fwd_kernel_traits {
     using SmemCopyAtomSF = Copy_Atom<UniversalCopy<ElementSF>, ElementSF>;
     using SmemCopyAtomDS = Copy_Atom<UniversalCopy<float>, float>;
 
-    // using BlkScaledConfig = flash::BlockScaledConfig<SFVectorSize>;
-    using BlkScaledConfig = flash::BlockScaledConfig<16>;
-    using LayoutSF = typename BlkScaledConfig::LayoutSF;
-    using SfAtom = typename BlkScaledConfig::SfAtom;
-    using SmemLayoutAtomSFQ = decltype(BlkScaledConfig::deduce_smem_layoutSFQ(TiledMmaQK{}, TileShape_MNK{}));
-    using SmemLayoutAtomSFK = decltype(BlkScaledConfig::deduce_smem_layoutSFKV(TiledMmaQK{}, TileShape_MNK{}));
-    using SmemLayoutAtomSFV = decltype(BlkScaledConfig::deduce_smem_layoutSFKV(TiledMmaPV{}, TileShape_MNK{}));
-    using SmemLayoutAtomSFVt = decltype(BlkScaledConfig::deduce_smem_layoutSFVt(TiledMmaPV{}, Shape<Int<kBlockM>, Int<kHeadDim>, Int<kBlockN>>{}));
+    using BlkScaledConfig = ::flash::BlockScaledConfig<16>;
+    // Inline the definitions to avoid MSVC dependent-name quirks
+    using SfAtom = Layout<
+        Shape<Shape<_16, _4>, Shape<Int<SFVectorSize>, Int<4>>>,
+        Stride<Stride<_16, _4>, Stride<_0, _1>>
+    >;
+    using LayoutSF = decltype(
+      blocked_product(
+        SfAtom{},
+        make_layout(
+          make_shape(int32_t(0), int32_t(0), int32_t(0), int32_t(0)),
+          make_stride(int32_t(0), _1{}, int32_t(0), int32_t(0))
+        )
+      )
+    );
+    using SmemLayoutAtomSFQ = decltype(::flash::BlockScaledConfig<16>::deduce_smem_layoutSFQ(TiledMmaQK{}, TileShape_MNK{}));
+    using SmemLayoutAtomSFK = decltype(::flash::BlockScaledConfig<16>::deduce_smem_layoutSFKV(TiledMmaQK{}, TileShape_MNK{}));
+    using SmemLayoutAtomSFV = decltype(::flash::BlockScaledConfig<16>::deduce_smem_layoutSFKV(TiledMmaPV{}, TileShape_MNK{}));
+    using SmemLayoutAtomSFVt = decltype(::flash::BlockScaledConfig<16>::deduce_smem_layoutSFVt(TiledMmaPV{}, Shape<Int<kBlockM>, Int<kHeadDim>, Int<kBlockN>>{}));
     using LayoutSFP = decltype(
       make_layout(
           make_shape(make_shape(_16{}, _4{}), _1{}, Int<kBlockN / 64>{}),
