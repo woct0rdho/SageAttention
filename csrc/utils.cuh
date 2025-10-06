@@ -15,24 +15,30 @@
  */
 
 #pragma once
-#include <torch/all.h>
+#include <torch/headeronly/util/Exception.h>
 
 #define CHECK_CUDA(x) \
-  TORCH_CHECK(x.is_cuda(), "Tensor " #x " must be on CUDA")
+  STD_TORCH_CHECK(x.is_cuda(), "Tensor " #x " must be on CUDA")
 #define CHECK_DTYPE(x, true_dtype)     \
-  TORCH_CHECK(x.dtype() == true_dtype, \
+  STD_TORCH_CHECK(x.scalar_type() == true_dtype, \
               "Tensor " #x " must have dtype (" #true_dtype ")")
 #define CHECK_DIMS(x, true_dim)    \
-  TORCH_CHECK(x.dim() == true_dim, \
+  STD_TORCH_CHECK(x.dim() == true_dim, \
               "Tensor " #x " must have dimension number (" #true_dim ")")
 #define CHECK_NUMEL(x, minimum)     \
-  TORCH_CHECK(x.numel() >= minimum, \
+  STD_TORCH_CHECK(x.numel() >= minimum, \
               "Tensor " #x " must have at last " #minimum " elements")
-#define CHECK_SHAPE(x, ...)                                   \
-  TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), \
-              "Tensor " #x " must have shape (" #__VA_ARGS__ ")")
+// https://github.com/Dao-AILab/flash-attention/blob/add175637c5d54b74bc25372e49ce282d6f236fc/hopper/flash_api_stable.cpp#L98
+#define CHECK_SHAPE(x, ...) \
+    do { \
+        auto expected_dims = std::vector<int64_t>{__VA_ARGS__}; \
+        STD_TORCH_CHECK(x.dim() == static_cast<int64_t>(expected_dims.size()), #x " must have " + std::to_string(expected_dims.size()) + " dimensions, got " + std::to_string(x.dim())); \
+        for (size_t i = 0; i < expected_dims.size(); ++i) { \
+            STD_TORCH_CHECK(x.size(i) == expected_dims[i], #x " dimension " + std::to_string(i) + " must have size " + std::to_string(expected_dims[i]) + ", got " + std::to_string(x.size(i))); \
+        } \
+    } while (0)
 #define CHECK_CONTIGUOUS(x) \
-  TORCH_CHECK(x.is_contiguous(), "Tensor " #x " must be contiguous")
+  STD_TORCH_CHECK(x.is_contiguous(), "Tensor " #x " must be contiguous")
 #define CHECK_LASTDIM_CONTIGUOUS(x) \
-  TORCH_CHECK(x.stride(-1) == 1,    \
+  STD_TORCH_CHECK(x.stride(-1) == 1,    \
               "Tensor " #x " must be contiguous at the last dimension")
