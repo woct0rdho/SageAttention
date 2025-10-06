@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/all.h>
+#include <torch/csrc/stable/tensor.h>
+
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
 
 #include "../dispatch_utils.h"
 #include "../utils.cuh"
@@ -24,6 +26,8 @@
 #include "../cp_async.cuh"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+
+using torch::stable::Tensor;
 
 enum class QuantType
 {
@@ -427,9 +431,9 @@ __global__ void MeanScaleKernel(T *__restrict__ input, int8_t *__restrict__ outp
 }
 
 void quant_per_block_int8_scale_cuda(
-                torch::Tensor input,
-                torch::Tensor output,
-                torch::Tensor scale,
+                Tensor input,
+                Tensor output,
+                Tensor scale,
                 double sm_scale,
                 int64_t block_size,
                 int64_t tensor_layout)
@@ -438,8 +442,8 @@ void quant_per_block_int8_scale_cuda(
   CHECK_CUDA(output);
   CHECK_CUDA(scale);
   
-  CHECK_DTYPE(output, torch::kInt8);
-  CHECK_DTYPE(scale, torch::kFloat);
+  CHECK_DTYPE(output, torch::headeronly::ScalarType::Char);
+  CHECK_DTYPE(scale, torch::headeronly::ScalarType::Float);
 
   CHECK_LASTDIM_CONTIGUOUS(input);
   CHECK_CONTIGUOUS(output);
@@ -495,10 +499,10 @@ void quant_per_block_int8_scale_cuda(
         const auto stream = get_current_cuda_stream(input);
 
         QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, true, false, c_type><<<grid, block, 0, stream>>>(
-          reinterpret_cast<c_type*>(input.data_ptr()),
+          static_cast<c_type*>(input.data_ptr()),
           nullptr,
-          output.data_ptr<int8_t>(),
-          reinterpret_cast<float*>(scale.data_ptr()),
+          static_cast<int8_t*>(output.data_ptr()),
+          static_cast<float*>(scale.data_ptr()),
           sm_scale,
           num_tokens,
           stride_bz_input, stride_seq_input, stride_h_input,
@@ -512,9 +516,9 @@ void quant_per_block_int8_scale_cuda(
 }
 
 void quant_per_block_int8_cuda(
-                torch::Tensor input,
-                torch::Tensor output,
-                torch::Tensor scale,
+                Tensor input,
+                Tensor output,
+                Tensor scale,
                 int64_t block_size,
                 int64_t tensor_layout)
 {
@@ -522,8 +526,8 @@ void quant_per_block_int8_cuda(
   CHECK_CUDA(output);
   CHECK_CUDA(scale);
   
-  CHECK_DTYPE(output, torch::kInt8);
-  CHECK_DTYPE(scale, torch::kFloat);
+  CHECK_DTYPE(output, torch::headeronly::ScalarType::Char);
+  CHECK_DTYPE(scale, torch::headeronly::ScalarType::Float);
 
   CHECK_LASTDIM_CONTIGUOUS(input);
   CHECK_CONTIGUOUS(output);
@@ -579,10 +583,10 @@ void quant_per_block_int8_cuda(
         const auto stream = get_current_cuda_stream(input);
 
         QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<grid, block, 0, stream>>>(
-          reinterpret_cast<c_type*>(input.data_ptr()),
+          static_cast<c_type*>(input.data_ptr()),
           nullptr,
-          output.data_ptr<int8_t>(),
-          reinterpret_cast<float*>(scale.data_ptr()),
+          static_cast<int8_t*>(output.data_ptr()),
+          static_cast<float*>(scale.data_ptr()),
           0.0f,
           num_tokens,
           stride_bz_input, stride_seq_input, stride_h_input,
@@ -596,10 +600,10 @@ void quant_per_block_int8_cuda(
 }
 
 void quant_per_block_int8_fuse_sub_mean_cuda(
-                torch::Tensor input,
-                torch::Tensor mean,
-                torch::Tensor output,
-                torch::Tensor scale,
+                Tensor input,
+                Tensor mean,
+                Tensor output,
+                Tensor scale,
                 int64_t block_size,
                 int64_t tensor_layout)
 {
@@ -608,8 +612,8 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
   CHECK_CUDA(output);
   CHECK_CUDA(scale);
   
-  CHECK_DTYPE(output, torch::kInt8);
-  CHECK_DTYPE(scale, torch::kFloat);
+  CHECK_DTYPE(output, torch::headeronly::ScalarType::Char);
+  CHECK_DTYPE(scale, torch::headeronly::ScalarType::Float);
 
   CHECK_LASTDIM_CONTIGUOUS(input);
   CHECK_CONTIGUOUS(mean);
@@ -652,7 +656,7 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
   auto input_dtype = input.scalar_type();
   auto mean_dtype = mean.scalar_type();
 
-  TORCH_CHECK(input_dtype == mean_dtype, "Input and mean must have the same data type");
+  STD_TORCH_CHECK(input_dtype == mean_dtype, "Input and mean must have the same data type");
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
     DISPATCH_BLOCK_SIZE(block_size, BLOCK_SIZE, {
@@ -671,10 +675,10 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
         const auto stream = get_current_cuda_stream(input);
 
         QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, true, c_type><<<grid, block, 0, stream>>>(
-          reinterpret_cast<c_type*>(input.data_ptr()),
-          reinterpret_cast<c_type*>(mean.data_ptr()),
-          output.data_ptr<int8_t>(),
-          reinterpret_cast<float*>(scale.data_ptr()),
+          static_cast<c_type*>(input.data_ptr()),
+          static_cast<c_type*>(mean.data_ptr()),
+          static_cast<int8_t*>(output.data_ptr()),
+          static_cast<float*>(scale.data_ptr()),
           0.0f,
           num_tokens,
           stride_bz_input, stride_seq_input, stride_h_input,
@@ -689,9 +693,9 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
 
 // use block size 128 and warp_block size 32
 void quant_per_warp_int8_cuda(
-                torch::Tensor input,
-                torch::Tensor output,
-                torch::Tensor scale,
+                Tensor input,
+                Tensor output,
+                Tensor scale,
                 int64_t block_size,
                 int64_t warp_block_size,
                 int64_t tensor_layout)
@@ -700,8 +704,8 @@ void quant_per_warp_int8_cuda(
   CHECK_CUDA(output);
   CHECK_CUDA(scale);
   
-  CHECK_DTYPE(output, torch::kInt8);
-  CHECK_DTYPE(scale, torch::kFloat);
+  CHECK_DTYPE(output, torch::headeronly::ScalarType::Char);
+  CHECK_DTYPE(scale, torch::headeronly::ScalarType::Float);
 
   CHECK_LASTDIM_CONTIGUOUS(input);
   CHECK_CONTIGUOUS(output);
@@ -758,10 +762,10 @@ void quant_per_warp_int8_cuda(
           const auto stream = get_current_cuda_stream(input);
 
           QuantInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<grid, block, 0, stream>>>(
-            reinterpret_cast<c_type*>(input.data_ptr()),
+            static_cast<c_type*>(input.data_ptr()),
             nullptr,
-            output.data_ptr<int8_t>(),
-            reinterpret_cast<float*>(scale.data_ptr()),
+            static_cast<int8_t*>(output.data_ptr()),
+            static_cast<float*>(scale.data_ptr()),
             0.0,
             num_tokens,
             stride_bz_input, stride_seq_input, stride_h_input,
@@ -776,9 +780,9 @@ void quant_per_warp_int8_cuda(
 }
 
 void sub_mean_cuda(
-                torch::Tensor input,
-                torch::Tensor mean,
-                torch::Tensor output,
+                Tensor input,
+                Tensor mean,
+                Tensor output,
                 int64_t tensor_layout)
 {
   CHECK_CUDA(input);
@@ -793,7 +797,7 @@ void sub_mean_cuda(
   CHECK_DIMS(mean, 3);
   CHECK_DIMS(output, 4);
 
-  CHECK_DTYPE(output, torch::kHalf);
+  CHECK_DTYPE(output, torch::headeronly::ScalarType::Half);
 
   const int batch_size = input.size(0);
   const int head_dim = input.size(3);
@@ -826,7 +830,7 @@ void sub_mean_cuda(
   auto input_dtype = input.scalar_type();
   auto mean_dtype = mean.scalar_type();
 
-  TORCH_CHECK(input_dtype == mean_dtype, "Input and mean must have the same data type");
+  STD_TORCH_CHECK(input_dtype == mean_dtype, "Input and mean must have the same data type");
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
@@ -845,9 +849,9 @@ void sub_mean_cuda(
         const auto stream = get_current_cuda_stream(input);
 
         SubMeanKernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread><<<grid, block, 0, stream>>>(
-          reinterpret_cast<c_type*>(input.data_ptr()),
-          reinterpret_cast<c_type*>(mean.data_ptr()),
-          reinterpret_cast<half*>(output.data_ptr()),
+          static_cast<c_type*>(input.data_ptr()),
+          static_cast<c_type*>(mean.data_ptr()),
+          static_cast<half*>(output.data_ptr()),
           num_tokens,
           stride_bz_input, stride_seq_input, stride_h_input,
           mean.stride(0), mean.stride(1),
@@ -858,8 +862,8 @@ void sub_mean_cuda(
 }
 
 void transpose_pad_permute_cuda(
-                torch::Tensor input,
-                torch::Tensor output,
+                Tensor input,
+                Tensor output,
                 int64_t tensor_layout)
 {
   CHECK_CUDA(input);
@@ -911,7 +915,7 @@ void transpose_pad_permute_cuda(
   auto input_dtype = input.scalar_type();
   auto output_dtype = output.scalar_type();
 
-  TORCH_CHECK(input_dtype == output_dtype, "Input and output must have the same data type");
+  STD_TORCH_CHECK(input_dtype == output_dtype, "Input and output must have the same data type");
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
@@ -926,8 +930,8 @@ void transpose_pad_permute_cuda(
       const auto stream = get_current_cuda_stream(input);
 
       TransposePadPermuteKernel<HEAD_DIM, CTA_SIZE, true, c_type><<<grid, block, 0, stream>>>(
-        reinterpret_cast<c_type*>(input.data_ptr()),
-        reinterpret_cast<c_type*>(output.data_ptr()),
+        static_cast<c_type*>(input.data_ptr()),
+        static_cast<c_type*>(output.data_ptr()),
         num_tokens,
         stride_bz_input, stride_seq_input, stride_h_input,
         stride_bz_output, stride_d_output, stride_h_output
@@ -937,9 +941,9 @@ void transpose_pad_permute_cuda(
 }
 
 void scale_fuse_quant_cuda(
-                torch::Tensor input,
-                torch::Tensor output,
-                torch::Tensor scale,
+                Tensor input,
+                Tensor output,
+                Tensor scale,
                 int64_t num_tokens,
                 double scale_max,
                 int64_t tensor_layout)
@@ -948,8 +952,8 @@ void scale_fuse_quant_cuda(
   CHECK_CUDA(output);
   CHECK_CUDA(scale);
 
-  // CHECK_DTYPE(output, torch::kInt8);
-  CHECK_DTYPE(scale, torch::kFloat);
+  // CHECK_DTYPE(output, torch::headeronly::ScalarType::Char);
+  CHECK_DTYPE(scale, torch::headeronly::ScalarType::Float);
 
   CHECK_CONTIGUOUS(input);
   CHECK_CONTIGUOUS(output);
@@ -1002,10 +1006,10 @@ void scale_fuse_quant_cuda(
     const auto stream = get_current_cuda_stream(input);
 
     MeanScaleKernel<64, false, c_type><<<grid, block, 0, stream>>>(
-      reinterpret_cast<c_type*>(input.data_ptr()),
-      reinterpret_cast<int8_t*>(output.data_ptr()),
+      static_cast<c_type*>(input.data_ptr()),
+      static_cast<int8_t*>(output.data_ptr()),
       nullptr,
-      reinterpret_cast<float*>(scale.data_ptr()),
+      static_cast<float*>(scale.data_ptr()),
       scale_max,
       num_tokens,
       stride_bz_input, stride_d_input, stride_h_input,
@@ -1017,10 +1021,10 @@ void scale_fuse_quant_cuda(
 }
 
 void mean_scale_fuse_quant_cuda(
-                torch::Tensor input,
-                torch::Tensor output,
-                torch::Tensor mean,
-                torch::Tensor scale,
+                Tensor input,
+                Tensor output,
+                Tensor mean,
+                Tensor scale,
                 int64_t num_tokens,
                 double scale_max,
                 int64_t tensor_layout)
@@ -1030,9 +1034,9 @@ void mean_scale_fuse_quant_cuda(
   CHECK_CUDA(mean);
   CHECK_CUDA(scale);
 
-  // CHECK_DTYPE(output, torch::kInt8);
-  CHECK_DTYPE(mean, torch::kFloat);
-  CHECK_DTYPE(scale, torch::kFloat);
+  // CHECK_DTYPE(output, torch::headeronly::ScalarType::Char);
+  CHECK_DTYPE(mean, torch::headeronly::ScalarType::Float);
+  CHECK_DTYPE(scale, torch::headeronly::ScalarType::Float);
 
   CHECK_CONTIGUOUS(input);
   CHECK_CONTIGUOUS(output);
@@ -1088,10 +1092,10 @@ void mean_scale_fuse_quant_cuda(
     const auto stream = get_current_cuda_stream(input);
 
     MeanScaleKernel<64, true, c_type><<<grid, block, 0, stream>>>(
-      reinterpret_cast<c_type*>(input.data_ptr()),
-      reinterpret_cast<int8_t*>(output.data_ptr()),
-      reinterpret_cast<float*>(mean.data_ptr()),
-      reinterpret_cast<float*>(scale.data_ptr()),
+      static_cast<c_type*>(input.data_ptr()),
+      static_cast<int8_t*>(output.data_ptr()),
+      static_cast<float*>(mean.data_ptr()),
+      static_cast<float*>(scale.data_ptr()),
       scale_max,
       num_tokens,
       stride_bz_input, stride_d_input, stride_h_input,
