@@ -77,7 +77,7 @@ if not SKIP_CUDA_BUILD:
     else:
         CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
         LINK_FLAGS = []
-    CXX_FLAGS += ["-DPy_LIMITED_API=0x030A0000"]
+    CXX_FLAGS += ["-DPy_LIMITED_API=0x030A0000", "-DTORCH_STABLE_ONLY"]
 
     NVCC_FLAGS_COMMON = [
         "-O3",
@@ -91,6 +91,7 @@ if not SKIP_CUDA_BUILD:
         "-diag-suppress=177",
         "-diag-suppress=221",
         "-DPy_LIMITED_API=0x030A0000",
+        "-DTORCH_STABLE_ONLY",
     ]
     if os.name == "nt":
         # https://github.com/pytorch/pytorch/issues/148317
