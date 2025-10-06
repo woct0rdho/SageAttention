@@ -15,7 +15,7 @@
  */
 
 #include <Python.h>
-#include <torch/library.h>
+#include <torch/csrc/stable/library.h>
 
 #include "fused.h"
 
@@ -38,8 +38,123 @@ extern "C" {
     }
 }
 
+void boxed_quant_per_block_int8_scale_cuda(
+    StableIValue* stack,
+    uint64_t num_args,
+    uint64_t num_outputs
+) {
+    auto input = to<Tensor>(stack[0]);
+    auto output = to<Tensor>(stack[1]);
+    auto scale = to<Tensor>(stack[2]);
+    auto sm_scale = to<double>(stack[3]);
+    auto block_size = to<int64_t>(stack[4]);
+    auto tensor_layout = to<int64_t>(stack[5]);
+
+    quant_per_block_int8_scale_cuda(input, output, scale, sm_scale, block_size, tensor_layout);
+}
+
+void boxed_quant_per_block_int8_cuda(
+    StableIValue* stack,
+    uint64_t num_args,
+    uint64_t num_outputs
+) {
+    auto input = to<Tensor>(stack[0]);
+    auto output = to<Tensor>(stack[1]);
+    auto scale = to<Tensor>(stack[2]);
+    auto block_size = to<int64_t>(stack[3]);
+    auto tensor_layout = to<int64_t>(stack[4]);
+
+    quant_per_block_int8_cuda(input, output, scale, block_size, tensor_layout);
+}
+
+void boxed_quant_per_block_int8_fuse_sub_mean_cuda(
+    StableIValue* stack,
+    uint64_t num_args,
+    uint64_t num_outputs
+) {
+    auto input = to<Tensor>(stack[0]);
+    auto mean = to<Tensor>(stack[1]);
+    auto output = to<Tensor>(stack[2]);
+    auto scale = to<Tensor>(stack[3]);
+    auto block_size = to<int64_t>(stack[4]);
+    auto tensor_layout = to<int64_t>(stack[5]);
+
+    quant_per_block_int8_fuse_sub_mean_cuda(input, mean, output, scale, block_size, tensor_layout);
+}
+
+void boxed_quant_per_warp_int8_cuda(
+    StableIValue* stack,
+    uint64_t num_args,
+    uint64_t num_outputs
+) {
+    auto input = to<Tensor>(stack[0]);
+    auto output = to<Tensor>(stack[1]);
+    auto scale = to<Tensor>(stack[2]);
+    auto block_size = to<int64_t>(stack[3]);
+    auto wrap_block_size = to<int64_t>(stack[4]);
+    auto tensor_layout = to<int64_t>(stack[5]);
+
+    quant_per_warp_int8_cuda(input, output, scale, block_size, wrap_block_size, tensor_layout);
+}
+
+void boxed_sub_mean_cuda(
+    StableIValue* stack,
+    uint64_t num_args,
+    uint64_t num_outputs
+) {
+    auto input = to<Tensor>(stack[0]);
+    auto mean = to<Tensor>(stack[1]);
+    auto output = to<Tensor>(stack[2]);
+    auto tensor_layout = to<int64_t>(stack[3]);
+
+    sub_mean_cuda(input, mean, output, tensor_layout);
+}
+
+void boxed_transpose_pad_permute_cuda(
+    StableIValue* stack,
+    uint64_t num_args,
+    uint64_t num_outputs
+) {
+    auto input = to<Tensor>(stack[0]);
+    auto output = to<Tensor>(stack[1]);
+    auto tensor_layout = to<int64_t>(stack[2]);
+
+    transpose_pad_permute_cuda(input, output, tensor_layout);
+}
+
+void boxed_scale_fuse_quant_cuda(
+    StableIValue* stack,
+    uint64_t num_args,
+    uint64_t num_outputs
+) {
+    auto input = to<Tensor>(stack[0]);
+    auto output = to<Tensor>(stack[1]);
+    auto scale = to<Tensor>(stack[2]);
+    auto num_tokens = to<int64_t>(stack[3]);
+    auto scale_max = to<double>(stack[4]);
+    auto tensor_layout = to<int64_t>(stack[5]);
+
+    scale_fuse_quant_cuda(input, output, scale, num_tokens, scale_max, tensor_layout);
+}
+
+void boxed_mean_scale_fuse_quant_cuda(
+    StableIValue* stack,
+    uint64_t num_args,
+    uint64_t num_outputs
+) {
+    auto input = to<Tensor>(stack[0]);
+    auto output = to<Tensor>(stack[1]);
+    auto mean = to<Tensor>(stack[2]);
+    auto scale = to<Tensor>(stack[3]);
+    auto num_tokens = to<int64_t>(stack[4]);
+    auto scale_max = to<double>(stack[5]);
+    auto tensor_layout = to<int64_t>(stack[6]);
+
+    mean_scale_fuse_quant_cuda(input, output, mean, scale, num_tokens, scale_max, tensor_layout);
+}
+
 // Defines the operators
-TORCH_LIBRARY(sageattention_fused, m) {
+STABLE_TORCH_LIBRARY(sageattention_fused, m) {
     m.def("quant_per_block_int8_scale_cuda("
             "Tensor input, "
             "Tensor(a!) output, "
@@ -102,13 +217,13 @@ TORCH_LIBRARY(sageattention_fused, m) {
 }
 
 // Registers CUDA implementations
-TORCH_LIBRARY_IMPL(sageattention_fused, CUDA, m) {
-    m.impl("quant_per_block_int8_scale_cuda", &quant_per_block_int8_scale_cuda);
-    m.impl("quant_per_block_int8_cuda", &quant_per_block_int8_cuda);
-    m.impl("quant_per_block_int8_fuse_sub_mean_cuda", &quant_per_block_int8_fuse_sub_mean_cuda);
-    m.impl("quant_per_warp_int8_cuda", &quant_per_warp_int8_cuda);
-    m.impl("sub_mean_cuda", &sub_mean_cuda);
-    m.impl("transpose_pad_permute_cuda", &transpose_pad_permute_cuda);
-    m.impl("scale_fuse_quant_cuda", &scale_fuse_quant_cuda);
-    m.impl("mean_scale_fuse_quant_cuda", &mean_scale_fuse_quant_cuda);
+STABLE_TORCH_LIBRARY_IMPL(sageattention_fused, CUDA, m) {
+    m.impl("quant_per_block_int8_scale_cuda", &boxed_quant_per_block_int8_scale_cuda);
+    m.impl("quant_per_block_int8_cuda", &boxed_quant_per_block_int8_cuda);
+    m.impl("quant_per_block_int8_fuse_sub_mean_cuda", &boxed_quant_per_block_int8_fuse_sub_mean_cuda);
+    m.impl("quant_per_warp_int8_cuda", &boxed_quant_per_warp_int8_cuda);
+    m.impl("sub_mean_cuda", &boxed_sub_mean_cuda);
+    m.impl("transpose_pad_permute_cuda", &boxed_transpose_pad_permute_cuda);
+    m.impl("scale_fuse_quant_cuda", &boxed_scale_fuse_quant_cuda);
+    m.impl("mean_scale_fuse_quant_cuda", &boxed_mean_scale_fuse_quant_cuda);
 }
