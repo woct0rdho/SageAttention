@@ -19,7 +19,7 @@
 #include <cuda_pipeline_primitives.h>
 
 #include <torch/csrc/stable/ops.h>
-#include <torch/csrc/stable/tensor.h>
+#include <torch/csrc/stable/tensor_struct.h>
 
 #include <torch/headeronly/core/ScalarType.h>
 #include <torch/headeronly/util/Exception.h>
@@ -825,13 +825,13 @@ Tensor qk_int8_sv_f16_accum_f32_attn(Tensor query,
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
 
             kernel_func<<<grid, block, smem_max>>>(
-              static_cast<int8_t*>(query.data_ptr()), 
-              static_cast<int8_t*>(key.data_ptr()),
-              static_cast<half*>(value.data_ptr()),
-              static_cast<DTypeOut*>(output.data_ptr()),
-              (RETURN_LSE) ? static_cast<float*>(lse.data_ptr()) : nullptr,
-              static_cast<float*>(query_scale.data_ptr()),
-              static_cast<float*>(key_scale.data_ptr()),
+              reinterpret_cast<int8_t*>(query.data_ptr()), 
+              reinterpret_cast<int8_t*>(key.data_ptr()),
+              reinterpret_cast<half*>(value.data_ptr()),
+              reinterpret_cast<DTypeOut*>(output.data_ptr()),
+              (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
+              reinterpret_cast<float*>(query_scale.data_ptr()),
+              reinterpret_cast<float*>(key_scale.data_ptr()),
               nullptr,
               qo_len,
               kv_len,
@@ -998,13 +998,13 @@ Tensor qk_int8_sv_f16_accum_f16_attn(Tensor query,
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
 
             kernel_func<<<grid, block, smem_max>>>(
-              static_cast<int8_t*>(query.data_ptr()), 
-              static_cast<int8_t*>(key.data_ptr()),
-              static_cast<half*>(value.data_ptr()),
-              static_cast<DTypeOut*>(output.data_ptr()),
-              (RETURN_LSE) ? static_cast<float*>(lse.data_ptr()) : nullptr,
-              static_cast<float*>(query_scale.data_ptr()),
-              static_cast<float*>(key_scale.data_ptr()),
+              reinterpret_cast<int8_t*>(query.data_ptr()), 
+              reinterpret_cast<int8_t*>(key.data_ptr()),
+              reinterpret_cast<half*>(value.data_ptr()),
+              reinterpret_cast<DTypeOut*>(output.data_ptr()),
+              (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
+              reinterpret_cast<float*>(query_scale.data_ptr()),
+              reinterpret_cast<float*>(key_scale.data_ptr()),
               nullptr,
               qo_len,
               kv_len,
@@ -1171,13 +1171,13 @@ Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(Tensor query,
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
 
             kernel_func<<<grid, block, smem_max>>>(
-              static_cast<int8_t*>(query.data_ptr()), 
-              static_cast<int8_t*>(key.data_ptr()),
-              static_cast<half*>(value.data_ptr()),
-              static_cast<DTypeOut*>(output.data_ptr()),
-              (RETURN_LSE) ? static_cast<float*>(lse.data_ptr()) : nullptr,
-              static_cast<float*>(query_scale.data_ptr()),
-              static_cast<float*>(key_scale.data_ptr()),
+              reinterpret_cast<int8_t*>(query.data_ptr()), 
+              reinterpret_cast<int8_t*>(key.data_ptr()),
+              reinterpret_cast<half*>(value.data_ptr()),
+              reinterpret_cast<DTypeOut*>(output.data_ptr()),
+              (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
+              reinterpret_cast<float*>(query_scale.data_ptr()),
+              reinterpret_cast<float*>(key_scale.data_ptr()),
               nullptr,
               qo_len,
               kv_len,
@@ -1353,14 +1353,14 @@ Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(Tensor query,
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
 
             kernel_func<<<grid, block, smem_max>>>(
-              static_cast<int8_t*>(query.data_ptr()), 
-              static_cast<int8_t*>(key.data_ptr()),
-              static_cast<half*>(value.data_ptr()),
-              static_cast<DTypeOut*>(output.data_ptr()),
-              (RETURN_LSE) ? static_cast<float*>(lse.data_ptr()) : nullptr,
-              static_cast<float*>(query_scale.data_ptr()),
-              static_cast<float*>(key_scale.data_ptr()),
-              static_cast<DTypeOut*>(value_mean.data_ptr()),
+              reinterpret_cast<int8_t*>(query.data_ptr()), 
+              reinterpret_cast<int8_t*>(key.data_ptr()),
+              reinterpret_cast<half*>(value.data_ptr()),
+              reinterpret_cast<DTypeOut*>(output.data_ptr()),
+              (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
+              reinterpret_cast<float*>(query_scale.data_ptr()),
+              reinterpret_cast<float*>(key_scale.data_ptr()),
+              reinterpret_cast<DTypeOut*>(value_mean.data_ptr()),
               qo_len,
               kv_len,
               num_kv_groups,
