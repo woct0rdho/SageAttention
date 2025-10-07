@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include <torch/csrc/stable/tensor.h>
+#include <torch/csrc/stable/tensor_struct.h>
 
 #include <torch/headeronly/core/ScalarType.h>
 #include <torch/headeronly/util/Exception.h>
@@ -499,10 +499,10 @@ void quant_per_block_int8_scale_cuda(
         const auto stream = get_current_cuda_stream(input);
 
         QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, true, false, c_type><<<grid, block, 0, stream>>>(
-          static_cast<c_type*>(input.data_ptr()),
+          reinterpret_cast<c_type*>(input.data_ptr()),
           nullptr,
-          static_cast<int8_t*>(output.data_ptr()),
-          static_cast<float*>(scale.data_ptr()),
+          reinterpret_cast<int8_t*>(output.data_ptr()),
+          reinterpret_cast<float*>(scale.data_ptr()),
           sm_scale,
           num_tokens,
           stride_bz_input, stride_seq_input, stride_h_input,
@@ -583,10 +583,10 @@ void quant_per_block_int8_cuda(
         const auto stream = get_current_cuda_stream(input);
 
         QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<grid, block, 0, stream>>>(
-          static_cast<c_type*>(input.data_ptr()),
+          reinterpret_cast<c_type*>(input.data_ptr()),
           nullptr,
-          static_cast<int8_t*>(output.data_ptr()),
-          static_cast<float*>(scale.data_ptr()),
+          reinterpret_cast<int8_t*>(output.data_ptr()),
+          reinterpret_cast<float*>(scale.data_ptr()),
           0.0f,
           num_tokens,
           stride_bz_input, stride_seq_input, stride_h_input,
@@ -675,10 +675,10 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
         const auto stream = get_current_cuda_stream(input);
 
         QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, true, c_type><<<grid, block, 0, stream>>>(
-          static_cast<c_type*>(input.data_ptr()),
-          static_cast<c_type*>(mean.data_ptr()),
-          static_cast<int8_t*>(output.data_ptr()),
-          static_cast<float*>(scale.data_ptr()),
+          reinterpret_cast<c_type*>(input.data_ptr()),
+          reinterpret_cast<c_type*>(mean.data_ptr()),
+          reinterpret_cast<int8_t*>(output.data_ptr()),
+          reinterpret_cast<float*>(scale.data_ptr()),
           0.0f,
           num_tokens,
           stride_bz_input, stride_seq_input, stride_h_input,
@@ -762,10 +762,10 @@ void quant_per_warp_int8_cuda(
           const auto stream = get_current_cuda_stream(input);
 
           QuantInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<grid, block, 0, stream>>>(
-            static_cast<c_type*>(input.data_ptr()),
+            reinterpret_cast<c_type*>(input.data_ptr()),
             nullptr,
-            static_cast<int8_t*>(output.data_ptr()),
-            static_cast<float*>(scale.data_ptr()),
+            reinterpret_cast<int8_t*>(output.data_ptr()),
+            reinterpret_cast<float*>(scale.data_ptr()),
             0.0,
             num_tokens,
             stride_bz_input, stride_seq_input, stride_h_input,
@@ -849,9 +849,9 @@ void sub_mean_cuda(
         const auto stream = get_current_cuda_stream(input);
 
         SubMeanKernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread><<<grid, block, 0, stream>>>(
-          static_cast<c_type*>(input.data_ptr()),
-          static_cast<c_type*>(mean.data_ptr()),
-          static_cast<half*>(output.data_ptr()),
+          reinterpret_cast<c_type*>(input.data_ptr()),
+          reinterpret_cast<c_type*>(mean.data_ptr()),
+          reinterpret_cast<half*>(output.data_ptr()),
           num_tokens,
           stride_bz_input, stride_seq_input, stride_h_input,
           mean.stride(0), mean.stride(1),
@@ -930,8 +930,8 @@ void transpose_pad_permute_cuda(
       const auto stream = get_current_cuda_stream(input);
 
       TransposePadPermuteKernel<HEAD_DIM, CTA_SIZE, true, c_type><<<grid, block, 0, stream>>>(
-        static_cast<c_type*>(input.data_ptr()),
-        static_cast<c_type*>(output.data_ptr()),
+        reinterpret_cast<c_type*>(input.data_ptr()),
+        reinterpret_cast<c_type*>(output.data_ptr()),
         num_tokens,
         stride_bz_input, stride_seq_input, stride_h_input,
         stride_bz_output, stride_d_output, stride_h_output
@@ -1006,10 +1006,10 @@ void scale_fuse_quant_cuda(
     const auto stream = get_current_cuda_stream(input);
 
     MeanScaleKernel<64, false, c_type><<<grid, block, 0, stream>>>(
-      static_cast<c_type*>(input.data_ptr()),
-      static_cast<int8_t*>(output.data_ptr()),
+      reinterpret_cast<c_type*>(input.data_ptr()),
+      reinterpret_cast<int8_t*>(output.data_ptr()),
       nullptr,
-      static_cast<float*>(scale.data_ptr()),
+      reinterpret_cast<float*>(scale.data_ptr()),
       scale_max,
       num_tokens,
       stride_bz_input, stride_d_input, stride_h_input,
@@ -1092,10 +1092,10 @@ void mean_scale_fuse_quant_cuda(
     const auto stream = get_current_cuda_stream(input);
 
     MeanScaleKernel<64, true, c_type><<<grid, block, 0, stream>>>(
-      static_cast<c_type*>(input.data_ptr()),
-      static_cast<int8_t*>(output.data_ptr()),
-      static_cast<float*>(mean.data_ptr()),
-      static_cast<float*>(scale.data_ptr()),
+      reinterpret_cast<c_type*>(input.data_ptr()),
+      reinterpret_cast<int8_t*>(output.data_ptr()),
+      reinterpret_cast<float*>(mean.data_ptr()),
+      reinterpret_cast<float*>(scale.data_ptr()),
       scale_max,
       num_tokens,
       stride_bz_input, stride_d_input, stride_h_input,
