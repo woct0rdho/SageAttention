@@ -20,7 +20,7 @@
 #include <cuda_fp8.h>
 
 #include <torch/csrc/stable/ops.h>
-#include <torch/csrc/stable/tensor.h>
+#include <torch/csrc/stable/tensor_struct.h>
 
 #include <torch/headeronly/core/ScalarType.h>
 
