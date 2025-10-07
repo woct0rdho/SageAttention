@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include <vector>
 #include <torch/headeronly/util/Exception.h>
 
 #define CHECK_CUDA(x) \
