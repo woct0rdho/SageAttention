@@ -53,21 +53,13 @@ from typing import Any, List, Literal, Optional, Tuple, Union
 import warnings
 
 import functools
-import subprocess
-import re
 
 
 @functools.cache
 def get_cuda_version():
-    try:
-        output = subprocess.check_output(['nvcc', '--version']).decode()
-        match = re.search(r'release (\d+)\.(\d+)', output)
-        if match:
-            major, minor = int(match.group(1)), int(match.group(2))
-            return major, minor
-    except Exception as e:
-        print("Failed to get CUDA version:", e)
-    return None, None
+    version = torch.version.cuda
+    major, minor = version.split('.')
+    return int(major), int(minor)
 
 
 @functools.cache
@@ -149,8 +141,7 @@ def sageattn(
     elif arch in {"sm75", "sm86"}:
         return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
     elif arch == "sm89":
-        cuda_major_version, cuda_minor_version = get_cuda_version()
-        if (cuda_major_version, cuda_minor_version) < (12, 8):
+        if get_cuda_version() < (12, 8):
             pv_accum_dtype = "fp32+fp32"
         else:
             pv_accum_dtype = "fp32+fp16"
@@ -158,8 +149,7 @@ def sageattn(
     elif arch == "sm90":
         return sageattn_qk_int8_pv_fp8_cuda_sm90(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32")
     elif arch == "sm120":
-        cuda_major_version, cuda_minor_version = get_cuda_version()
-        if (cuda_major_version, cuda_minor_version) < (12, 8):
+        if get_cuda_version() < (12, 8):
             # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
             pv_accum_dtype = "fp32"
         else:
