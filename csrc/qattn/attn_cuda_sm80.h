@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// #include <torch/csrc/stable/tensor.h>
+#include <torch/csrc/stable/tensor.h>
 
 using torch::stable::Tensor;
 
