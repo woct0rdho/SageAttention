@@ -14,29 +14,31 @@
  * limitations under the License.
  */
 
-#include <torch/all.h>
+// #include <torch/csrc/stable/tensor.h>
 
-torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
-                    torch::Tensor query,
-                    torch::Tensor key,
-                    torch::Tensor value,
-                    torch::Tensor output,
-                    torch::Tensor query_scale,
-                    torch::Tensor key_scale,
+using torch::stable::Tensor;
+
+Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
+                    Tensor query,
+                    Tensor key,
+                    Tensor value,
+                    Tensor output,
+                    Tensor query_scale,
+                    Tensor key_scale,
                     int64_t tensor_layout,
                     int64_t is_causal,
                     int64_t qk_quant_gran,
                     double sm_scale,
                     int64_t return_lse);
 
-torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
-                    torch::Tensor query,
-                    torch::Tensor key,
-                    torch::Tensor value,
-                    torch::Tensor output,
-                    torch::Tensor query_scale,
-                    torch::Tensor key_scale,
-                    torch::Tensor value_scale,
+Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
+                    Tensor query,
+                    Tensor key,
+                    Tensor value,
+                    Tensor output,
+                    Tensor query_scale,
+                    Tensor key_scale,
+                    Tensor value_scale,
                     int64_t tensor_layout,
                     int64_t is_causal,
                     int64_t qk_quant_gran,
