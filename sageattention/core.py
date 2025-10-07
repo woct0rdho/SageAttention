@@ -149,11 +149,22 @@ def sageattn(
     elif arch in {"sm75", "sm86"}:
         return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
     elif arch == "sm89":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16")
+        cuda_major_version, cuda_minor_version = get_cuda_version()
+        if (cuda_major_version, cuda_minor_version) < (12, 8):
+            pv_accum_dtype = "fp32+fp32"
+        else:
+            pv_accum_dtype = "fp32+fp16"
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype=pv_accum_dtype)
     elif arch == "sm90":
         return sageattn_qk_int8_pv_fp8_cuda_sm90(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32")
     elif arch == "sm120":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16") # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
+        cuda_major_version, cuda_minor_version = get_cuda_version()
+        if (cuda_major_version, cuda_minor_version) < (12, 8):
+            # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
+            pv_accum_dtype = "fp32"
+        else:
+            pv_accum_dtype = "fp32+fp16"
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype=pv_accum_dtype)
     else:
         raise ValueError(f"Unsupported CUDA architecture: {arch}")
 
@@ -729,11 +740,6 @@ def sageattn_qk_int8_pv_fp8_cuda(
     assert qk_quant_gran in ["per_warp", "per_thread"], "qk_quant_gran must be either 'per_warp' or 'per_thread'."
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
-
-    # cuda_major_version, cuda_minor_version = get_cuda_version()
-    # if(cuda_major_version, cuda_minor_version) < (12, 8) and pv_accum_dtype == 'fp32+fp16':
-    #     warnings.warn("cuda version < 12.8, change pv_accum_dtype to 'fp32+fp32'")
-    #     pv_accum_dtype = 'fp32+fp32'
 
     # FIXME(DefTruth): make sage attention work compatible with distributed 
     # env, for example, xDiT which launch by torchrun. Without this workaround, 
