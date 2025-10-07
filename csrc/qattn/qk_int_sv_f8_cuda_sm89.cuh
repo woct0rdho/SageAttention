@@ -17,7 +17,11 @@
 #include "../utils.cuh"
 #include <cuda_fp16.h>
 #include <cuda_pipeline_primitives.h>
-#include <torch/all.h>
+
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor_struct.h>
+
+#include <torch/headeronly/core/ScalarType.h>
 
 #include "../cp_async.cuh"
 #include "../mma.cuh"
@@ -26,6 +30,8 @@
 #include "../dispatch_utils.h"
 
 #include "attn_utils.cuh"
+
+using torch::stable::Tensor;
 
 #define PACK_SIZE_QK 16 // as if it is int8
 #define PACK_SIZE_V 16  // fp8
