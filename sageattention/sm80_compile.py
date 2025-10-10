@@ -29,7 +29,7 @@ def sm80_qk_fake_impl(
     if return_lse:
         lse = torch.empty((batch_size, num_qo_heads, qo_len), dtype=torch.float32, device=query.device)
     else:
-        lse = torch.empty((0))
+        lse = torch.empty((0,), dtype=torch.float32, device=query.device)
     return lse
 
 
