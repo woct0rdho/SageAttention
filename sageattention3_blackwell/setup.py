@@ -58,15 +58,34 @@ if not SKIP_CUDA_BUILD:
     _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
     if bare_metal_version < Version("12.8"):
         raise RuntimeError("Sage3 is only supported on CUDA 12.8 and above")
-    cc_major, cc_minor = torch.cuda.get_device_capability()
-    if (cc_major, cc_minor) == (10, 0):  # sm_100
+
+    compute_capabilities = set()
+    if os.getenv("TORCH_CUDA_ARCH_LIST"):
+        # TORCH_CUDA_ARCH_LIST is separated by space or semicolon
+        for x in os.getenv("TORCH_CUDA_ARCH_LIST").replace(";", " ").split():
+            compute_capabilities.add(x)
+    else:
+        # Iterate over all GPUs on the current machine.
+        device_count = torch.cuda.device_count()
+        for i in range(device_count):
+            major, minor = torch.cuda.get_device_capability(i)
+            if major < 7:
+                warnings.warn(f"skipping GPU {i} with compute capability {major}.{minor}")
+                continue
+            compute_capabilities.add(f"{major}.{minor}")
+
+    def has_capability(target):
+        return any(cc.startswith(target) for cc in compute_capabilities)
+
+    if not has_capability(("10.0", "12.0")):
+        raise RuntimeError("Unsupported compute capability. You may set TORCH_CUDA_ARCH_LIST")
+
+    if has_capability("10.0"):
         cc_flag.append("-gencode")
         cc_flag.append("arch=compute_100a,code=sm_100a")
-    elif (cc_major, cc_minor) == (12, 0):  # sm_120
+    if has_capability("12.0"):
         cc_flag.append("-gencode")
         cc_flag.append("arch=compute_120a,code=sm_120a")
-    else:
-        raise RuntimeError("Unsupported GPU")
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
