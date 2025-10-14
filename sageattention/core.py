@@ -52,23 +52,23 @@ from .quant import per_channel_fp8
 from typing import Any, List, Literal, Optional, Tuple, Union
 import warnings
 
-import functools
 
-
-@functools.cache
 def get_cuda_version():
     version = torch.version.cuda
     major, minor = version.split('.')
     return int(major), int(minor)
 
 
-@functools.cache
 def get_cuda_arch_versions():
     cuda_archs = []
     for i in range(torch.cuda.device_count()):
         major, minor = torch.cuda.get_device_capability(i)
         cuda_archs.append(f"sm{major}{minor}")
     return cuda_archs
+
+
+# Currently get_cuda_arch_versions cannot be traced by torch.compile
+_cuda_archs = get_cuda_arch_versions()
 
 
 def sageattn(
@@ -135,7 +135,7 @@ def sageattn(
     - All tensors must be on the same cuda device.
     """
         
-    arch = get_cuda_arch_versions()[q.device.index]
+    arch = _cuda_archs[q.device.index]
     if arch in {"sm80", "sm86"}:
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
     elif arch == "sm75":
