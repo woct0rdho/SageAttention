@@ -4,99 +4,6 @@ from . import _qattn_sm80
 _qattn_sm80 = torch.ops.sageattention_qattn_sm80
 
 
-@torch.library.custom_op("sageattention::qk_int8_sv_f16_accum_f16_attn", mutates_args=("output",), device_types="cuda")
-def qk_int8_sv_f16_accum_f16_attn(
-    query: torch.Tensor, 
-    key: torch.Tensor, 
-    value: torch.Tensor, 
-    output: torch.Tensor, 
-    query_scale: torch.Tensor, 
-    key_scale: torch.Tensor, 
-    tensor_layout: int, 
-    is_causal: int, 
-    qk_quant_gran: int, 
-    sm_scale: float,
-    return_lse: int,
-) -> torch.Tensor:
-    """
-    Custom CUDA kernel for SageAttention with INT8 quantization for Q and K, FP16 PV with FP16 accumulation.
-    """
-    return _qattn_sm80.qk_int8_sv_f16_accum_f16_attn(
-        query, key, value, output, query_scale, key_scale, tensor_layout,
-        is_causal, qk_quant_gran, sm_scale, return_lse
-    )
-
-
-@torch.library.custom_op("sageattention::qk_int8_sv_f16_accum_f32_attn", mutates_args=("output",), device_types="cuda")
-def qk_int8_sv_f16_accum_f32_attn(
-    query: torch.Tensor, 
-    key: torch.Tensor, 
-    value: torch.Tensor, 
-    output: torch.Tensor, 
-    query_scale: torch.Tensor, 
-    key_scale: torch.Tensor, 
-    tensor_layout: int, 
-    is_causal: int, 
-    qk_quant_gran: int, 
-    sm_scale: float,
-    return_lse: int,
-) -> torch.Tensor:
-    """
-    Custom CUDA kernel for SageAttention with INT8 quantization for Q and K, FP16 PV with FP32 accumulation.
-    """
-    return _qattn_sm80.qk_int8_sv_f16_accum_f32_attn(
-        query, key, value, output, query_scale, key_scale, tensor_layout,
-        is_causal, qk_quant_gran, sm_scale, return_lse
-    )
-
-
-@torch.library.custom_op("sageattention::qk_int8_sv_f16_accum_f16_attn_inst_buf", mutates_args=("output",), device_types="cuda")
-def qk_int8_sv_f16_accum_f16_attn_inst_buf(
-    query: torch.Tensor, 
-    key: torch.Tensor, 
-    value: torch.Tensor, 
-    output: torch.Tensor, 
-    query_scale: torch.Tensor, 
-    key_scale: torch.Tensor, 
-    tensor_layout: int, 
-    is_causal: int, 
-    qk_quant_gran: int, 
-    sm_scale: float,
-    return_lse: int,
-) -> torch.Tensor:
-    """
-    Custom CUDA kernel for SageAttention with INT8 quantization for Q and K, FP16 PV with FP16 accumulation.
-    """
-    return _qattn_sm80.qk_int8_sv_f16_accum_f16_attn_inst_buf(
-        query, key, value, output, query_scale, key_scale, tensor_layout,
-        is_causal, qk_quant_gran, sm_scale, return_lse
-    )
-
-
-@torch.library.custom_op("sageattention::qk_int8_sv_f16_accum_f16_fuse_v_mean_attn", mutates_args=("output",), device_types="cuda")
-def qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(
-    query: torch.Tensor, 
-    key: torch.Tensor, 
-    value: torch.Tensor, 
-    output: torch.Tensor, 
-    query_scale: torch.Tensor, 
-    key_scale: torch.Tensor, 
-    value_mean: torch.Tensor, 
-    tensor_layout: int, 
-    is_causal: int, 
-    qk_quant_gran: int, 
-    sm_scale: float,
-    return_lse: int,
-) -> torch.Tensor:
-    """
-    Custom CUDA kernel for SageAttention with INT8 quantization for Q and K, FP16 PV with FP16 accumulation.
-    """
-    return _qattn_sm80.qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(
-        query, key, value, output, query_scale, key_scale, value_mean,
-        tensor_layout, is_causal, qk_quant_gran, sm_scale, return_lse
-    )
-
-
 def sm80_qk_fake_impl(
     query: torch.Tensor, 
     key: torch.Tensor, 
@@ -125,12 +32,13 @@ def sm80_qk_fake_impl(
         lse = torch.empty((0,))
     return lse
 
-torch.library.register_fake("sageattention::qk_int8_sv_f16_accum_f16_attn")(sm80_qk_fake_impl)
-torch.library.register_fake("sageattention::qk_int8_sv_f16_accum_f32_attn")(sm80_qk_fake_impl)
-torch.library.register_fake("sageattention::qk_int8_sv_f16_accum_f16_attn_inst_buf")(sm80_qk_fake_impl)
+
+torch.library.register_fake("sageattention_qattn_sm80::qk_int8_sv_f16_accum_f32_attn")(sm80_qk_fake_impl)
+torch.library.register_fake("sageattention_qattn_sm80::qk_int8_sv_f16_accum_f16_attn")(sm80_qk_fake_impl)
+torch.library.register_fake("sageattention_qattn_sm80::qk_int8_sv_f16_accum_f16_attn_inst_buf")(sm80_qk_fake_impl)
 
 
-@torch.library.register_fake("sageattention::qk_int8_sv_f16_accum_f16_fuse_v_mean_attn")
+@torch.library.register_fake("sageattention_qattn_sm80::qk_int8_sv_f16_accum_f16_fuse_v_mean_attn")
 def qk_int8_sv_f16_accum_f16_fuse_v_mean_attn_fake_impl(
     query: torch.Tensor, 
     key: torch.Tensor, 
