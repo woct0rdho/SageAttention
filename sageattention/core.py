@@ -253,14 +253,6 @@ def sageattn_qk_int8_pv_fp16_triton(
         assert attn_mask.dtype == torch.bool or attn_mask.dtype == q.dtype, "attn_mask must be of dtype bool or the same dtype as q."
         assert attn_mask.device == q.device, "All tensors must be on the same device."
 
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
-
     head_dim_og = q.size(-1)
 
     if head_dim_og < 64:
@@ -406,14 +398,6 @@ def sageattn_varlen(
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
 
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
-
     head_dim_og = q.size(-1)
 
     if head_dim_og < 64:
@@ -548,14 +532,6 @@ def sageattn_qk_int8_pv_fp16_cuda(
     assert qk_quant_gran in ["per_warp", "per_thread"], "qk_quant_gran must be either 'per_warp' or 'per_thread'."
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
-
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
 
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
     _is_caual = 1 if is_causal else 0
@@ -733,14 +709,6 @@ def sageattn_qk_int8_pv_fp8_cuda(
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
 
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
-
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
     _is_caual = 1 if is_causal else 0
     _qk_quant_gran = 3 if qk_quant_gran == "per_thread" else 2
@@ -914,8 +882,6 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     assert qk_quant_gran in ["per_warp", "per_thread"], "qk_quant_gran must be either 'per_warp' or 'per_thread'."
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
-
-    torch.cuda.set_device(v.device)
 
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
     _is_caual = 1 if is_causal else 0
