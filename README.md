@@ -44,9 +44,11 @@ If you want to run Wan, try [RadialAttention](https://github.com/woct0rdho/Comfy
 
 If you need to build and run SageAttention on your own machine:
 1. Install Visual Studio (MSVC and Windows SDK), and CUDA toolkit
-2. Clone this repo. Checkout `abi3_stable` branch if you want ABI3 and libtorch stable ABI
-3. Install the dependencies in [`pyproject.toml`](https://github.com/woct0rdho/SageAttention/blob/main/pyproject.toml), include the correct torch version such as `torch 2.7.1+cu128`
-4. Run `python setup.py install --verbose` to install directly, or `python setup.py bdist_wheel --verbose` to build a wheel. This avoids the environment checks of pip
+2. Clone this repo
+   * Checkout `abi3_stable` branch if you want ABI3 and libtorch stable ABI, which supports PyTorch >= 2.9
+   * Checkout `abi3` branch if you want ABI3, which supports PyTorch >= 2.4
+4. Install the dependencies in [`pyproject.toml`](https://github.com/woct0rdho/SageAttention/blob/main/pyproject.toml), include the correct torch version such as `torch 2.7.1+cu128`
+5. Run `python setup.py install --verbose` to install directly, or `python setup.py bdist_wheel --verbose` to build a wheel. This avoids the environment checks of pip
 
 ## Dev notes
 
