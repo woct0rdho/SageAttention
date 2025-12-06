@@ -3,8 +3,8 @@ import os
 from pathlib import Path
 from packaging.version import parse, Version
 from setuptools import setup, find_packages
+from setuptools.command.bdist_wheel import bdist_wheel
 import subprocess
-from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 import torch
 from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
@@ -19,7 +19,6 @@ FORCE_BUILD = os.getenv("FAHOPPER_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FAHOPPER_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FAHOPPER_FORCE_CXX11_ABI", "FALSE") == "TRUE"
-
 
 
 def get_cuda_bare_metal_version(cuda_dir):
@@ -44,7 +43,7 @@ def check_if_cuda_home_none(global_option: str) -> None:
 
 
 def append_nvcc_threads(nvcc_extra_args):
-    return nvcc_extra_args + ["--threads", "4"]
+    return nvcc_extra_args + ["--threads", f"{os.cpu_count()}"]
 
 
 cmdclass = {}
@@ -59,18 +58,34 @@ if not SKIP_CUDA_BUILD:
     _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
     if bare_metal_version < Version("12.8"):
         raise RuntimeError("Sage3 is only supported on CUDA 12.8 and above")
-    cc_major, cc_minor = torch.cuda.get_device_capability()
-    if (cc_major, cc_minor) == (10, 0):  # sm_100
+
+    compute_capabilities = set()
+    if os.getenv("TORCH_CUDA_ARCH_LIST"):
+        # TORCH_CUDA_ARCH_LIST is separated by space or semicolon
+        for x in os.getenv("TORCH_CUDA_ARCH_LIST").replace(";", " ").split():
+            compute_capabilities.add(x)
+    else:
+        # Iterate over all GPUs on the current machine.
+        device_count = torch.cuda.device_count()
+        for i in range(device_count):
+            major, minor = torch.cuda.get_device_capability(i)
+            if major < 7:
+                warnings.warn(f"skipping GPU {i} with compute capability {major}.{minor}")
+                continue
+            compute_capabilities.add(f"{major}.{minor}")
+
+    def has_capability(target):
+        return any(cc.startswith(target) for cc in compute_capabilities)
+
+    if not has_capability(("10.0", "12.0")):
+        raise RuntimeError("Unsupported compute capability. You may set TORCH_CUDA_ARCH_LIST")
+
+    if has_capability("10.0"):
         cc_flag.append("-gencode")
         cc_flag.append("arch=compute_100a,code=sm_100a")
-    elif (cc_major, cc_minor) == (12, 0):  # sm_120
+    if has_capability("12.0"):
         cc_flag.append("-gencode")
         cc_flag.append("arch=compute_120a,code=sm_120a")
-    elif (cc_major, cc_minor) == (12, 1):  # sm_121
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_121a,code=sm_121a")
-    else:
-        raise RuntimeError("Unsupported GPU")
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -78,16 +93,16 @@ if not SKIP_CUDA_BUILD:
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
     repo_dir = Path(this_dir)
-    cutlass_dir = repo_dir / "csrc" / "cutlass"
-    (repo_dir / "csrc").mkdir(parents=True, exist_ok=True)
-    if not cutlass_dir.exists():
-        subprocess.run(
-            ["git", "clone", "--depth", "1", "https://github.com/NVIDIA/cutlass.git", str(cutlass_dir)],
-            check=True
-        )
+    cutlass_dir = repo_dir / "cutlass"
+
+    if os.name == "nt":
+        # TODO: Detect MSVC rather than OS
+        CXX_FLAGS = ["/O2", "/std:c++17", "/permissive-"]
+    else:
+        CXX_FLAGS = ["-O3", "-std=c++17"]
+
     nvcc_flags = [
         "-O3",
-        # "-O0",
         "-std=c++17",
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
@@ -98,7 +113,6 @@ if not SKIP_CUDA_BUILD:
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
         "--use_fast_math",
-        # "--ptxas-options=-v",  # printing out number of registers
         "--ptxas-options=--verbose,--warn-on-local-memory-usage",  # printing out number of registers
         "-lineinfo",
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
@@ -107,19 +121,30 @@ if not SKIP_CUDA_BUILD:
         "-DKBLKSIZE=128",
         "-DCTA256",
         "-DDQINRMEM",
+        "-diag-suppress=68",
+        "-diag-suppress=177",
+        "-diag-suppress=221",
+        "-diag-suppress=550",
+        "-diag-suppress=3357",
     ]
+    if os.name == "nt":
+        # https://github.com/pytorch/pytorch/issues/148317
+        nvcc_flags += [
+            "-D_WIN32=1",
+            "-DUSE_CUDA=1",
+        ]
+
     include_dirs = [
-        repo_dir / "sageattn3",
         cutlass_dir / "include",
         cutlass_dir / "tools" / "util" / "include",
     ]
 
     ext_modules.append(
         CUDAExtension(
-            name="fp4attn_cuda",
-            sources=["sageattn3/blackwell/api.cu"],
+            name="sageattn3.fp4attn_cuda",
+            sources=["csrc/blackwell/api.cu"],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
+                "cxx": CXX_FLAGS,
                 "nvcc": append_nvcc_threads(
                     nvcc_flags + ["-DEXECMODE=0"] + cc_flag
                 ),
@@ -131,10 +156,10 @@ if not SKIP_CUDA_BUILD:
     )
     ext_modules.append(
         CUDAExtension(
-            name="fp4quant_cuda",
-            sources=["sageattn3/quantization/fp4_quantization_4d.cu"],
+            name="sageattn3.fp4quant_cuda",
+            sources=["csrc/quantization/fp4_quantization_4d.cu"],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
+                "cxx": CXX_FLAGS,
                 "nvcc": append_nvcc_threads(
                     nvcc_flags + ["-DEXECMODE=0"] + cc_flag
                 ),
@@ -146,24 +171,15 @@ if not SKIP_CUDA_BUILD:
     )
 
 
-
-class CachedWheelsCommand(_bdist_wheel):
+class CachedWheelsCommand(bdist_wheel):
     def run(self):
         super().run()
 
+
 setup(
     name=PACKAGE_NAME,
-    version="1.0.0",
-    packages=find_packages(
-        exclude=(
-            "build",
-            "csrc",
-            "tests",
-            "dist",
-            "docs",
-            "benchmarks",
-        )
-    ),
+    version="1.0.0" + os.environ.get("SAGEATTENTION_WHEEL_VERSION_SUFFIX", ""),
+    packages=find_packages(),
     description="FP4FlashAttention",
     long_description_content_type="text/markdown",
     classifiers=[
@@ -174,14 +190,6 @@ setup(
     ext_modules=ext_modules,
     cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": BuildExtension}
     if ext_modules
-    else {
-        "bdist_wheel": CachedWheelsCommand,
-    },
-    python_requires=">=3.8",
-    install_requires=[
-        "torch",
-        "einops",
-        "packaging",
-        "ninja",
-    ],
+    else {"bdist_wheel": CachedWheelsCommand},
+    python_requires=">=3.9",
 )
