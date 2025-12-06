@@ -52,20 +52,11 @@ from .quant import per_channel_fp8
 from typing import Any, List, Literal, Optional, Tuple, Union
 import warnings
 
-import subprocess
-import re
-
 
 def get_cuda_version():
-    try:
-        output = subprocess.check_output(['nvcc', '--version']).decode()
-        match = re.search(r'release (\d+)\.(\d+)', output)
-        if match:
-            major, minor = int(match.group(1)), int(match.group(2))
-            return major, minor
-    except Exception as e:
-        print("Failed to get CUDA version:", e)
-    return None, None
+    version = torch.version.cuda
+    major, minor = version.split('.')
+    return int(major), int(minor)
 
 
 def get_cuda_arch_versions():
@@ -74,6 +65,10 @@ def get_cuda_arch_versions():
         major, minor = torch.cuda.get_device_capability(i)
         cuda_archs.append(f"sm{major}{minor}")
     return cuda_archs
+
+
+# Currently get_cuda_arch_versions cannot be traced by torch.compile
+_cuda_archs = get_cuda_arch_versions()
 
 
 def sageattn(
@@ -140,19 +135,28 @@ def sageattn(
     - All tensors must be on the same cuda device.
     """
         
-    arch = get_cuda_arch_versions()[q.device.index]
-    if arch == "sm80":
-        return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
-    elif arch == "sm86":
+    arch = _cuda_archs[q.device.index]
+    if arch in {"sm70", "sm75"}:
         return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
+    elif arch in {"sm80", "sm86"}:
+        return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
     elif arch == "sm89":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16")
+        if get_cuda_version() < (12, 8):
+            pv_accum_dtype = "fp32+fp32"
+        else:
+            # SageAttention2++
+            pv_accum_dtype = "fp32+fp16"
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype=pv_accum_dtype)
     elif arch == "sm90":
         return sageattn_qk_int8_pv_fp8_cuda_sm90(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32")
-    elif arch == "sm120":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16") # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
-    elif arch == "sm121":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16") # sm121 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm121.
+    elif arch in {"sm100", "sm120", "sm121"}:
+        if get_cuda_version() < (12, 8):
+            # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
+            pv_accum_dtype = "fp32"
+        else:
+            # SageAttention2++
+            pv_accum_dtype = "fp32+fp16"
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype=pv_accum_dtype)
     else:
         raise ValueError(f"Unsupported CUDA architecture: {arch}")
 
@@ -248,14 +252,6 @@ def sageattn_qk_int8_pv_fp16_triton(
     if attn_mask is not None:
         assert attn_mask.dtype == torch.bool or attn_mask.dtype == q.dtype, "attn_mask must be of dtype bool or the same dtype as q."
         assert attn_mask.device == q.device, "All tensors must be on the same device."
-
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
 
     head_dim_og = q.size(-1)
 
@@ -402,14 +398,6 @@ def sageattn_varlen(
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
 
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
-
     head_dim_og = q.size(-1)
 
     if head_dim_og < 64:
@@ -544,14 +532,6 @@ def sageattn_qk_int8_pv_fp16_cuda(
     assert qk_quant_gran in ["per_warp", "per_thread"], "qk_quant_gran must be either 'per_warp' or 'per_thread'."
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
-
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
 
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
     _is_caual = 1 if is_causal else 0
@@ -729,19 +709,6 @@ def sageattn_qk_int8_pv_fp8_cuda(
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
 
-    # cuda_major_version, cuda_minor_version = get_cuda_version()
-    # if(cuda_major_version, cuda_minor_version) < (12, 8) and pv_accum_dtype == 'fp32+fp16':
-    #     warnings.warn("cuda version < 12.8, change pv_accum_dtype to 'fp32+fp32'")
-    #     pv_accum_dtype = 'fp32+fp32'
-
-    # FIXME(DefTruth): make sage attention work compatible with distributed 
-    # env, for example, xDiT which launch by torchrun. Without this workaround, 
-    # sage attention will run into illegal memory access error after first 
-    # inference step in distributed env for multi gpus inference. This small
-    # workaround also make sage attention work compatible with torch.compile
-    # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
-
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
     _is_caual = 1 if is_causal else 0
     _qk_quant_gran = 3 if qk_quant_gran == "per_thread" else 2
@@ -915,8 +882,6 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     assert qk_quant_gran in ["per_warp", "per_thread"], "qk_quant_gran must be either 'per_warp' or 'per_thread'."
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
-
-    torch.cuda.set_device(v.device)
 
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
     _is_caual = 1 if is_causal else 0
