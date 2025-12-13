@@ -588,14 +588,14 @@ __device__ __forceinline__ void mma_sync_m16n8k32_row_col_s8s8s32(int32_t* C, ui
   );
 
   // MMA 2: M = 8..15, N = 0..7, K = 0..15
-  // Inputs: A[2], B[0]
+  // Inputs: A[1], B[0] (Fixed: Was A[2])
   // Accumulator: C[2], C[3] (or 0 if kInit)
   // Output: tmp2, tmp3
   asm volatile(
       "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
       "{%0, %1}, {%2}, {%3}, {%4, %5};\n"
       : "=r"(tmp2), "=r"(tmp3)
-      : "r"(A[2]), // This operand corresponds to rows M=8..15
+      : "r"(A[1]), // Fixed: Use A[1] for Bottom-Left (M=8..15, K=0..15)
         "r"(B[0]),
         "r"( (mma_mode == MMAMode::kInit) ? 0 : C[2] ),
         "r"( (mma_mode == MMAMode::kInit) ? 0 : C[3] )
@@ -606,14 +606,14 @@ __device__ __forceinline__ void mma_sync_m16n8k32_row_col_s8s8s32(int32_t* C, ui
   // Accumulate onto results from first K-half (stored in tmp0..3)
 
   // MMA 3: M = 0..7, N = 0..7, K = 16..31
-  // Inputs: A[1], B[1]
+  // Inputs: A[2], B[1] (Fixed: Was A[1])
   // Accumulator: tmp0, tmp1
   // Output: C[0], C[1]
   asm volatile(
       "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
       "{%0, %1}, {%2}, {%3}, {%4, %5};\n"
       : "=r"(C[0]), "=r"(C[1]) // Write final result directly to C
-      : "r"(A[1]), // Corresponds to K=16..31 part
+      : "r"(A[2]), // Fixed: Use A[2] for Top-Right (M=0..7, K=16..31)
         "r"(B[1]),
         "r"(tmp0),  // Accumulate with first K-half result
         "r"(tmp1)
@@ -691,117 +691,90 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_s8s8s32(int32_t* C, u
   }
 #else  // SM_75 fallback path
   // Emulate m16n16k32 using eight m8n8k16 instructions (4 for spatial tiles x 2 for K dimension)
-  // Assumes A layout: A[0]=r0-7 k0-15, A[1]=r0-7 k16-31, A[2]=r8-15 k0-15, A[3]=r8-15 k16-31
-  // Assumes B layout: B[0]=k0-15 c0-7, B[1]=k16-31 c0-7, B[2]=k0-15 c8-15, B[3]=k16-31 c8-15
+  // Corrected Layout mapping:
+  // LDMATRIX.x4 produces [R0, R1, R2, R3].
+  // Assuming LDMATRIX order:
+  // R0: TL (M0-7, K0-15)
+  // R1: BL (M8-15, K0-15)
+  // R2: TR (M0-7, K16-31)
+  // R3: BR (M8-15, K16-31)
+  //
+  // Previous code swapped R1 and R2 usage incorrectly. Fixed below.
 
-  // Temporary accumulators if needed, or use C directly. Let's use C directly.
-  int32_t c_tmp[8]; // Use temp array to avoid reading potentially uninitialized C in kInit mode
+  int32_t c_tmp[8];
 
   if constexpr (mma_mode == MMAMode::kInit) {
-      // Initialize accumulators to 0
-      // (Note: Use explicit 0 in asm operands for kInit)
       #pragma unroll
-      for (int i=0; i<8; ++i) c_tmp[i] = 0; // Use temps for kInit path intermediate accumulation
+      for (int i=0; i<8; ++i) c_tmp[i] = 0;
   } else {
-      // Copy C input to temps for kInplaceUpdate intermediate accumulation
       #pragma unroll
       for (int i=0; i<8; ++i) c_tmp[i] = C[i];
   }
-
 
   // --- K Chunk 0 (k = 0..15) ---
   // MMA 1.0: Rows 0-7, Cols 0-7, K 0-15
   asm volatile(
       "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1},"                  // D = c_tmp[0..1]
-      "{%2},"                       // A = A[0]
-      "{%3},"                       // B = B[0]
-      "{%4,  %5};\n"                 // C = c_tmp[0..1] (or {0,0} if kInit was handled outside)
+      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
       : "=r"(c_tmp[0]), "=r"(c_tmp[1])
-      : "r"(A[0]), "r"(B[0]),
-        "r"(c_tmp[0]), "r"(c_tmp[1])
+      : "r"(A[0]), "r"(B[0]), "r"(c_tmp[0]), "r"(c_tmp[1])
   );
   // MMA 2.0: Rows 8-15, Cols 0-7, K 0-15
+  // FIXED: Input A should be A[1] (BL) not A[2]
   asm volatile(
       "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1},"                  // D = c_tmp[2..3]
-      "{%2},"                       // A = A[2]
-      "{%3},"                       // B = B[0]
-      "{%4,  %5};\n"                 // C = c_tmp[2..3]
+      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
       : "=r"(c_tmp[2]), "=r"(c_tmp[3])
-      : "r"(A[2]), "r"(B[0]),
-        "r"(c_tmp[2]), "r"(c_tmp[3])
+      : "r"(A[1]), "r"(B[0]), "r"(c_tmp[2]), "r"(c_tmp[3])
   );
   // MMA 3.0: Rows 0-7, Cols 8-15, K 0-15
   asm volatile(
       "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1},"                  // D = c_tmp[4..5]
-      "{%2},"                       // A = A[0]
-      "{%3},"                       // B = B[2]
-      "{%4,  %5};\n"                 // C = c_tmp[4..5]
+      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
       : "=r"(c_tmp[4]), "=r"(c_tmp[5])
-      : "r"(A[0]), "r"(B[2]),
-        "r"(c_tmp[4]), "r"(c_tmp[5])
+      : "r"(A[0]), "r"(B[2]), "r"(c_tmp[4]), "r"(c_tmp[5])
   );
   // MMA 4.0: Rows 8-15, Cols 8-15, K 0-15
+  // FIXED: Input A should be A[1] (BL) not A[2]
   asm volatile(
       "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1},"                  // D = c_tmp[6..7]
-      "{%2},"                       // A = A[2]
-      "{%3},"                       // B = B[2]
-      "{%4,  %5};\n"                 // C = c_tmp[6..7]
+      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
       : "=r"(c_tmp[6]), "=r"(c_tmp[7])
-      : "r"(A[2]), "r"(B[2]),
-        "r"(c_tmp[6]), "r"(c_tmp[7])
+      : "r"(A[1]), "r"(B[2]), "r"(c_tmp[6]), "r"(c_tmp[7])
   );
 
   // --- K Chunk 1 (k = 16..31) --- Accumulate results
   // MMA 1.1: Rows 0-7, Cols 0-7, K 16-31
+  // FIXED: Input A should be A[2] (TR) not A[1]
   asm volatile(
       "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1},"                  // D = c_tmp[0..1]
-      "{%2},"                       // A = A[1]
-      "{%3},"                       // B = B[1]
-      "{%4,  %5};\n"                 // C = c_tmp[0..1] (Accumulate)
+      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
       : "=r"(c_tmp[0]), "=r"(c_tmp[1])
-      : "r"(A[1]), "r"(B[1]),
-        "r"(c_tmp[0]), "r"(c_tmp[1]) // Input is result from K chunk 0
+      : "r"(A[2]), "r"(B[1]), "r"(c_tmp[0]), "r"(c_tmp[1])
   );
   // MMA 2.1: Rows 8-15, Cols 0-7, K 16-31
   asm volatile(
       "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1},"                  // D = c_tmp[2..3]
-      "{%2},"                       // A = A[3]
-      "{%3},"                       // B = B[1]
-      "{%4,  %5};\n"                 // C = c_tmp[2..3] (Accumulate)
+      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
       : "=r"(c_tmp[2]), "=r"(c_tmp[3])
-      : "r"(A[3]), "r"(B[1]),
-        "r"(c_tmp[2]), "r"(c_tmp[3]) // Input is result from K chunk 0
+      : "r"(A[3]), "r"(B[1]), "r"(c_tmp[2]), "r"(c_tmp[3])
   );
   // MMA 3.1: Rows 0-7, Cols 8-15, K 16-31
+  // FIXED: Input A should be A[2] (TR) not A[1]
   asm volatile(
       "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1},"                  // D = c_tmp[4..5]
-      "{%2},"                       // A = A[1]
-      "{%3},"                       // B = B[3]
-      "{%4,  %5};\n"                 // C = c_tmp[4..5] (Accumulate)
+      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
       : "=r"(c_tmp[4]), "=r"(c_tmp[5])
-      : "r"(A[1]), "r"(B[3]),
-        "r"(c_tmp[4]), "r"(c_tmp[5]) // Input is result from K chunk 0
+      : "r"(A[2]), "r"(B[3]), "r"(c_tmp[4]), "r"(c_tmp[5])
   );
   // MMA 4.1: Rows 8-15, Cols 8-15, K 16-31
   asm volatile(
       "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1},"                  // D = c_tmp[6..7]
-      "{%2},"                       // A = A[3]
-      "{%3},"                       // B = B[3]
-      "{%4,  %5};\n"                 // C = c_tmp[6..7] (Accumulate)
+      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
       : "=r"(c_tmp[6]), "=r"(c_tmp[7])
-      : "r"(A[3]), "r"(B[3]),
-        "r"(c_tmp[6]), "r"(c_tmp[7]) // Input is result from K chunk 0
+      : "r"(A[3]), "r"(B[3]), "r"(c_tmp[6]), "r"(c_tmp[7])
   );
 
-  // Write final accumulated results from temps back to C
   #pragma unroll
   for (int i=0; i<8; ++i) C[i] = c_tmp[i];
 #endif
@@ -1088,26 +1061,29 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, uint32_t* s) {
 #else
   // SM75 fallback using m16n8k8 instruction for k8 instead of k16
   // We need to do the same operation in two parts
+  
+  // Use dummy registers for unused outputs to avoid using '_' with +f constraint
+  float dummy0, dummy1, dummy2, dummy3;
 
   // First half of the input (k=0..7)
   asm volatile(
       "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-      "{%0,  _,  %1,  _},"
-      "{%2,  %3},"
-      "{%4},"
-      "{%5,  0.,  %6,  0.};\n"
-      : "=f"(d[0]), "=f"(d[1])
+      "{%0,  %2,  %1,  %3},"
+      "{%4,  %5},"
+      "{%6},"
+      "{%7,  0.,  %8,  0.};\n"
+      : "=f"(d[0]), "=f"(d[1]), "=f"(dummy0), "=f"(dummy1)
       : "r"(s[0]), "r"(s[1]), "r"(1006648320),  // 1006648320 packs two 1.0f in half precision
         "f"(d[0]), "f"(d[1]));
 
   // Second half of the input (k=8..15)
   asm volatile(
       "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-      "{%0,  _,  %1,  _},"
-      "{%2,  %3},"
-      "{%4},"
-      "{%5,  0.,  %6,  0.};\n"
-      : "=f"(d[0]), "=f"(d[1])
+      "{%0,  %2,  %1,  %3},"
+      "{%4,  %5},"
+      "{%6},"
+      "{%7,  0.,  %8,  0.};\n"
+      : "=f"(d[0]), "=f"(d[1]), "=f"(dummy2), "=f"(dummy3)
       : "r"(s[2]), "r"(s[3]), "r"(1006648320),  // 1006648320 packs two 1.0f in half precision
         "f"(d[0]), "f"(d[1]));
 #endif
