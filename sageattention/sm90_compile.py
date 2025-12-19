@@ -48,7 +48,7 @@ def qk_int8_sv_f8_accum_f32_attn_inst_buf_fake_impl(
     if return_lse:
         lse = torch.empty((batch_size, num_qo_heads, qo_len), dtype=torch.float32, device=query.device)
     else:
-        lse = torch.empty((0))
+        lse = torch.empty((0,))
     return lse
 
 
