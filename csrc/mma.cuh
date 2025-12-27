@@ -163,67 +163,39 @@ __device__ __forceinline__ void mma_sync_m16n8k16_row_col_f16f16f32(float* C, ui
           "f"(0.f), "f"(0.f));
   }
 #else  // MMA_F16F16F32_M16N8K16_ENABLED
+  // SM75 optimization: Use single ASM block to allow ILP between the two MMA instructions.
+  // Although K-split implies dependency, keeping them in one block helps register allocation.
+  float t0, t1, t2, t3;
   if constexpr (mma_mode == MMAMode::kInplaceUpdate)
   {
-    // SM_75 fallback for InplaceUpdate
     asm volatile(
         "{\n"
-        ".reg .b32 tmp0, tmp1, tmp2, tmp3;\n" // Temp float registers for intermediate accumulation
-
-        // First m16n8k8: Processes first half of K dimension (k=0..7)
-        // Inputs: A[0], A[1] (holding first 4 f16s of A's K dim)
-        //         B[0]      (holding first 2 f16s of B's K dim)
-        // Accumulates from existing C values into temps
         "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-        "{tmp0,  tmp1,  tmp2,  tmp3}," // Output to temps
-        "{%4,  %5},"                   // Input A registers {A[0], A[1]}
-        "{%8},"                        // Input B register {B[0]}
-        "{%10, %11, %12, %13};\n"      // Input C accumulators {C[0], C[1], C[2], C[3]}
-
-        // Second m16n8k8: Processes second half of K dimension (k=8..15)
-        // Inputs: A[2], A[3] (holding second 4 f16s of A's K dim)
-        //         B[1]      (holding second 2 f16s of B's K dim)
-        // Accumulates from temps into final C registers
+        "{%0,  %1,  %2,  %3}, {%8,  %9}, {%12}, {%14, %15, %16, %17};\n"
         "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-        "{%0,  %1,  %2,  %3},"         // Output to final C registers {C[0], C[1], C[2], C[3]}
-        "{%6,  %7},"                   // Input A registers {A[2], A[3]}
-        "{%9},"                        // Input B register {B[1]}
-        "{tmp0,  tmp1,  tmp2,  tmp3};\n" // Input C accumulators (temps from previous step)
+        "{%4,  %5,  %6,  %7}, {%10, %11}, {%13}, {%0,  %1,  %2,  %3};\n"
         "}\n"
-        : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])   // %0..3: Output registers (final C)
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),     // %4..7: Input registers for A
-          "r"(B[0]), "r"(B[1]),                           // %8..9: Input registers for B
-          "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]));   // %10..13: Input registers for initial C (read-only)
+        : "=&f"(t0), "=&f"(t1), "=&f"(t2), "=&f"(t3),
+          "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+          "r"(B[0]), "r"(B[1]),
+          "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3])
+    );
   }
   else if constexpr (mma_mode == MMAMode::kInit)
   {
-    // SM_75 fallback for Init
     asm volatile(
         "{\n"
-        ".reg .b32 tmp0, tmp1, tmp2, tmp3;\n" // Temp float registers
-
-        // First m16n8k8: Processes first half of K dimension (k=0..7)
-        // Inputs: A[0], A[1], B[0]
-        // Accumulates from 0.f into temps
         "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-        "{tmp0,  tmp1,  tmp2,  tmp3}," // Output to temps
-        "{%4,  %5},"                   // Input A registers {A[0], A[1]}
-        "{%8},"                        // Input B register {B[0]}
-        "{%10, %11, %12, %13};\n"      // Input C accumulators {0.f, 0.f, 0.f, 0.f}
-
-        // Second m16n8k8: Processes second half of K dimension (k=8..15)
-        // Inputs: A[2], A[3], B[1]
-        // Accumulates from temps into final C registers
+        "{%0,  %1,  %2,  %3}, {%8,  %9}, {%12}, {0.0, 0.0, 0.0, 0.0};\n"
         "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-        "{%0,  %1,  %2,  %3},"         // Output to final C registers {C[0], C[1], C[2], C[3]}
-        "{%6,  %7},"                   // Input A registers {A[2], A[3]}
-        "{%9},"                        // Input B register {B[1]}
-        "{tmp0,  tmp1,  tmp2,  tmp3};\n" // Input C accumulators (temps from previous step)
+        "{%4,  %5,  %6,  %7}, {%10, %11}, {%13}, {%0,  %1,  %2,  %3};\n"
         "}\n"
-        : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])   // %0..3: Output registers (final C)
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),     // %4..7: Input registers for A
-          "r"(B[0]), "r"(B[1]),                           // %8..9: Input registers for B
-          "f"(0.f), "f"(0.f), "f"(0.f), "f"(0.f));       // %10..13: Input registers for initial C (zeros)
+        : "=&f"(t0), "=&f"(t1), "=&f"(t2), "=&f"(t3),
+          "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+          "r"(B[0]), "r"(B[1])
+    );
   }
 #endif
 }
@@ -284,107 +256,49 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
           "f"(0.f), "f"(0.f));
   }
 #else  // MMA_F16F16F32_M16N8K16_ENABLED
-  // Define temporary registers for the accumulator chaining
-  float t0, t1, t2, t3;
+  // SM75 optimization: Interleave Left and Right halves calculations to hide latency.
+  float t0, t1, t2, t3, t4, t5, t6, t7;
 
   if constexpr (mma_mode == MMAMode::kInplaceUpdate)
   {
-      // --- First m16n8k16 replacement (uses B[0], B[1]) ---
-      // First m16n8k8 step (K=0..7)
       asm volatile(
+          "{\n"
           "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-          "{%0, %1, %2, %3}," // Temporaries
-          "{%4, %5},"          // A[0], A[1]
-          "{%6},"              // B[0]
-          "{%7, %8, %9, %10};" // C[0], C[1], C[2], C[3] initial
-          : "=f"(t0), "=f"(t1), "=f"(t2), "=f"(t3)
-          : "r"(A[0]), "r"(A[1]), "r"(B[0]),
-            "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3])
-      );
-      // Second m16n8k8 step (K=8..15), accumulating into temps
-      asm volatile(
+          "{%0, %1, %2, %3}, {%8, %9}, {%12}, {%16, %17, %18, %19};\n"
           "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-          "{%0, %1, %2, %3}," // C[0], C[1], C[2], C[3] final
-          "{%4, %5},"          // A[2], A[3]
-          "{%6},"              // B[1]
-          "{%7, %8, %9, %10};" // Temporaries from previous step
-          : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
-          : "r"(A[2]), "r"(A[3]), "r"(B[1]),
-            "f"(t0), "f"(t1), "f"(t2), "f"(t3)
-      );
-
-      // --- Second m16n8k16 replacement (uses B[2], B[3]) ---
-       // First m16n8k8 step (K=0..7)
-      asm volatile(
+          "{%4, %5, %6, %7}, {%8, %9}, {%14}, {%20, %21, %22, %23};\n"
           "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-          "{%0, %1, %2, %3}," // Temporaries
-          "{%4, %5},"          // A[0], A[1]
-          "{%6},"              // B[2]
-          "{%7, %8, %9, %10};" // C[4], C[5], C[6], C[7] initial
-          : "=f"(t0), "=f"(t1), "=f"(t2), "=f"(t3)
-          : "r"(A[0]), "r"(A[1]), "r"(B[2]),
-            "f"(C[4]), "f"(C[5]), "f"(C[6]), "f"(C[7])
-      );
-      // Second m16n8k8 step (K=8..15), accumulating into temps
-      asm volatile(
+          "{%16, %17, %18, %19}, {%10, %11}, {%13}, {%0, %1, %2, %3};\n"
           "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-          "{%0, %1, %2, %3}," // C[4], C[5], C[6], C[7] final
-          "{%4, %5},"          // A[2], A[3]
-          "{%6},"              // B[3]
-          "{%7, %8, %9, %10};" // Temporaries from previous step
-          : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
-          : "r"(A[2]), "r"(A[3]), "r"(B[3]),
-            "f"(t0), "f"(t1), "f"(t2), "f"(t3)
+          "{%20, %21, %22, %23}, {%10, %11}, {%15}, {%4, %5, %6, %7};\n"
+          "}\n"
+          : "=&f"(t0), "=&f"(t1), "=&f"(t2), "=&f"(t3),
+            "=&f"(t4), "=&f"(t5), "=&f"(t6), "=&f"(t7),
+            "+r"(A[0]), "+r"(A[1]), "+r"(A[2]), "+r"(A[3]),
+            "+r"(B[0]), "+r"(B[1]), "+r"(B[2]), "+r"(B[3]),
+            "+f"(C[0]), "+f"(C[1]), "+f"(C[2]), "+f"(C[3]),
+            "+f"(C[4]), "+f"(C[5]), "+f"(C[6]), "+f"(C[7])
       );
   }
   else if constexpr (mma_mode == MMAMode::kInit)
   {
-      // --- First m16n8k16 replacement (uses B[0], B[1]) ---
-      // First m16n8k8 step (K=0..7)
       asm volatile(
+          "{\n"
           "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-          "{%0, %1, %2, %3}," // Temporaries
-          "{%4, %5},"          // A[0], A[1]
-          "{%6},"              // B[0]
-          "{%7, %8, %9, %10};" // Zero initializers
-          : "=f"(t0), "=f"(t1), "=f"(t2), "=f"(t3)
-          : "r"(A[0]), "r"(A[1]), "r"(B[0]),
-            "f"(0.f), "f"(0.f), "f"(0.f), "f"(0.f)
-      );
-      // Second m16n8k8 step (K=8..15), accumulating into temps
-      asm volatile(
+          "{%0, %1, %2, %3}, {%8, %9}, {%12}, {0.0, 0.0, 0.0, 0.0};\n"
           "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-          "{%0, %1, %2, %3}," // C[0], C[1], C[2], C[3] final
-          "{%4, %5},"          // A[2], A[3]
-          "{%6},"              // B[1]
-          "{%7, %8, %9, %10};" // Temporaries from previous step
-          : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
-          : "r"(A[2]), "r"(A[3]), "r"(B[1]),
-            "f"(t0), "f"(t1), "f"(t2), "f"(t3)
-      );
-
-      // --- Second m16n8k16 replacement (uses B[2], B[3]) ---
-       // First m16n8k8 step (K=0..7)
-      asm volatile(
+          "{%4, %5, %6, %7}, {%8, %9}, {%14}, {0.0, 0.0, 0.0, 0.0};\n"
           "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-          "{%0, %1, %2, %3}," // Temporaries
-          "{%4, %5},"          // A[0], A[1]
-          "{%6},"              // B[2]
-          "{%7, %8, %9, %10};" // Zero initializers
-          : "=f"(t0), "=f"(t1), "=f"(t2), "=f"(t3)
-          : "r"(A[0]), "r"(A[1]), "r"(B[2]),
-            "f"(0.f), "f"(0.f), "f"(0.f), "f"(0.f)
-      );
-      // Second m16n8k8 step (K=8..15), accumulating into temps
-      asm volatile(
+          "{%16, %17, %18, %19}, {%10, %11}, {%13}, {%0, %1, %2, %3};\n"
           "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-          "{%0, %1, %2, %3}," // C[4], C[5], C[6], C[7] final
-          "{%4, %5},"          // A[2], A[3]
-          "{%6},"              // B[3]
-          "{%7, %8, %9, %10};" // Temporaries from previous step
-          : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
-          : "r"(A[2]), "r"(A[3]), "r"(B[3]),
-            "f"(t0), "f"(t1), "f"(t2), "f"(t3)
+          "{%20, %21, %22, %23}, {%10, %11}, {%15}, {%4, %5, %6, %7};\n"
+          "}\n"
+          : "=&f"(t0), "=&f"(t1), "=&f"(t2), "=&f"(t3),
+            "=&f"(t4), "=&f"(t5), "=&f"(t6), "=&f"(t7),
+            "+r"(A[0]), "+r"(A[1]), "+r"(A[2]), "+r"(A[3]),
+            "+r"(B[0]), "+r"(B[1]), "+r"(B[2]), "+r"(B[3]),
+            "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3]),
+            "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
       );
   }
 #endif
@@ -486,39 +400,24 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f16(uint32_t* C
   uint32_t c2_in = (mma_mode == MMAMode::kInit) ? 0 : C[2];
   uint32_t c3_in = (mma_mode == MMAMode::kInit) ? 0 : C[3];
 
-  // Fragment mapping:
-  // A: {A[0], A[1]} for k=0..7, {A[2], A[3]} for k=8..15
-  // B: {B[0]} k=0..7,n=0..7 | {B[1]} k=8..15,n=0..7 | {B[2]} k=0..7,n=8..15 | {B[3]} k=8..15,n=8..15
-  // C: {C[0], C[1]} n=0..7 | {C[2], C[3]} n=8..15
-
   asm volatile(
     "{\n"
-    // Allocate 4 temporary registers (.b32) for intermediate f16 pairs
     "  .reg .b32 t0, t1, t2, t3;\n\n"
-
-    // --- Compute first 16x8 tile (C0: n=0..7) ---
-    // 1. First K-half: tmp{0,1} = A[k=0..7] * B[k=0..7, n=0..7] + C_in{0,1}
     "  mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
-    "{t0, t1}, {%4, %5}, {%8}, {%12, %13};\n" // Inputs: A[0,1], B[0], C_in[0,1]
-    // 2. Second K-half: C{0,1} = A[k=8..15] * B[k=8..15, n=0..7] + tmp{0,1}
+    "{t0, t1}, {%4, %5}, {%8}, {%12, %13};\n"
     "  mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
-    "{%0, %1}, {%6, %7}, {%9}, {t0, t1};\n\n" // Inputs: A[2,3], B[1], tmp[0,1] -> Output: C[0,1]
-
-    // --- Compute second 16x8 tile (C1: n=8..15) ---
-    // 1. First K-half: tmp{2,3} = A[k=0..7] * B[k=0..7, n=8..15] + C_in{2,3}
+    "{t2, t3}, {%4, %5}, {%10}, {%14, %15};\n"
     "  mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
-    "{t2, t3}, {%4, %5}, {%10}, {%14, %15};\n" // Inputs: A[0,1], B[2], C_in[2,3]
-    // 2. Second K-half: C{2,3} = A[k=8..15] * B[k=8..15, n=8..15] + tmp{2,3}
+    "{%0, %1}, {%6, %7}, {%9}, {t0, t1};\n\n" 
     "  mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
-    "{%2, %3}, {%6, %7}, {%11}, {t2, t3};\n" // Inputs: A[2,3], B[3], tmp[2,3] -> Output: C[2,3]
+    "{%2, %3}, {%6, %7}, {%11}, {t2, t3};\n"
     "}\n"
-    : // Output Constraints: Final accumulator values C[0]..C[3]
+    : 
       "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
-    : // Input Constraints: A[0]..A[3], B[0]..B[3], initial C_in[0]..C_in[3]
+    : 
       "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),     // %4 , %5 , %6 , %7
       "r"(B[0]), "r"(B[1]), "r"(B[2]), "r"(B[3]),     // %8 , %9 , %10, %11
       "r"(c0_in), "r"(c1_in), "r"(c2_in), "r"(c3_in)  // %12, %13, %14, %15
-    // No explicit clobbers needed for .reg allocated temps
   );
 #endif
 }
@@ -560,78 +459,36 @@ __device__ __forceinline__ void mma_sync_m16n8k32_row_col_s8s8s32(int32_t* C, ui
           "r"(0), "r"(0));
   }
 #else  // MMA_S8S8S32_M16N8K32_ENABLED
+  // SM75 optimization: Merge into one ASM block
+  int32_t t0, t1, t2, t3;
 
-  // Emulate m16n8k32.s8.s8.s32 using four m8n8k16.s8.s8.s32 operations.
-  // SM_75 supports m8n8k16 for s8 inputs.
-  // A[0..3] holds the M=16, K=32 fragment components.
-  // B[0..1] holds the K=32, N=8 fragment components.
-  // C[0..3] holds the M=16, N=8 accumulator components.
-  //   C[0], C[1] -> M=0..7 part
-  //   C[2], C[3] -> M=8..15 part
-
-  int32_t tmp0, tmp1, tmp2, tmp3; // Temporary accumulators for first K-half
-
-  // === K = 0..15 part ===
-
-  // MMA 1: M = 0..7, N = 0..7, K = 0..15
-  // Inputs: A[0], B[0]
-  // Accumulator: C[0], C[1] (or 0 if kInit)
-  // Output: tmp0, tmp1
-  asm volatile(
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0, %1}, {%2}, {%3}, {%4, %5};\n"
-      : "=r"(tmp0), "=r"(tmp1)
-      : "r"(A[0]),
-        "r"(B[0]),
-        "r"( (mma_mode == MMAMode::kInit) ? 0 : C[0] ),
-        "r"( (mma_mode == MMAMode::kInit) ? 0 : C[1] )
-  );
-
-  // MMA 2: M = 8..15, N = 0..7, K = 0..15
-  // Inputs: A[1], B[0] (Fixed: Was A[2])
-  // Accumulator: C[2], C[3] (or 0 if kInit)
-  // Output: tmp2, tmp3
-  asm volatile(
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0, %1}, {%2}, {%3}, {%4, %5};\n"
-      : "=r"(tmp2), "=r"(tmp3)
-      : "r"(A[1]), // Fixed: Use A[1] for Bottom-Left (M=8..15, K=0..15)
-        "r"(B[0]),
-        "r"( (mma_mode == MMAMode::kInit) ? 0 : C[2] ),
-        "r"( (mma_mode == MMAMode::kInit) ? 0 : C[3] )
-  );
-
-
-  // === K = 16..31 part ===
-  // Accumulate onto results from first K-half (stored in tmp0..3)
-
-  // MMA 3: M = 0..7, N = 0..7, K = 16..31
-  // Inputs: A[2], B[1] (Fixed: Was A[1])
-  // Accumulator: tmp0, tmp1
-  // Output: C[0], C[1]
-  asm volatile(
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0, %1}, {%2}, {%3}, {%4, %5};\n"
-      : "=r"(C[0]), "=r"(C[1]) // Write final result directly to C
-      : "r"(A[2]), // Fixed: Use A[2] for Top-Right (M=0..7, K=16..31)
-        "r"(B[1]),
-        "r"(tmp0),  // Accumulate with first K-half result
-        "r"(tmp1)
-  );
-
-  // MMA 4: M = 8..15, N = 0..7, K = 16..31
-  // Inputs: A[3], B[1]
-  // Accumulator: tmp2, tmp3
-  // Output: C[2], C[3]
-  asm volatile(
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0, %1}, {%2}, {%3}, {%4, %5};\n"
-      : "=r"(C[2]), "=r"(C[3]) // Write final result directly to C
-      : "r"(A[3]), // Corresponds to M=8..15, K=16..31 part
-        "r"(B[1]),
-        "r"(tmp2),  // Accumulate with first K-half result
-        "r"(tmp3)
-  );
+  if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
+    asm volatile(
+        "{\n"
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%8}, {%12}, {%14, %15};\n" // A0, B0 -> t0,t1 (accum C0,C1)
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%2, %3}, {%9}, {%12}, {%16, %17};\n" // A1, B0 -> t2,t3 (accum C2,C3)
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%14, %15}, {%10}, {%13}, {%0, %1};\n" // A2, B1 -> C0,C1 (accum t0,t1)
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%16, %17}, {%11}, {%13}, {%2, %3};\n" // A3, B1 -> C2,C3 (accum t2,t3)
+        "}\n"
+        : "=&r"(t0), "=&r"(t1), "=&r"(t2), "=&r"(t3),
+          "+r"(A[0]), "+r"(A[1]), "+r"(A[2]), "+r"(A[3]), // %8-11
+          "+r"(B[0]), "+r"(B[1]), // %12-13
+          "+r"(C[0]), "+r"(C[1]), "+r"(C[2]), "+r"(C[3]) // %14-17
+    );
+  } else {
+    asm volatile(
+        "{\n"
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%8}, {%12}, {0, 0};\n"
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%2, %3}, {%9}, {%12}, {0, 0};\n"
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%14, %15}, {%10}, {%13}, {%0, %1};\n"
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%16, %17}, {%11}, {%13}, {%2, %3};\n"
+        "}\n"
+        : "=&r"(t0), "=&r"(t1), "=&r"(t2), "=&r"(t3),
+          "+r"(A[0]), "+r"(A[1]), "+r"(A[2]), "+r"(A[3]),
+          "+r"(B[0]), "+r"(B[1]),
+          "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
+    );
+  }
 #endif
 }
 
@@ -690,93 +547,51 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_s8s8s32(int32_t* C, u
           "r"(0), "r"(0));
   }
 #else  // SM_75 fallback path
-  // Emulate m16n16k32 using eight m8n8k16 instructions (4 for spatial tiles x 2 for K dimension)
-  // Corrected Layout mapping:
-  // LDMATRIX.x4 produces [R0, R1, R2, R3].
-  // Assuming LDMATRIX order:
-  // R0: TL (M0-7, K0-15)
-  // R1: BL (M8-15, K0-15)
-  // R2: TR (M0-7, K16-31)
-  // R3: BR (M8-15, K16-31)
-  //
-  // Previous code swapped R1 and R2 usage incorrectly. Fixed below.
+  int32_t t0, t1, t2, t3, t4, t5, t6, t7;
 
-  int32_t c_tmp[8];
-
-  if constexpr (mma_mode == MMAMode::kInit) {
-      #pragma unroll
-      for (int i=0; i<8; ++i) c_tmp[i] = 0;
+  if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
+      asm volatile(
+          "{\n"
+          // K chunk 0 (k=0-15)
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%8}, {%12}, {%16, %17};\n" // TL: A0, B0 -> t0,t1 (accum C0,C1)
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%2, %3}, {%9}, {%12}, {%18, %19};\n" // BL: A1, B0 -> t2,t3 (accum C2,C3)
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%4, %5}, {%8}, {%14}, {%20, %21};\n" // TR: A0, B2 -> t4,t5 (accum C4,C5)
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%6, %7}, {%9}, {%14}, {%22, %23};\n" // BR: A1, B2 -> t6,t7 (accum C6,C7)
+          
+          // K chunk 1 (k=16-31)
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%16, %17}, {%10}, {%13}, {%0, %1};\n" // TL: A2, B1 -> C0,C1 (accum t0,t1)
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%18, %19}, {%11}, {%13}, {%2, %3};\n" // BL: A3, B1 -> C2,C3 (accum t2,t3)
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%20, %21}, {%10}, {%15}, {%4, %5};\n" // TR: A2, B3 -> C4,C5 (accum t4,t5)
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%22, %23}, {%11}, {%15}, {%6, %7};\n" // BR: A3, B3 -> C6,C7 (accum t6,t7)
+          "}\n"
+          : "=&r"(t0), "=&r"(t1), "=&r"(t2), "=&r"(t3), "=&r"(t4), "=&r"(t5), "=&r"(t6), "=&r"(t7),
+            "+r"(A[0]), "+r"(A[1]), "+r"(A[2]), "+r"(A[3]), // %8-11
+            "+r"(B[0]), "+r"(B[1]), "+r"(B[2]), "+r"(B[3]), // %12-15
+            "+r"(C[0]), "+r"(C[1]), "+r"(C[2]), "+r"(C[3]), // %16-19
+            "+r"(C[4]), "+r"(C[5]), "+r"(C[6]), "+r"(C[7])  // %20-23
+      );
   } else {
-      #pragma unroll
-      for (int i=0; i<8; ++i) c_tmp[i] = C[i];
+      asm volatile(
+          "{\n"
+          // K chunk 0 (k=0-15)
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%8}, {%12}, {0, 0};\n"
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%2, %3}, {%9}, {%12}, {0, 0};\n"
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%4, %5}, {%8}, {%14}, {0, 0};\n"
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%6, %7}, {%9}, {%14}, {0, 0};\n"
+          
+          // K chunk 1 (k=16-31)
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%16, %17}, {%10}, {%13}, {%0, %1};\n"
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%18, %19}, {%11}, {%13}, {%2, %3};\n"
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%20, %21}, {%10}, {%15}, {%4, %5};\n"
+          "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%22, %23}, {%11}, {%15}, {%6, %7};\n"
+          "}\n"
+          : "=&r"(t0), "=&r"(t1), "=&r"(t2), "=&r"(t3), "=&r"(t4), "=&r"(t5), "=&r"(t6), "=&r"(t7),
+            "+r"(A[0]), "+r"(A[1]), "+r"(A[2]), "+r"(A[3]),
+            "+r"(B[0]), "+r"(B[1]), "+r"(B[2]), "+r"(B[3]),
+            "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3]),
+            "=r"(C[4]), "=r"(C[5]), "=r"(C[6]), "=r"(C[7])
+      );
   }
-
-  // --- K Chunk 0 (k = 0..15) ---
-  // MMA 1.0: Rows 0-7, Cols 0-7, K 0-15
-  asm volatile(
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
-      : "=r"(c_tmp[0]), "=r"(c_tmp[1])
-      : "r"(A[0]), "r"(B[0]), "r"(c_tmp[0]), "r"(c_tmp[1])
-  );
-  // MMA 2.0: Rows 8-15, Cols 0-7, K 0-15
-  // FIXED: Input A should be A[1] (BL) not A[2]
-  asm volatile(
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
-      : "=r"(c_tmp[2]), "=r"(c_tmp[3])
-      : "r"(A[1]), "r"(B[0]), "r"(c_tmp[2]), "r"(c_tmp[3])
-  );
-  // MMA 3.0: Rows 0-7, Cols 8-15, K 0-15
-  asm volatile(
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
-      : "=r"(c_tmp[4]), "=r"(c_tmp[5])
-      : "r"(A[0]), "r"(B[2]), "r"(c_tmp[4]), "r"(c_tmp[5])
-  );
-  // MMA 4.0: Rows 8-15, Cols 8-15, K 0-15
-  // FIXED: Input A should be A[1] (BL) not A[2]
-  asm volatile(
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
-      : "=r"(c_tmp[6]), "=r"(c_tmp[7])
-      : "r"(A[1]), "r"(B[2]), "r"(c_tmp[6]), "r"(c_tmp[7])
-  );
-
-  // --- K Chunk 1 (k = 16..31) --- Accumulate results
-  // MMA 1.1: Rows 0-7, Cols 0-7, K 16-31
-  // FIXED: Input A should be A[2] (TR) not A[1]
-  asm volatile(
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
-      : "=r"(c_tmp[0]), "=r"(c_tmp[1])
-      : "r"(A[2]), "r"(B[1]), "r"(c_tmp[0]), "r"(c_tmp[1])
-  );
-  // MMA 2.1: Rows 8-15, Cols 0-7, K 16-31
-  asm volatile(
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
-      : "=r"(c_tmp[2]), "=r"(c_tmp[3])
-      : "r"(A[3]), "r"(B[1]), "r"(c_tmp[2]), "r"(c_tmp[3])
-  );
-  // MMA 3.1: Rows 0-7, Cols 8-15, K 16-31
-  // FIXED: Input A should be A[2] (TR) not A[1]
-  asm volatile(
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
-      : "=r"(c_tmp[4]), "=r"(c_tmp[5])
-      : "r"(A[2]), "r"(B[3]), "r"(c_tmp[4]), "r"(c_tmp[5])
-  );
-  // MMA 4.1: Rows 8-15, Cols 8-15, K 16-31
-  asm volatile(
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0,  %1}, {%2}, {%3}, {%4,  %5};\n"
-      : "=r"(c_tmp[6]), "=r"(c_tmp[7])
-      : "r"(A[3]), "r"(B[3]), "r"(c_tmp[6]), "r"(c_tmp[7])
-  );
-
-  #pragma unroll
-  for (int i=0; i<8; ++i) C[i] = c_tmp[i];
 #endif
 }
 
@@ -1068,24 +883,14 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, uint32_t* s) {
   // First half of the input (k=0..7)
   asm volatile(
       "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-      "{%0,  %2,  %1,  %3},"
-      "{%4,  %5},"
-      "{%6},"
-      "{%7,  0.,  %8,  0.};\n"
-      : "=f"(d[0]), "=f"(d[1]), "=f"(dummy0), "=f"(dummy1)
-      : "r"(s[0]), "r"(s[1]), "r"(1006648320),  // 1006648320 packs two 1.0f in half precision
-        "f"(d[0]), "f"(d[1]));
-
-  // Second half of the input (k=8..15)
-  asm volatile(
+      "{%0,  %2,  %1,  %3}, {%4,  %5}, {%6}, {%7,  0.,  %8,  0.};\n"
       "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-      "{%0,  %2,  %1,  %3},"
-      "{%4,  %5},"
-      "{%6},"
-      "{%7,  0.,  %8,  0.};\n"
-      : "=f"(d[0]), "=f"(d[1]), "=f"(dummy2), "=f"(dummy3)
-      : "r"(s[2]), "r"(s[3]), "r"(1006648320),  // 1006648320 packs two 1.0f in half precision
-        "f"(d[0]), "f"(d[1]));
+      "{%0,  %2,  %1,  %3}, {%9,  %10}, {%6}, {%0,  0.,  %1,  0.};\n"
+      : "+f"(d[0]), "+f"(d[1]), "=f"(dummy0), "=f"(dummy1)
+      : "r"(s[0]), "r"(s[1]), "r"(1006648320),
+        "f"(d[0]), "f"(d[1]),
+        "r"(s[2]), "r"(s[3])
+  );
 #endif
 }
 
