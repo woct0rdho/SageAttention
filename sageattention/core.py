@@ -414,8 +414,12 @@ def sageattn_varlen(
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
     assert cu_seqlens_q.is_contiguous() and cu_seqlens_k.is_contiguous(), "cu_seqlens_q and cu_seqlens_k must be contiguous."
 
+    compute_dtype = dtype
     if dtype == torch.bfloat16 or dtype == torch.float32:
+        q = q.to(torch.float16)
+        k = k.to(torch.float16)
         v = v.to(torch.float16)
+        compute_dtype = torch.float16
 
     if smooth_k:
         km = k.mean(dim=0, keepdim=True) # ! km is calculated on the all the batches. Calculate over each individual sequence requires dedicated kernel.
@@ -427,11 +431,14 @@ def sageattn_varlen(
     q_int8, q_scale, k_int8, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale = per_block_int8_varlen_triton(q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=sm_scale)
 
     if is_causal:
-        o = attn_true_varlen(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=dtype)
+        o = attn_true_varlen(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=compute_dtype)
     else:
-        o = attn_false_varlen(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=dtype)
+        o = attn_false_varlen(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=compute_dtype)
 
     o = o[..., :head_dim_og]
+    
+    if o.dtype != dtype:
+        o = o.to(dtype)
 
     return o
 
@@ -959,3 +966,5 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
         return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
     else:
         return o
+
+
