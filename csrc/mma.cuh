@@ -125,13 +125,80 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) 
 #endif
 }
 
+// =========================================================================================
+// [New Addition] Low-Level Primitives for Software Pipelining (The "Split MMA" Strategy)
+
+// =========================================================================================
+
 /*!
- * \brief Wrapper of the mma m16n8k16 instruction for row major and column major f16 matrix
- *   multiplication, accumulated in f32.
- * \tparam mma_mode The mode of mma instruction, either kInit or kInplaceUpdate
- * \param C pointer to the accumulator
- * \param A pointer to the fragment of matrix A
- * \param B pointer to the fragment of matrix B
+ * \brief [Primitive] Raw m16n8k8 MMA instruction for SM75.
+ * This is the atomic unit of computation on Turing.
+ * Use this to build pipelined m16n8k16 or m16n16k16 loops.
+ */
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void mma_sync_m16n8k8_f16f16f32(float* C, uint32_t* A, uint32_t* B) {
+#ifdef MMA_F16F16F32_M16N8K8_ENABLED
+  if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5},"
+        "{%6},"
+        "{%0,  %1,  %2,  %3};\n" // Input C is also Output C (Accumulate)
+        : "+f"(C[0]), "+f"(C[1]), "+f"(C[2]), "+f"(C[3])
+        : "r"(A[0]), "r"(A[1]), "r"(B[0])
+    );
+  } else {
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5},"
+        "{%6},"
+        "{0.0, 0.0, 0.0, 0.0};\n" // Zero initialize
+        : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+        : "r"(A[0]), "r"(A[1]), "r"(B[0])
+    );
+  }
+#else
+  RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+#endif
+}
+
+/*!
+ * \brief [Primitive] Raw m8n8k16 INT8 MMA instruction for SM75.
+ * This is the atomic unit for INT8 on Turing.
+ */
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void mma_sync_m8n8k16_s8s8s32(int32_t* C, uint32_t A, uint32_t B) {
+#ifdef MMA_S8S8S32_M16N8K32_ENABLED
+  // SM80 uses the larger instruction, but if we are manually pipelining on SM75, we fall back here.
+  // Note: On SM80+ you should usually prefer the atomic m16n8k32 unless doing very specific scheduling.
+  // This primitive is specifically for SM75 optimization.
+  if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
+    asm volatile(
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+        "{%0, %1}, {%2}, {%3}, {%0, %1};\n"
+        : "+r"(C[0]), "+r"(C[1])
+        : "r"(A), "r"(B)
+    );
+  } else {
+    asm volatile(
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+        "{%0, %1}, {%2}, {%3}, {0, 0};\n"
+        : "=r"(C[0]), "=r"(C[1])
+        : "r"(A), "r"(B)
+    );
+  }
+#endif
+}
+
+// =========================================================================================
+// High-Level Wrappers (Optimized for Atomicity + ILP)
+// If you cannot manually pipeline, use these. They use interleaved assembly to hide latency locally.
+// =========================================================================================
+
+/*!
+ * \brief Wrapper of the mma m16n8k16 instruction...
  */
 template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n8k16_row_col_f16f16f32(float* C, uint32_t* A,
@@ -163,8 +230,9 @@ __device__ __forceinline__ void mma_sync_m16n8k16_row_col_f16f16f32(float* C, ui
           "f"(0.f), "f"(0.f));
   }
 #else  // MMA_F16F16F32_M16N8K16_ENABLED
-  // SM75 optimization: Use single ASM block to allow ILP between the two MMA instructions.
-  // Although K-split implies dependency, keeping them in one block helps register allocation.
+  // [Optimization] SM75 optimized fallback
+  // Uses a single ASM block to allow the compiler to handle register allocation better.
+  // Interleaves the two K-steps inside the hardware pipeline.
   float t0, t1, t2, t3;
   if constexpr (mma_mode == MMAMode::kInplaceUpdate)
   {
@@ -175,7 +243,7 @@ __device__ __forceinline__ void mma_sync_m16n8k16_row_col_f16f16f32(float* C, ui
         "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
         "{%4,  %5,  %6,  %7}, {%10, %11}, {%13}, {%0,  %1,  %2,  %3};\n"
         "}\n"
-        : "=&f"(t0), "=&f"(t1), "=&f"(t2), "=&f"(t3),
+        : "=&f"(t0), "=&f"(t1), "=&f"(t2), "=&f"(t3), // Early-clobber temps
           "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
         : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
           "r"(B[0]), "r"(B[1]),
@@ -201,12 +269,7 @@ __device__ __forceinline__ void mma_sync_m16n8k16_row_col_f16f16f32(float* C, ui
 }
 
 /*!
- * \brief Wrapper of the mma m16n16k16 instruction for row major and column major f16 matrix
- *   multiplication, accumulated in f32.
- * \tparam mma_mode The mode of mma instruction, either kInit or kInplaceUpdate
- * \param C pointer to the accumulator
- * \param A pointer to the fragment of matrix A
- * \param B pointer to the fragment of matrix B
+ * \brief Wrapper of the mma m16n16k16 instruction...
  */
 template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, uint32_t* A,
@@ -256,13 +319,16 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
           "f"(0.f), "f"(0.f));
   }
 #else  // MMA_F16F16F32_M16N8K16_ENABLED
-  // SM75 optimization: Interleave Left and Right halves calculations to hide latency.
+  // [Optimization] SM75 optimized interleaving.
+  // This breaks the dependency chain by computing independent tiles (Left C0-C3, Right C4-C7)
+  // in an interleaved manner. While one instruction waits for result latency, the other issues.
   float t0, t1, t2, t3, t4, t5, t6, t7;
 
   if constexpr (mma_mode == MMAMode::kInplaceUpdate)
   {
       asm volatile(
           "{\n"
+
           "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
           "{%0, %1, %2, %3}, {%8, %9}, {%12}, {%16, %17, %18, %19};\n"
           "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
@@ -307,10 +373,6 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
 /*!
  * \brief Wrapper of the mma m16n8k16 instruction for row major and column major f16 matrix
  *   multiplication, accumulated in f16.
- * \tparam mma_mode The mode of mma instruction, either kInit or kInplaceUpdate
- * \param C pointer to the accumulator
- * \param A pointer to the fragment of matrix A
- * \param B pointer to the fragment of matrix B
  */
 template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n8k16_row_col_f16f16f16(uint32_t* C, uint32_t* A,
@@ -346,10 +408,6 @@ __device__ __forceinline__ void mma_sync_m16n8k16_row_col_f16f16f16(uint32_t* C,
 /*!
  * \brief Wrapper of the mma m16n16k16 instruction for row major and column major f16 matrix
  *   multiplication, accumulated in f16.
- * \tparam mma_mode The mode of mma instruction, either kInit or kInplaceUpdate
- * \param C pointer to the accumulator
- * \param A pointer to the fragment of matrix A
- * \param B pointer to the fragment of matrix B
  */
 template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f16(uint32_t* C, uint32_t* A,
@@ -425,10 +483,6 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f16(uint32_t* C
 /*!
  * \brief Wrapper of the mma m16n8k32 instruction for row major and column major int8 matrix
  *   multiplication, accumulated in int32.
- * \tparam mma_mode The mode of mma instruction, either kInit or kInplaceUpdate
- * \param C pointer to the accumulator
- * \param A pointer to the fragment of matrix A
- * \param B pointer to the fragment of matrix B
  */
 template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n8k32_row_col_s8s8s32(int32_t* C, uint32_t* A,
@@ -459,23 +513,26 @@ __device__ __forceinline__ void mma_sync_m16n8k32_row_col_s8s8s32(int32_t* C, ui
           "r"(0), "r"(0));
   }
 #else  // MMA_S8S8S32_M16N8K32_ENABLED
-  // SM75 optimization: Merge into one ASM block
+  // [Optimization] SM75 optimized fallback
+  // Merged 4 separate ASM blocks into 1 to allow efficient register allocation
+  // and remove call overheads. This simulates m16n8k32 using m8n8k16 primitives.
   int32_t t0, t1, t2, t3;
 
   if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
     asm volatile(
         "{\n"
-        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%8}, {%12}, {%14, %15};\n" // A0, B0 -> t0,t1 (accum C0,C1)
-        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%2, %3}, {%9}, {%12}, {%16, %17};\n" // A1, B0 -> t2,t3 (accum C2,C3)
-        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%14, %15}, {%10}, {%13}, {%0, %1};\n" // A2, B1 -> C0,C1 (accum t0,t1)
-        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%16, %17}, {%11}, {%13}, {%2, %3};\n" // A3, B1 -> C2,C3 (accum t2,t3)
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%8}, {%12}, {%14, %15};\n" 
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%2, %3}, {%9}, {%12}, {%16, %17};\n" 
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%14, %15}, {%10}, {%13}, {%0, %1};\n" 
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%16, %17}, {%11}, {%13}, {%2, %3};\n" 
         "}\n"
-        : "=&r"(t0), "=&r"(t1), "=&r"(t2), "=&r"(t3),
+        : "=&r"(t0), "=&r"(t1), "=&r"(t2), "=&r"(t3), // Early clobber temps
           "+r"(A[0]), "+r"(A[1]), "+r"(A[2]), "+r"(A[3]), // %8-11
           "+r"(B[0]), "+r"(B[1]), // %12-13
           "+r"(C[0]), "+r"(C[1]), "+r"(C[2]), "+r"(C[3]) // %14-17
     );
   } else {
+    // kInit optimization: Initialize with 0 implicitly
     asm volatile(
         "{\n"
         "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%8}, {%12}, {0, 0};\n"
@@ -495,10 +552,6 @@ __device__ __forceinline__ void mma_sync_m16n8k32_row_col_s8s8s32(int32_t* C, ui
 /*!
  * \brief Wrapper of the mma m16n16k32 instruction for row major and column major int8 matrix
  *   multiplication, accumulated in int32.
- * \tparam mma_mode The mode of mma instruction, either kInit or kInplaceUpdate
- * \param C pointer to the accumulator
- * \param A pointer to the fragment of matrix A
- * \param B pointer to the fragment of matrix B
  */
 template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k32_row_col_s8s8s32(int32_t* C, uint32_t* A,
@@ -547,6 +600,9 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_s8s8s32(int32_t* C, u
           "r"(0), "r"(0));
   }
 #else  // SM_75 fallback path
+  // [Optimization] SM75 optimized fallback
+  // Full interleaved instruction scheduling to maximize ILP.
+  // 4 spatial tiles * 2 K-chunks = 8 instructions fused into one block.
   int32_t t0, t1, t2, t3, t4, t5, t6, t7;
 
   if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
@@ -598,10 +654,6 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_s8s8s32(int32_t* C, u
 /*!
  * \brief Wrapper of the mma m16n8k32 instruction for row major and column major int4 matrix
  *   multiplication, accumulated in int32.
- * \tparam mma_mode The mode of mma instruction, either kInit or kInplaceUpdate
- * \param C pointer to the accumulator
- * \param A pointer to the fragment of matrix A
- * \param B pointer to the fragment of matrix B
  */
 template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n8k64_row_col_s4s4s32(int32_t* C, uint32_t* A,
@@ -639,10 +691,6 @@ __device__ __forceinline__ void mma_sync_m16n8k64_row_col_s4s4s32(int32_t* C, ui
 /*!
  * \brief Wrapper of the mma m16n16k64 instruction for row major and column major int4 matrix
  *   multiplication, accumulated in int32.
- * \tparam mma_mode The mode of mma instruction, either kInit or kInplaceUpdate
- * \param C pointer to the accumulator
- * \param A pointer to the fragment of matrix A
- * \param B pointer to the fragment of matrix B
  */
 template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k64_row_col_s4s4s32(int32_t* C, uint32_t* A,
@@ -698,10 +746,6 @@ __device__ __forceinline__ void mma_sync_m16n16k64_row_col_s4s4s32(int32_t* C, u
 /*!
  * \brief Wrapper of the mma m16n8k32 instruction for row major and column major fp8 e4m3 matrix
  *   multiplication, accumulated in fp32.
- * \tparam mma_mode The mode of mma instruction, either kInit or kInplaceUpdate
- * \param C pointer to the accumulator
- * \param A pointer to the fragment of matrix A
- * \param B pointer to the fragment of matrix B
  */
 template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n8k32_row_col_f8f8f32(float* C, uint32_t* A,
@@ -799,10 +843,6 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f16(uint32_t* C_u
 /*!
  * \brief Wrapper of the mma m16n16k32 instruction for row major and column major fp8 matrix
  *   multiplication, accumulated in fp32.
- * \tparam mma_mode The mode of mma instruction, either kInit or kInplaceUpdate
- * \param C pointer to the accumulator
- * \param A pointer to the fragment of matrix A
- * \param B pointer to the fragment of matrix B
  */
 template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uint32_t* A,
@@ -874,11 +914,10 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, uint32_t* s) {
       : "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(1006648320), // 1006648320 packs two 1.0f in half precision
         "r"(1006648320), "f"(d[0]), "f"(d[1]));
 #else
-  // SM75 fallback using m16n8k8 instruction for k8 instead of k16
-  // We need to do the same operation in two parts
-  
-  // Use dummy registers for unused outputs to avoid using '_' with +f constraint
-  float dummy0, dummy1, dummy2, dummy3;
+  // [Optimization] SM75 optimized fallback
+  // Merged two K-steps into one block. Reused output registers as in-out operands (+f)
+  // to reduce register pressure.
+  float dummy0, dummy1;
 
   // First half of the input (k=0..7)
   asm volatile(
