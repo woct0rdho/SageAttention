@@ -87,7 +87,9 @@ __device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
                  "l"(gmem_ptr), "n"(16), "r"(16));
   }
 #else
-  *((uint4*)smem_ptr) = *((uint4*)gmem_ptr);
+  // Optimization for Turing: Use __ldg to force loading through read-only data cache (Texture Cache).
+  // This bypasses L1 cache coherence overhead and improves bandwidth for read-only data (Q/K/V).
+  *((uint4*)smem_ptr) = __ldg((const uint4*)gmem_ptr);
 #endif
 }
 
@@ -136,7 +138,8 @@ __device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr, b
   }
 #else
   if (predicate) {
-    *((uint4*)smem_ptr) = *((uint4*)gmem_ptr);
+    // Optimization for Turing: Use __ldg for cached read-only access.
+    *((uint4*)smem_ptr) = __ldg((const uint4*)gmem_ptr);
   } else {
     if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
       *((uint4*)smem_ptr) = make_uint4(0, 0, 0, 0);
