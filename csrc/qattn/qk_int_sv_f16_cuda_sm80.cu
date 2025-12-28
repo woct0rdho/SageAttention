@@ -266,7 +266,8 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
   K_load_idx_lane_base += CTA_K;
   V_load_idx_lane_base += CTA_K;
 
-#pragma unroll
+// Unroll main loop to hide synchronous load latency on Turing
+#pragma unroll 2
   for (uint32_t iter = 1; iter < num_iterations - 1; iter++)
   {
     // ensure K is ready
@@ -1004,7 +1005,7 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
                 std::cerr << "CUDA error before kernel launch: " << cudaGetErrorString(pre_launch_error) << std::endl;
             }
 
-            auto kernel_func = qk_int_sv_f16_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), half, false, DTypeOut, ComputeUnit::kTensorCore,
+            auto kernel_func = qk_int_sv_f16_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), float, false, DTypeOut, ComputeUnit::kTensorCore, 
                                                           mask_mode, RETURN_LSE, false>;
 
             cudaError_t pre_launch_error2 = cudaGetLastError();
