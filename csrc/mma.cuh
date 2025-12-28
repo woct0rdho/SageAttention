@@ -285,23 +285,18 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
       C[4]=0.f; C[5]=0.f; C[6]=0.f; C[7]=0.f;
   }
 
+  // Interleave L/R instructions to hide latency
   asm volatile(
       "{\n"
-      // --- Left Tile (B0, B1) ---
-      // K=0..7
-      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-      "{%0, %1, %2, %3}, {%8, %9}, {%12}, {%0, %1, %2, %3};\n"
-      // K=8..15
-      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-      "{%0, %1, %2, %3}, {%10, %11}, {%13}, {%0, %1, %2, %3};\n"
-
-      // --- Right Tile (B2, B3) ---
-      // K=0..7
-      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-      "{%4, %5, %6, %7}, {%8, %9}, {%14}, {%4, %5, %6, %7};\n"
-      // K=8..15
-      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-      "{%4, %5, %6, %7}, {%10, %11}, {%15}, {%4, %5, %6, %7};\n"
+      // K=0..7 Left
+      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%8, %9}, {%12}, {%0, %1, %2, %3};\n"
+      // K=0..7 Right
+      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%4, %5, %6, %7}, {%8, %9}, {%14}, {%4, %5, %6, %7};\n"
+      
+      // K=8..15 Left
+      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%10, %11}, {%13}, {%0, %1, %2, %3};\n"
+      // K=8..15 Right
+      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%4, %5, %6, %7}, {%10, %11}, {%15}, {%4, %5, %6, %7};\n"
       "}\n"
       : "+f"(C[0]), "+f"(C[1]), "+f"(C[2]), "+f"(C[3]),
         "+f"(C[4]), "+f"(C[5]), "+f"(C[6]), "+f"(C[7])
@@ -411,12 +406,16 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f16(uint32_t* C
   asm volatile(
     "{\n"
     "  .reg .b32 t0, t1, t2, t3;\n\n"
+    // Left K0
     "  mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
     "{t0, t1}, {%4, %5}, {%8}, {%12, %13};\n"
+    // Right K0
     "  mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
     "{t2, t3}, {%4, %5}, {%10}, {%14, %15};\n"
+    // Left K1
     "  mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
     "{%0, %1}, {%6, %7}, {%9}, {t0, t1};\n\n" 
+    // Right K1
     "  mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
     "{%2, %3}, {%6, %7}, {%11}, {t2, t3};\n"
     "}\n"
@@ -555,23 +554,26 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_s8s8s32(int32_t* C, u
       C[4]=0; C[5]=0; C[6]=0; C[7]=0;
   }
 
+  // Interleave L/R instructions to hide latency
   asm volatile(
       "{\n"
-      // --- Left Tile (B0, B1) ---
-      // K Chunk 0 (0-15)
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%8}, {%12}, {%0, %1};\n" // TL
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%2, %3}, {%9}, {%12}, {%2, %3};\n" // BL
-      // K Chunk 1 (16-31)
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%10}, {%13}, {%0, %1};\n" // TL
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%2, %3}, {%11}, {%13}, {%2, %3};\n" // BL
+      // 1. Left Tile TL K0
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%8}, {%12}, {%0, %1};\n"
+      // 2. Right Tile TR K0
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%4, %5}, {%8}, {%14}, {%4, %5};\n" 
+      // 3. Left Tile BL K0
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%2, %3}, {%9}, {%12}, {%2, %3};\n" 
+      // 4. Right Tile BR K0
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%6, %7}, {%9}, {%14}, {%6, %7};\n" 
 
-      // --- Right Tile (B2, B3) ---
-      // K Chunk 0 (0-15)
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%4, %5}, {%8}, {%14}, {%4, %5};\n" // TR
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%6, %7}, {%9}, {%14}, {%6, %7};\n" // BR
-      // K Chunk 1 (16-31)
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%4, %5}, {%10}, {%15}, {%4, %5};\n" // TR
-      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%6, %7}, {%11}, {%15}, {%6, %7};\n" // BR
+      // 5. Left Tile TL K1
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%10}, {%13}, {%0, %1};\n" 
+      // 6. Right Tile TR K1
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%4, %5}, {%10}, {%15}, {%4, %5};\n" 
+      // 7. Left Tile BL K1
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%2, %3}, {%11}, {%13}, {%2, %3};\n" 
+      // 8. Right Tile BR K1
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%6, %7}, {%11}, {%15}, {%6, %7};\n" 
       "}\n"
       : "+r"(C[0]), "+r"(C[1]), "+r"(C[2]), "+r"(C[3]),
         "+r"(C[4]), "+r"(C[5]), "+r"(C[6]), "+r"(C[7])
