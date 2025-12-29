@@ -585,10 +585,31 @@ def sageattn_qk_int8_pv_fp16_cuda(
     else:
         km = None
 
+    # Check for SM75 (Turing)
+    major, minor = torch.cuda.get_device_capability(q.device)
+    is_sm75 = (major == 7 and minor == 5)
+
+    if is_sm75:
+        BLKQ = 64
+        BLKK = 32
+        WARPQ = 16
+        WARPK = 32
+    else:
+        BLKQ = 128
+        BLKK = 64
+        WARPQ = 16 if (q.size(-1) == 128 and pv_accum_dtype == "fp16+fp32") else 32
+        WARPK = 64
+
     if qk_quant_gran == "per_warp":
-        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=(16 if (q.size(-1) == 128 and pv_accum_dtype == "fp16+fp32") else 32), BLKK=64)
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(
+            q, k, km, tensor_layout=tensor_layout, 
+            BLKQ=BLKQ, WARPQ=WARPQ, BLKK=BLKK
+        )
     elif qk_quant_gran == "per_thread":
-        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=(16 if (q.size(-1) == 128 and pv_accum_dtype == "fp16+fp32") else 32), BLKK=64, WARPK=64)
+        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(
+            q, k, km, tensor_layout=tensor_layout, 
+            BLKQ=BLKQ, WARPQ=WARPQ, BLKK=BLKK, WARPK=WARPK
+        )
 
     o = torch.empty(q.size(), dtype=dtype, device=q.device)
 
@@ -966,5 +987,3 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
         return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
     else:
         return o
-
-
