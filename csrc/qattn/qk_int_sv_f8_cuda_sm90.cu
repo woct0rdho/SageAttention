@@ -32,6 +32,23 @@
 
 using torch::stable::Tensor;
 
+// SM90-specific dispatch macro that only supports head_dim 64 and 128
+// (head_dim 256 is not supported due to WGMMA constraints)
+#define DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, ...)           \
+  if (head_dim == 64) {                                           \
+    constexpr int HEAD_DIM = 64;                                  \
+    __VA_ARGS__                                                   \
+  } else if (head_dim == 128) {                                   \
+    constexpr int HEAD_DIM = 128;                                 \
+    __VA_ARGS__                                                   \
+  } else {                                                        \
+    std::ostringstream err_msg;                                   \
+    err_msg << "SM90 kernel does not support head_dim="          \
+            << int(head_dim) << ". Only 64 and 128 are supported. " \
+            << "Use SM80 or SM89 kernels for head_dim=256.";     \
+    throw std::invalid_argument(err_msg.str());                   \
+  }
+
 template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true, CUtensorMapL2promotion_enum promotion_mode=CU_TENSOR_MAP_L2_PROMOTION_NONE, typename T>
 CUtensorMap create_tensor_map_4D(T* gmem_ptr, int d1, int d2, int d3, int d4, int stride1, int stride2, int stride3) {
     constexpr int smem_stride = BlockMinorSize * sizeof(T);
@@ -682,7 +699,7 @@ Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
 
   auto output_type = output.scalar_type();
 
-  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+  DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
     DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
       DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
         DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
@@ -856,7 +873,7 @@ Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
 
   auto output_dtype = output.scalar_type();
 
-  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+  DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
     DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
       DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
         DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
