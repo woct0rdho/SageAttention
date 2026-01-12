@@ -20,6 +20,9 @@
 
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/tensor_struct.h>
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_10_0
+#include <torch/csrc/stable/tensor_inl.h>
+#endif
 
 #include <torch/headeronly/core/ScalarType.h>
 #include <torch/headeronly/util/Exception.h>
