@@ -60,10 +60,12 @@ jobs:
           # Define all possible build configurations
           # Format: python_version|pytorch_version|cuda_version|display_name|arch_list
           declare -a all_builds=(
-            # PyTorch 2.5.1 + CUDA 12.4 + Python 3.12 (Safe Stable)
-            "3.12|2.5.1|12.4.1|PyTorch 2.5.1 + CUDA 12.4 + Python 3.12|7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0;12.0"
-            # PyTorch 2.6.0 + CUDA 12.8 + Python 3.12 (Latest Stable)
-            "3.12|2.6.0|12.8.0|PyTorch 2.6.0 + CUDA 12.8 + Python 3.12|7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0;12.0;12.1"
+            # PyTorch 2.7.0 + CUDA 12.8 + Python 3.12
+            "3.12|2.7.0|12.8.0|PyTorch 2.7.0 + CUDA 12.8 + Python 3.12|7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0;12.0;12.1"
+            # PyTorch 2.8.0 + CUDA 12.8 + Python 3.12
+            "3.12|2.8.0|12.8.0|PyTorch 2.8.0 + CUDA 12.8 + Python 3.12|7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0;12.0;12.1"
+            # PyTorch 2.9.0 + CUDA 12.8 + Python 3.12
+            "3.12|2.9.0|12.8.0|PyTorch 2.9.0 + CUDA 12.8 + Python 3.12|7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0;12.0;12.1"
           )
 
           # Filter builds based on profile
@@ -72,7 +74,7 @@ jobs:
           case "$profile" in
             "default")
               # Single default build for PRs (Latest Stable)
-              selected_builds+=("3.12|2.6.0|12.8.0|PyTorch 2.6.0 + CUDA 12.8 + Python 3.12|7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0;12.0;12.1")
+              selected_builds+=("3.12|2.9.0|12.8.0|PyTorch 2.9.0 + CUDA 12.8 + Python 3.12|7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0;12.0;12.1")
               ;;
             "stable"|"sage2-all")
               # All builds (both PyTorch versions)
@@ -146,9 +148,7 @@ jobs:
           pytorch_version="${{ matrix.pytorch }}"
 
           # Map CUDA version to PyTorch index
-          if [[ "$cuda_version" == "12.4"* ]]; then
-            pip install torch==$pytorch_version torchvision --index-url https://download.pytorch.org/whl/cu124
-          elif [[ "$cuda_version" == "12.8"* ]]; then
+          if [[ "$cuda_version" == "12.8"* ]]; then
             pip install torch==$pytorch_version torchvision --index-url https://download.pytorch.org/whl/cu126
           else
             pip install torch==$pytorch_version torchvision --index-url https://download.pytorch.org/whl/cu118
@@ -165,23 +165,19 @@ jobs:
           $pytorch = "${{ matrix.pytorch }}"
           $cuda = "${{ matrix.cuda }}"
 
-          $torch_parts = $pytorch.Split('.')
-          $torch_minor = $torch_parts[1]
+          $torch_tag = $pytorch.Replace(".", "")
+          
           $cuda_parts = $cuda.Split('.')
-          $cuda_minor = $cuda_parts[1]
-
-          echo "TORCH_VERSION=$pytorch" >> $env:GITHUB_ENV
-          echo "CUDA_VERSION=$cuda" >> $env:GITHUB_ENV
-          echo "TORCH_CUDA_ARCH_LIST=7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0" >> $env:GITHUB_ENV
-          echo "TORCH_MINOR_VERSION=$torch_minor" >> $env:GITHUB_ENV
-          echo "CUDA_MINOR_VERSION=$cuda_minor" >> $env:GITHUB_ENV
+          $cuda_tag = $cuda_parts[0] + $cuda_parts[1]
+          
+          echo "SAGEATTENTION_BUILD_TAG=$torch_tag.$cuda_tag" >> $env:GITHUB_ENV
 
       - name: Update pyproject.toml with PyTorch version
         run: python update_pyproject.py
 
       - name: Build wheel (${{ matrix.display }})
         run: |
-          python setup.py bdist_wheel --build-number "${{ env.TORCH_MINOR_VERSION }}.${{ env.CUDA_MINOR_VERSION }}"
+          python setup.py bdist_wheel --build-number "${{ env.SAGEATTENTION_BUILD_TAG }}"
         env:
           TORCH_VERSION: ${{ matrix.pytorch }}
           CUDA_VERSION: ${{ matrix.cuda }}
@@ -200,7 +196,7 @@ jobs:
             filename=$(basename "$wheel")
             echo "Checking wheel: $filename"
 
-            # Expected pattern: sageattention-2.2.0-{torch}.{cuda}-cp{py}-cp{py}-win_amd64.whl
+            # Expected pattern: sageattention-2.2.0-270.128-cp312-cp312-win_amd64.whl
             if [[ ! $filename =~ ^sageattention-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+\.[0-9]+-cp[0-9]+-cp[0-9]+-win_amd64\.whl$ ]]; then
               echo "❌ Wheel name does not match expected pattern: $filename"
               exit 1
@@ -209,13 +205,12 @@ jobs:
             # Extract version info from filename
             if [[ $filename =~ sageattention-([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)\.([0-9]+)-cp([0-9]+) ]]; then
               sage_version="${BASH_REMATCH[1]}"
-              torch_version="${BASH_REMATCH[2]}"
-              cuda_version="${BASH_REMATCH[3]}"
+              torch_tag="${BASH_REMATCH[2]}"
+              cuda_tag="${BASH_REMATCH[3]}"
               python_version="${BASH_REMATCH[4]}"
 
               echo "  ✅ SageAttention version: $sage_version"
-              echo "  ✅ PyTorch version tag: $torch_version (2.$torch_version.0)"
-              echo "  ✅ CUDA version tag: $cuda_version (12.$cuda_version)"
+              echo "  ✅ Build Tag: $torch_tag.$cuda_tag"
               echo "  ✅ Python version: $python_version (3.$python_version)"
             fi
           done

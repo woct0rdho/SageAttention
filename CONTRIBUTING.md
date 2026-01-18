@@ -8,7 +8,7 @@ This guide details the enhancements made in this fork, specifically regarding **
 We use `docker buildx bake` to manage complex multi-platform build configurations. This ensures reproducible environments for both Linux and Windows (cross-compilation) artifacts.
 
 ```bash
-# Build default configuration (Linux + PyTorch 2.8 + CUDA 12.9)
+# Build default configuration (Linux + PyTorch 2.9 + CUDA 12.8)
 docker buildx bake default
 
 # Build all Linux wheels
@@ -29,9 +29,9 @@ gh act -W .github/workflows/build-wheels-linux.yml --container-architecture linu
 ### Wheel Naming Convention
 We enforce specific build tags to ensure wheels are strictly PEP 440 compliant while carrying dependency metadata:
 *   **Format**: `sageattention-{version}-{build_tag}-...`
-*   **Example**: `sageattention-2.2.0-8.9-cp312-cp312-linux_x86_64.whl`
-    *   `8.9` represents **PyTorch 2.8** + **CUDA 12.9**.
-    *   This prevents `InvalidVersion` errors during installation.
+*   **Example**: `sageattention-2.2.0-280.128-cp312-cp312-linux_x86_64.whl`
+    *   `280.128` represents **PyTorch 2.8** + **CUDA 12.8**.
+    *   Format: `{torch_major}{torch_minor}{torch_patch}.{cuda_major}{cuda_minor}`.
 
 ### Workflows
 *   **`build-wheels-linux.yml`**: Uses `setup-python` and native runners for speed.
@@ -43,7 +43,8 @@ We provide pre-built wheels for the following configurations:
 
 | PyTorch | CUDA | Python | Platform |
 | :---: | :---: | :---: | :---: |
-| 2.5.1 | 12.4 | 3.12 | Linux, Windows |
-| 2.6.0 | 12.6 | 3.12 | Linux, Windows |
+| 2.7.0 | 12.8 | 3.12 | Linux, Windows |
+| 2.8.0 | 12.8 | 3.12 | Linux, Windows |
+| 2.9.0 | 12.8 | 3.12 | Linux, Windows |
 
 *For other configurations, please build from source.*
