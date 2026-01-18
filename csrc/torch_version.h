@@ -1,0 +1,12 @@
+// TORCH_FEATURE_VERSION and TORCH_VERSION_x_y_z are defined only in torch >= 2.10
+#ifndef TORCH_FEATURE_VERSION
+#ifdef TORCH_TARGET_VERSION
+#define TORCH_FEATURE_VERSION TORCH_TARGET_VERSION
+#else
+#define TORCH_FEATURE_VERSION TORCH_ABI_VERSION
+#endif
+#endif
+
+#ifndef TORCH_VERSION_2_10_0
+#define TORCH_VERSION_2_10_0 (((0ULL + 2) << 56) | ((0ULL + 10) << 48))
+#endif
