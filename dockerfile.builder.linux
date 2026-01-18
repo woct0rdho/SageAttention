@@ -58,9 +58,9 @@ RUN pip install --upgrade pip setuptools wheel packaging
 # Install PyTorch with caching optimization
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$CUDA_VERSION" = "12.8.1" ]; then \
-        pip install torch==${TORCH_VERSION} torchvision --index-url https://download.pytorch.org/whl/cu128; \
+    pip install torch==${TORCH_VERSION} torchvision --index-url https://download.pytorch.org/whl/cu128; \
     else \
-        pip install torch==${TORCH_VERSION} torchvision --index-url https://download.pytorch.org/whl/cu129; \
+    pip install torch==${TORCH_VERSION} torchvision --index-url https://download.pytorch.org/whl/cu129; \
     fi
 
 # Stage 2: Builder - compiles SageAttention wheel (wheel stays embedded)
@@ -70,10 +70,12 @@ FROM runtime AS builder
 ARG TORCH_VERSION
 ARG PYTHON_VERSION
 ARG TORCH_CUDA_ARCH_LIST
+ARG MAX_JOBS
 
 # Set build environment variables
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 ENV PYTHON_VERSION=${PYTHON_VERSION}
+ENV MAX_JOBS=${MAX_JOBS}
 
 # Verify build configuration
 RUN echo "Build Configuration:" && \
@@ -89,15 +91,23 @@ COPY . .
 # Update pyproject.toml with correct PyTorch version
 RUN python update_pyproject.py
 
+# Calculate version suffix for wheel name (e.g. 8.9 for torch 2.8 and cuda 12.9)
+RUN echo "Calculating version suffix..." && \
+    TORCH_MINOR=$(echo ${TORCH_VERSION} | cut -d. -f2) && \
+    CUDA_MINOR=$(echo ${CUDA_VERSION} | cut -d. -f2) && \
+    echo "Build Tag: ${TORCH_MINOR}.${CUDA_MINOR}" && \
+    echo "SAGEATTENTION_BUILD_TAG=${TORCH_MINOR}.${CUDA_MINOR}" >> /etc/environment
+
 # Install build dependencies
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install numpy packaging pybind11
+    pip install numpy packaging pybind11 ninja
 
 # Build SageAttention wheel with cache mount for compilation artifacts
 RUN --mount=type=cache,target=/tmp/ccache \
     --mount=type=cache,target=/root/.cache/pip \
+    . /etc/environment && \
     CCACHE_DIR=/tmp/ccache \
-    python setup.py bdist_wheel
+    python setup.py bdist_wheel --build-number "${SAGEATTENTION_BUILD_TAG}"
 
 # Stage 3: Wheel extraction - outputs ONLY wheel files with automatic version naming
 FROM scratch AS wheel

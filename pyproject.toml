@@ -5,6 +5,7 @@ requires = [
     "pybind11",
     "setuptools",
     "wheel",
+    "ninja",
     # torch version will be added by update_pyproject.py
     "torch",
 ]
@@ -30,6 +31,11 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch",
+    "numpy",
+    "triton; platform_system == 'Linux'",
 ]
 
 [project.urls]

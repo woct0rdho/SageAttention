@@ -1,0 +1,236 @@
+name: Build SageAttention Wheels (Linux)
+
+on:
+  workflow_call:
+    inputs:
+      build_profile:
+        description: 'Build profile to use'
+        required: true
+        default: 'stable'
+        type: string
+  workflow_dispatch:
+    inputs:
+      build_profile:
+        description: 'Build profile to use'
+        required: true
+        default: 'stable'
+        type: choice
+        options:
+          - stable      # Both PyTorch versions (2 wheels)
+          - sage2-all   # Same as stable (2 wheels)
+
+jobs:
+  # Job 1: Validate/Configure
+  configure:
+    runs-on: ubuntu-latest
+    outputs:
+      build_profile: ${{ steps.set-profile.outputs.profile }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set build profile
+        id: set-profile
+        run: |
+          # Always use the input provided by workflow_call or workflow_dispatch
+          echo "profile=${{ inputs.build_profile }}" >> $GITHUB_OUTPUT
+      
+
+  # Job 2: Generate build matrix dynamically
+  generate-matrix:
+    needs: configure
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate build matrix
+        id: generate
+        run: |
+          profile="${{ needs.configure.outputs.build_profile }}"
+
+          # Define all possible build configurations
+          # Format: python_version|pytorch_version|cuda_version|display_name|arch_list
+          declare -a all_builds=(
+            # PyTorch 2.5.1 + CUDA 12.4 + Python 3.12 (Safe Stable)
+            "3.12|2.5.1|12.4.1|PyTorch 2.5.1 + CUDA 12.4 + Python 3.12|7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0"
+            # PyTorch 2.6.0 + CUDA 12.8 + Python 3.12 (Latest Stable)
+            "3.12|2.6.0|12.8.0|PyTorch 2.6.0 + CUDA 12.8 + Python 3.12|7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0"
+          )
+
+          # Filter builds based on profile
+          declare -a selected_builds=()
+
+          case "$profile" in
+            "default")
+              # Single default build for PRs (Latest Stable)
+              selected_builds+=("3.12|2.6.0|12.8.0|PyTorch 2.6.0 + CUDA 12.8 + Python 3.12|7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0")
+              ;;
+            "stable"|"sage2-all")
+              # All builds (both PyTorch versions)
+              selected_builds=("${all_builds[@]}")
+              ;;
+            *)
+              echo "Unknown profile: $profile"
+              exit 1
+              ;;
+          esac
+
+          # Convert to JSON matrix format
+          matrix_json="["
+          first=true
+          for build in "${selected_builds[@]}"; do
+            IFS='|' read -r python pytorch cuda display arch_list <<< "$build"
+            if [ "$first" = true ]; then
+              first=false
+            else
+              matrix_json+=","
+            fi
+            matrix_json+="{\"python\":\"$python\",\"pytorch\":\"$pytorch\",\"cuda\":\"$cuda\",\"display\":\"$display\",\"arch_list\":\"$arch_list\"}"
+          done
+          matrix_json+="]"
+
+          echo "matrix={\"include\":$matrix_json}" >> $GITHUB_OUTPUT
+          echo "Build count: ${#selected_builds[@]}"
+          echo "$matrix_json" | jq .
+
+  # Job 3: Build wheels on Linux (Native)
+  build-wheels:
+    name: Build ${{ matrix.display }}
+    needs: [configure, generate-matrix]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Setup Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Setup CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.30
+        with:
+          cuda: ${{ matrix.cuda }}
+          use-github-cache: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Upgrade pip and install build tools
+        run: |
+          python -m pip install --upgrade pip setuptools wheel packaging
+
+      - name: Install PyTorch ${{ matrix.pytorch }}
+        run: |
+          cuda_version="${{ matrix.cuda }}"
+          pytorch_version="${{ matrix.pytorch }}"
+          
+          echo "DEBUG: Installing PyTorch. CUDA=$cuda_version, TORCH=$pytorch_version"
+          
+          # Construct index URL
+          if [[ "$cuda_version" == "12.4"* ]]; then
+            index_url="https://download.pytorch.org/whl/cu124"
+          elif [[ "$cuda_version" == "12.8"* ]]; then
+             index_url="https://download.pytorch.org/whl/cu126"
+          else
+             # Fallback for old/other versions
+             index_url="https://download.pytorch.org/whl/cu118"
+          fi
+          
+          echo "DEBUG: Using index URL: $index_url"
+          echo "DEBUG: Command: pip install torch==$pytorch_version torchvision --index-url $index_url"
+          
+          pip install torch==$pytorch_version torchvision --index-url "$index_url"
+          
+          echo "DEBUG: Installed packages:"
+          pip list | grep torch
+
+      - name: Install build dependencies
+        run: |
+          pip install numpy packaging pybind11
+
+      - name: Update pyproject.toml with PyTorch version
+        run: python update_pyproject.py
+
+      - name: Set build version suffix
+        run: |
+          torch_minor=$(echo "${{ matrix.pytorch }}" | cut -d. -f2)
+          cuda_minor=$(echo "${{ matrix.cuda }}" | cut -d. -f2)
+          echo "SAGEATTENTION_BUILD_TAG=${torch_minor}.${cuda_minor}" >> $GITHUB_ENV
+      
+      - name: Build wheel (${{ matrix.display }})
+        run: |
+          python setup.py bdist_wheel --build-number "${{ env.SAGEATTENTION_BUILD_TAG }}"
+        env:
+          TORCH_VERSION: ${{ matrix.pytorch }}
+          CUDA_VERSION: ${{ matrix.cuda }}
+          TORCH_CUDA_ARCH_LIST: ${{ matrix.arch_list }}
+          MAX_JOBS: "1"
+
+      - name: Verify wheel naming
+        shell: bash
+        run: |
+          echo "=== Built wheels ==="
+          ls -lh dist/
+
+          # Verify PEP 427 compliant naming
+          for wheel in dist/*.whl; do
+            filename=$(basename "$wheel")
+            echo "Checking wheel: $filename"
+
+            if [[ ! $filename =~ ^sageattention-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+\.[0-9]+-cp[0-9]+-cp[0-9]+-linux_x86_64\.whl$ ]]; then
+              echo "❌ Wheel name does not match expected pattern: $filename"
+              exit 1
+            fi
+
+            # Extract version info from filename
+            if [[ $filename =~ sageattention-([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)\.([0-9]+)-cp([0-9]+) ]]; then
+              sage_version="${BASH_REMATCH[1]}"
+              torch_version="${BASH_REMATCH[2]}"
+              cuda_version="${BASH_REMATCH[3]}"
+              python_version="${BASH_REMATCH[4]}"
+
+              echo "  ✅ SageAttention version: $sage_version"
+              echo "  ✅ PyTorch version tag: $torch_version (2.$torch_version.0)"
+              echo "  ✅ CUDA version tag: $cuda_version (12.$cuda_version)"
+              echo "  ✅ Python version: $python_version (3.$python_version)"
+            fi
+          done
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-py${{ matrix.python }}-torch${{ matrix.pytorch }}-cuda${{ matrix.cuda }}
+          path: ./dist/*.whl
+          retention-days: 7
+          compression-level: 0
+
+      - name: Test wheel installation
+        run: |
+          wheel=$(ls dist/*.whl | head -n 1)
+          pip install "$wheel"
+          # Change to dist directory to avoid importing sageattention from source
+          cd dist
+          python -c "import sageattention; print('✅ SageAttention imported successfully')"
+
+

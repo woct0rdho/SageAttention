@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  # Determine which profile to run based on event type
+  strategy:
+    runs-on: ubuntu-latest
+    outputs:
+      profile: ${{ steps.profile.outputs.profile }}
+    steps:
+      - id: profile
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "profile=default" >> $GITHUB_OUTPUT
+            echo "Event is PR: Using 'default' profile (fast build)"
+          else
+            echo "profile=stable" >> $GITHUB_OUTPUT
+            echo "Event is Push to Main: Using 'stable' profile (full build)"
+          fi
+
+  # Call Linux Build (Reusable)
+  build-linux:
+    needs: strategy
+    uses: ./.github/workflows/build-wheels-linux.yml
+    with:
+      build_profile: ${{ needs.strategy.outputs.profile }}
+
+  # Call Windows Build (Reusable)
+  build-windows:
+    needs: strategy
+    uses: ./.github/workflows/build-wheels-windows.yml
+    with:
+      build_profile: ${{ needs.strategy.outputs.profile }}
+
+  # Release Job (Only on push to main)
+  release:
+    needs: [build-linux, build-windows]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract version from pyproject.toml
+        id: get_version
+        run: |
+          VERSION=$(grep -m1 'version =' pyproject.toml | cut -d '"' -f2)
+          echo "Current version: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if tag exists
+        id: check_tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="v${{ steps.get_version.outputs.version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
+            echo "Tag $TAG_NAME already exists. Skipping release."
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Tag $TAG_NAME does not exist. Proceeding with release."
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Download and Publish ONLY if tag doesn't exist
+      - name: Download Linux artifacts
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-linux-*
+          path: ./dist
+          merge-multiple: true
+
+      - name: Download Windows artifacts
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-windows-*
+          path: ./dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.get_version.outputs.version }}
+          name: SageAttention ${{ steps.get_version.outputs.version }}
+          files: dist/*.whl
+          generate_release_notes: true
+          body: |
+            ## 📦 SageAttention Wheels - ${{ steps.get_version.outputs.version }}
+            
+            This release includes pre-built wheels for **Linux and Windows**.
+            
+            ### 🛠️ Compatibility
+            | OS | Python | PyTorch | CUDA |
+            |----|--------|---------|------|
+            | 🐧 Linux | 3.12 | 2.5.1, 2.6.0 | 12.4, 12.6 |
+            | 🪟 Windows | 3.12 | 2.5.1, 2.6.0 | 12.4, 12.6 |
+
+            ### 💻/ Installation
+            ```bash
+            pip install sageattention
+            ```
+            
+            > **Note**: For Windows users, no extra steps are required. The package automatically handles missing Triton by falling back to CUDA kernels.

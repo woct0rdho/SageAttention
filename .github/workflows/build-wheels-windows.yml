@@ -1,0 +1,242 @@
+name: Build SageAttention Wheels (Windows)
+
+on:
+  workflow_call:
+    inputs:
+      build_profile:
+        description: 'Build profile to use'
+        required: true
+        default: 'stable'
+        type: string
+  workflow_dispatch:
+    inputs:
+      build_profile:
+        description: 'Build profile to use'
+        required: true
+        default: 'stable'
+        type: choice
+        options:
+          - stable      # Both PyTorch versions (2 wheels)
+          - sage2-all   # Same as stable (2 wheels)
+
+jobs:
+  # Job 1: Validate configuration
+  validate:
+    runs-on: windows-latest
+    outputs:
+      build_profile: ${{ steps.set-profile.outputs.profile }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set build profile
+        id: set-profile
+        shell: bash
+        run: |
+          # Always use the input provided by workflow_call or workflow_dispatch
+          echo "profile=${{ inputs.build_profile }}" >> $GITHUB_OUTPUT
+
+      - name: Validation summary
+        run: |
+          echo "✅ Windows build configuration validated"
+          echo "📦 Build profile: ${{ steps.set-profile.outputs.profile }}"
+
+  # Job 2: Generate build matrix dynamically
+  generate-matrix:
+    needs: validate
+    runs-on: windows-latest
+    outputs:
+      matrix: ${{ steps.generate.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate build matrix
+        id: generate
+        shell: bash
+        run: |
+          profile="${{ needs.validate.outputs.build_profile }}"
+
+          # Define all possible build configurations
+          # Format: python_version|pytorch_version|cuda_version|display_name|arch_list
+          declare -a all_builds=(
+            # PyTorch 2.5.1 + CUDA 12.4 + Python 3.12 (Safe Stable)
+            "3.12|2.5.1|12.4.1|PyTorch 2.5.1 + CUDA 12.4 + Python 3.12|7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0;12.0"
+            # PyTorch 2.6.0 + CUDA 12.8 + Python 3.12 (Latest Stable)
+            "3.12|2.6.0|12.8.0|PyTorch 2.6.0 + CUDA 12.8 + Python 3.12|7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0;12.0;12.1"
+          )
+
+          # Filter builds based on profile
+          declare -a selected_builds=()
+
+          case "$profile" in
+            "default")
+              # Single default build for PRs (Latest Stable)
+              selected_builds+=("3.12|2.6.0|12.8.0|PyTorch 2.6.0 + CUDA 12.8 + Python 3.12|7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0;12.0;12.1")
+              ;;
+            "stable"|"sage2-all")
+              # All builds (both PyTorch versions)
+              selected_builds=("${all_builds[@]}")
+              ;;
+            *)
+              echo "Unknown profile: $profile"
+              exit 1
+              ;;
+          esac
+
+          # Convert to JSON matrix format
+          matrix_json="["
+          first=true
+          for build in "${selected_builds[@]}"; do
+            IFS='|' read -r python pytorch cuda display arch_list <<< "$build"
+            if [ "$first" = true ]; then
+              first=false
+            else
+              matrix_json+=","
+            fi
+            matrix_json+="{\"python\":\"$python\",\"pytorch\":\"$pytorch\",\"cuda\":\"$cuda\",\"display\":\"$display\",\"arch_list\":\"$arch_list\"}"
+          done
+          matrix_json+="]"
+
+          echo "matrix={\"include\":$matrix_json}" >> $GITHUB_OUTPUT
+          echo "Build count: ${#selected_builds[@]}"
+          echo "$matrix_json" | jq .
+
+  # Job 2: Build wheels on Windows
+  build-windows:
+    name: Build ${{ matrix.display }}
+    needs: [validate, generate-matrix]
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.30
+        with:
+          cuda: ${{ matrix.cuda }}
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure git for line endings
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Upgrade pip and install build tools
+        run: |
+          python -m pip install --upgrade pip setuptools wheel packaging
+
+      - name: Install PyTorch
+        shell: bash
+        run: |
+          cuda_version="${{ matrix.cuda }}"
+          pytorch_version="${{ matrix.pytorch }}"
+
+          # Map CUDA version to PyTorch index
+          if [[ "$cuda_version" == "12.4"* ]]; then
+            pip install torch==$pytorch_version torchvision --index-url https://download.pytorch.org/whl/cu124
+          elif [[ "$cuda_version" == "12.8"* ]]; then
+            pip install torch==$pytorch_version torchvision --index-url https://download.pytorch.org/whl/cu126
+          else
+            pip install torch==$pytorch_version torchvision --index-url https://download.pytorch.org/whl/cu118
+          fi
+
+      - name: Install build dependencies
+        run: |
+          pip install numpy packaging pybind11
+
+      - name: Set build environment variables
+        shell: powershell
+        run: |
+          # Extract version components for build tags
+          $pytorch = "${{ matrix.pytorch }}"
+          $cuda = "${{ matrix.cuda }}"
+
+          $torch_parts = $pytorch.Split('.')
+          $torch_minor = $torch_parts[1]
+          $cuda_parts = $cuda.Split('.')
+          $cuda_minor = $cuda_parts[1]
+
+          echo "TORCH_VERSION=$pytorch" >> $env:GITHUB_ENV
+          echo "CUDA_VERSION=$cuda" >> $env:GITHUB_ENV
+          echo "TORCH_CUDA_ARCH_LIST=7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0" >> $env:GITHUB_ENV
+          echo "TORCH_MINOR_VERSION=$torch_minor" >> $env:GITHUB_ENV
+          echo "CUDA_MINOR_VERSION=$cuda_minor" >> $env:GITHUB_ENV
+
+      - name: Update pyproject.toml with PyTorch version
+        run: python update_pyproject.py
+
+      - name: Build wheel (${{ matrix.display }})
+        run: |
+          python setup.py bdist_wheel --build-number "${{ env.TORCH_MINOR_VERSION }}.${{ env.CUDA_MINOR_VERSION }}"
+        env:
+          TORCH_VERSION: ${{ matrix.pytorch }}
+          CUDA_VERSION: ${{ matrix.cuda }}
+          TORCH_CUDA_ARCH_LIST: "7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0"
+          DISTUTILS_USE_SDK: "1"
+          MAX_JOBS: "1"
+
+      - name: Verify wheel naming
+        shell: bash
+        run: |
+          echo "=== Built wheels ==="
+          ls -lh dist/
+
+          # Verify PEP 427 compliant naming
+          for wheel in dist/*.whl; do
+            filename=$(basename "$wheel")
+            echo "Checking wheel: $filename"
+
+            # Expected pattern: sageattention-2.2.0-{torch}.{cuda}-cp{py}-cp{py}-win_amd64.whl
+            if [[ ! $filename =~ ^sageattention-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+\.[0-9]+-cp[0-9]+-cp[0-9]+-win_amd64\.whl$ ]]; then
+              echo "❌ Wheel name does not match expected pattern: $filename"
+              exit 1
+            fi
+
+            # Extract version info from filename
+            if [[ $filename =~ sageattention-([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)\.([0-9]+)-cp([0-9]+) ]]; then
+              sage_version="${BASH_REMATCH[1]}"
+              torch_version="${BASH_REMATCH[2]}"
+              cuda_version="${BASH_REMATCH[3]}"
+              python_version="${BASH_REMATCH[4]}"
+
+              echo "  ✅ SageAttention version: $sage_version"
+              echo "  ✅ PyTorch version tag: $torch_version (2.$torch_version.0)"
+              echo "  ✅ CUDA version tag: $cuda_version (12.$cuda_version)"
+              echo "  ✅ Python version: $python_version (3.$python_version)"
+            fi
+          done
+
+      - name: Test wheel installation
+        shell: powershell
+        run: |
+          $wheels = Get-ChildItem -Path "dist" -Filter "*.whl"
+          if ($wheels.Count -eq 0) {
+            Write-Error "No wheels found in dist directory"
+            exit 1
+          }
+          pip install $wheels[0].FullName
+          # Change to dist directory to avoid importing sageattention from source
+          cd dist
+          python -c "import sageattention; print('✅ SageAttention imported successfully')"
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows-py${{ matrix.python }}-torch${{ matrix.pytorch }}-cuda${{ matrix.cuda }}
+          path: ./dist/*.whl
+          retention-days: 7
+          compression-level: 0

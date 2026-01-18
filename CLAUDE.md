@@ -12,20 +12,28 @@ SageAttention is a high-performance PyTorch extension providing optimized CUDA a
 Use Docker Bake for consistent builds with automatic wheel versioning:
 
 ```bash
-# Build for current platform (Linux + PyTorch 2.8 + CUDA 12.9)
+# Build for current platform (Linux + PyTorch 2.8 + CUDA 12.9 + Python 3.12)
 docker buildx bake --file docker-bake.hcl default
 
-# Build specific configurations (wheels automatically include version info)
-docker buildx bake --file docker-bake.hcl linux-pytorch28-cu129-python312
-docker buildx bake --file docker-bake.hcl windows-pytorch28-cu129-python312
+# Build specific configurations
+docker buildx bake --file docker-bake.hcl linux-sage2-pytorch28-cu129-python312
+docker buildx bake --file docker-bake.hcl linux-sage2-pytorch27-cu128-python311
 
-# Build all platforms and versions
-docker buildx bake --file docker-bake.hcl all
+# Build all SageAttention 2/2++ wheels (10 combinations)
+docker buildx bake --file docker-bake.hcl sage2-all
 
-# Convenience groups
-docker buildx bake --file docker-bake.hcl linux    # All Linux builds
-docker buildx bake --file docker-bake.hcl windows  # All Windows builds
-docker buildx bake --file docker-bake.hcl pytorch28 # All PyTorch 2.8 builds
+# Build by PyTorch version
+docker buildx bake --file docker-bake.hcl pytorch26  # PyTorch 2.6 (4 Python versions)
+docker buildx bake --file docker-bake.hcl pytorch27  # PyTorch 2.7 (3 Python versions)
+docker buildx bake --file docker-bake.hcl pytorch28  # PyTorch 2.8 (3 Python versions)
+
+# Build by Python version
+docker buildx bake --file docker-bake.hcl python310  # Python 3.10 (3 PyTorch versions)
+docker buildx bake --file docker-bake.hcl python311  # Python 3.11 (3 PyTorch versions)
+docker buildx bake --file docker-bake.hcl python312  # Python 3.12 (3 PyTorch versions)
+
+# Build stable combination for each PyTorch version
+docker buildx bake --file docker-bake.hcl stable
 ```
 
 ### Setup Multi-platform Builder
@@ -37,7 +45,10 @@ docker buildx inspect --bootstrap
 ### Testing
 ```bash
 # Test specific builds
-docker buildx bake --file docker-bake.hcl test-linux-pytorch28-cu129-python312
+docker buildx bake --file docker-bake.hcl test-linux-sage2-pytorch28-cu129-python312
+docker buildx bake --file docker-bake.hcl test-linux-sage2-pytorch27-cu128-python312
+
+# Test all configurations
 docker buildx bake --file docker-bake.hcl test-all
 ```
 
@@ -51,11 +62,25 @@ docker buildx bake --file docker-bake.hcl test-all
 - **sageattention/triton/**: Triton kernel implementations for different quantization schemes
 
 ### Build Matrix Support
+
+**SageAttention 2/2++ (Main Package):**
 - **Platforms**: Linux (manylinux_x86_64)
-- **Python**: 3.9+ (primary testing on 3.12)
-- **PyTorch**: 2.7.0, 2.8.0
-- **CUDA**: 12.8.1, 12.9.1
-- **Compute Capabilities**: 8.0, 8.6, 8.9, 9.0, 12.0
+- **Python**: 3.9, 3.10, 3.11, 3.12
+- **PyTorch**: 2.6.0, 2.7.0, 2.8.0
+- **CUDA**: 12.6.1, 12.8.1, 12.9.1
+- **Compute Capabilities (Extended)**: 7.0, 7.5, 8.0, 8.6, 8.7, 8.9, 9.0, 10.0, 12.0, 12.1
+- **GPU Coverage**: V100, RTX 20xx/30xx/40xx/50xx, A100, H100, B100/B200, AGX Orin, DGX Spark
+- **Total Configurations**: 10 wheel combinations
+
+**SageAttention3 (Blackwell-only, not yet configured):**
+- **Platforms**: Linux (manylinux_x86_64)
+- **Python**: 3.9+ (3.13+ recommended)
+- **PyTorch**: 2.8.0+ (required)
+- **CUDA**: 12.8+ (required)
+- **Compute Capabilities**: 10.0 (B100/B200), 12.0 (B200)
+- **Technology**: FP4 Microscaling attention
+
+**See [BUILD_MATRIX.md](BUILD_MATRIX.md) for complete build matrix details.**
 
 ### Module Structure
 - **Attention Variants**: 
