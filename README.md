@@ -52,4 +52,4 @@ If you need to build and run SageAttention on your own machine:
 * CUDA kernels for sm80/89/90 are bundled in the wheels, and also sm120 for CUDA >= 12.8
 * For RTX 20xx, SageAttention 2 runs Triton kernels, which are the same as SageAttention 1. If you want to help improve the CUDA kernels for RTX 20xx, you may see https://github.com/Ph0rk0z/SageAttention2/tree/updates
 * The wheels do not use CXX11 ABI
-* We cannot publish the wheels to PyPI, because PyPI does not support multiple PyTorch/CUDA variants for the same version of SageAttention. Some people are working on this, see https://astral.sh/blog/introducing-pyx and https://wheelnext.dev/proposals/pepxxx_wheel_variant_support/
+* We cannot publish the wheels to PyPI, because PyPI does not support multiple PyTorch/CUDA variants for the same version of SageAttention. Some people are working on this, see https://astral.sh/blog/introducing-pyx and https://wheelnext.dev/proposals/pep817_wheel_variant_support/
