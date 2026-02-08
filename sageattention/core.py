@@ -414,11 +414,14 @@ def sageattn_varlen(
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
     assert cu_seqlens_q.is_contiguous() and cu_seqlens_k.is_contiguous(), "cu_seqlens_q and cu_seqlens_k must be contiguous."
 
-    compute_dtype = dtype
     if dtype == torch.bfloat16 or dtype == torch.float32:
+        v = v.to(torch.float16)
+
+    arch = _cuda_archs[q.device.index]
+    compute_dtype = dtype
+    if arch in {"sm70", "sm75"} and (dtype == torch.bfloat16 or dtype == torch.float32):
         q = q.to(torch.float16)
         k = k.to(torch.float16)
-        v = v.to(torch.float16)
         compute_dtype = torch.float16
 
     if smooth_k:
@@ -585,11 +588,8 @@ def sageattn_qk_int8_pv_fp16_cuda(
     else:
         km = None
 
-    # Check for SM75 (Turing)
-    major, minor = torch.cuda.get_device_capability(q.device)
-    is_sm75 = (major == 7 and minor == 5)
-
-    if is_sm75:
+    arch = _cuda_archs[q.device.index]
+    if arch in {"sm70", "sm75"}:
         BLKQ = 64
         BLKK = 32
         WARPQ = 16
@@ -601,15 +601,9 @@ def sageattn_qk_int8_pv_fp16_cuda(
         WARPK = 64
 
     if qk_quant_gran == "per_warp":
-        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(
-            q, k, km, tensor_layout=tensor_layout, 
-            BLKQ=BLKQ, WARPQ=WARPQ, BLKK=BLKK
-        )
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=BLKQ, WARPQ=WARPQ, BLKK=BLKK)
     elif qk_quant_gran == "per_thread":
-        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(
-            q, k, km, tensor_layout=tensor_layout, 
-            BLKQ=BLKQ, WARPQ=WARPQ, BLKK=BLKK, WARPK=WARPK
-        )
+        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=BLKQ, WARPQ=WARPQ, BLKK=BLKK, WARPK=WARPK)
 
     o = torch.empty(q.size(), dtype=dtype, device=q.device)
 
