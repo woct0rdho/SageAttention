@@ -19,23 +19,21 @@
 
 #include "attn_cuda_sm80.h"
 
-extern "C" {
-    /* Creates a dummy empty _C module that can be imported from Python.
-       The import from Python will load the .so consisting of this file
-       in this extension, so that the TORCH_LIBRARY static initializers
-       below are run. */
-    PyObject* PyInit__qattn_sm80(void)
-    {
-        static struct PyModuleDef module_def = {
-            PyModuleDef_HEAD_INIT,
-            "_qattn_sm80",  /* name of module */
-            NULL,           /* module documentation, may be NULL */
-            -1,             /* size of per-interpreter state of the module,
-                               or -1 if the module keeps state in global variables. */
-            NULL,           /* methods */
-        };
-        return PyModule_Create(&module_def);
-    }
+/* Creates a dummy empty _C module that can be imported from Python.
+   The import from Python will load the .so consisting of this file
+   in this extension, so that the TORCH_LIBRARY static initializers
+   below are run. */
+PyMODINIT_FUNC PyInit__qattn_sm80(void)
+{
+    static struct PyModuleDef module_def = {
+        PyModuleDef_HEAD_INIT,
+        "_qattn_sm80",  /* name of module */
+        NULL,           /* module documentation, may be NULL */
+        -1,             /* size of per-interpreter state of the module,
+                           or -1 if the module keeps state in global variables. */
+        NULL,           /* methods */
+    };
+    return PyModule_Create(&module_def);
 }
 
 // Defines the operators
