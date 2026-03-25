@@ -120,7 +120,7 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_sm89, m) {
             "float sm_scale, "
             "int return_lse"
           ") -> Tensor");
-    m.def("qk_int8_sv_f16_fuse_v_scale_attn_inst_buf("
+    m.def("qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf("
             "Tensor query, "
             "Tensor key, "
             "Tensor value, "
