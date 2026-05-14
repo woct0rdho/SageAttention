@@ -1,0 +1,7446 @@
+/*
+ * Copyright (c) 2024 by SageAttention team.
+ * Copyright (c) 2026 Advanced Micro Devices, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0.
+ */
+
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor_struct.h>
+
+#include "../torch_version.h"
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_10_0
+#include <torch/csrc/stable/tensor_inl.h>
+#endif
+
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
+
+#if defined(__HIP_PLATFORM_AMD__)
+#include <hip/amd_detail/amd_math_functions.h>
+#include <hip/hip_bfloat16.h>
+#include <hip/hip_fp8.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+#include <rocwmma/rocwmma.hpp>
+#else
+#error "qk_int_sv_gfx12_native.cu is only intended for ROCm/HIP."
+#endif
+
+#include "../reduction_utils.cuh"
+
+#include <cfloat>
+#include <cmath>
+#include <cstdint>
+#include <optional>
+#include <type_traits>
+#include <vector>
+
+using torch::stable::Tensor;
+using ScalarType = torch::headeronly::ScalarType;
+
+namespace {
+
+constexpr int kNHD = 0;
+constexpr int kHND = 1;
+constexpr float kLog2e = 1.4426950408889634f;
+constexpr float kFp8SoftmaxOffset = 8.807f;
+constexpr float kF16SoftmaxOffset = 0.0f;
+
+Tensor new_empty_like(const Tensor& like, std::initializer_list<int64_t> sizes, ScalarType dtype) {
+  return torch::stable::new_empty(like, std::vector<int64_t>(sizes), std::make_optional(dtype));
+}
+
+Tensor new_empty_like(
+    const Tensor& like,
+    torch::headeronly::IntHeaderOnlyArrayRef sizes,
+    ScalarType dtype) {
+  return torch::stable::new_empty(like, sizes, std::make_optional(dtype));
+}
+
+std::vector<int64_t> contiguous_strides(const std::vector<int64_t>& sizes) {
+  std::vector<int64_t> strides(sizes.size());
+  int64_t stride = 1;
+  for (int64_t idx = static_cast<int64_t>(sizes.size()) - 1; idx >= 0; --idx) {
+    strides[idx] = stride;
+    stride *= sizes[idx];
+  }
+  return strides;
+}
+
+Tensor from_blob_like(
+    void* data,
+    std::initializer_list<int64_t> sizes,
+    const Tensor& like,
+    ScalarType dtype) {
+  std::vector<int64_t> shape(sizes);
+  std::vector<int64_t> strides = contiguous_strides(shape);
+  return torch::stable::from_blob(data, shape, strides, like.device(), dtype);
+}
+
+#define SAGEATTN_NATIVE_HAS_GFX12_WMMA 1
+#ifndef SAGEATTN_GFX12_NATIVE_WAVES_PER_EU_MAX
+#define SAGEATTN_GFX12_NATIVE_WAVES_PER_EU_MAX 1
+#endif
+#ifndef SAGEATTN_GFX12_NATIVE_D64_2Q_WAVES_PER_EU_MAX
+#define SAGEATTN_GFX12_NATIVE_D64_2Q_WAVES_PER_EU_MAX 2
+#endif
+#ifndef SAGEATTN_GFX12_NATIVE_D64_2Q_CAUSAL_WAVES_PER_EU_MAX
+#define SAGEATTN_GFX12_NATIVE_D64_2Q_CAUSAL_WAVES_PER_EU_MAX 2
+#endif
+#ifndef SAGEATTN_GFX12_NATIVE_D64_2Q_CAUSAL_WAVES_PER_EU_MIN
+#define SAGEATTN_GFX12_NATIVE_D64_2Q_CAUSAL_WAVES_PER_EU_MIN 1
+#endif
+#ifndef SAGEATTN_GFX12_NATIVE_D16_2Q_WAVES_PER_EU_MAX
+#define SAGEATTN_GFX12_NATIVE_D16_2Q_WAVES_PER_EU_MAX 2
+#endif
+#ifndef SAGEATTN_GFX12_NATIVE_D128_2Q_WAVES_PER_EU_MAX
+#define SAGEATTN_GFX12_NATIVE_D128_2Q_WAVES_PER_EU_MAX 1
+#endif
+#ifndef SAGEATTN_GFX12_NATIVE_F16_TV_PAD
+#define SAGEATTN_GFX12_NATIVE_F16_TV_PAD 16
+#endif
+#ifndef SAGEATTN_GFX12_NATIVE_F16_2Q_MIN_BLOCKS
+#define SAGEATTN_GFX12_NATIVE_F16_2Q_MIN_BLOCKS 1
+#endif
+#define SAGEATTN_NATIVE_WAVES_PER_EU \
+  __attribute__((amdgpu_waves_per_eu(1, SAGEATTN_GFX12_NATIVE_WAVES_PER_EU_MAX)))
+#define SAGEATTN_NATIVE_2Q_WAVES_PER_EU(HD_, CAUSAL_) \
+  __attribute__((amdgpu_waves_per_eu( \
+      ((HD_) == 64 && (CAUSAL_) ? SAGEATTN_GFX12_NATIVE_D64_2Q_CAUSAL_WAVES_PER_EU_MIN : 1), \
+      ((HD_) == 16 ? SAGEATTN_GFX12_NATIVE_D16_2Q_WAVES_PER_EU_MAX : \
+       ((HD_) == 64 ? ((CAUSAL_) ? SAGEATTN_GFX12_NATIVE_D64_2Q_CAUSAL_WAVES_PER_EU_MAX \
+                                   : SAGEATTN_GFX12_NATIVE_D64_2Q_WAVES_PER_EU_MAX) \
+                       : SAGEATTN_GFX12_NATIVE_D128_2Q_WAVES_PER_EU_MAX)))))
+#define SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BR_) \
+  __launch_bounds__(BR_, SAGEATTN_GFX12_NATIVE_F16_2Q_MIN_BLOCKS)
+#define SAGEATTN_F16_SCHED_BARRIER(MASK_) ((void)0)
+
+using half8_vec = _Float16 __attribute__((ext_vector_type(8)));
+using float8_vec = float __attribute__((ext_vector_type(8)));
+using i16x8_vec = int16_t __attribute__((ext_vector_type(8)));
+using i32x2_vec = int32_t __attribute__((ext_vector_type(2)));
+using u32x4_vec = uint32_t __attribute__((ext_vector_type(4)));
+using i32x8_vec = int32_t __attribute__((ext_vector_type(8)));
+
+void hip_kernel_launch_check() {
+  const hipError_t err = hipGetLastError();
+  STD_TORCH_CHECK(err == hipSuccess, "HIP kernel launch failed: ", hipGetErrorString(err));
+}
+
+__device__ __forceinline__ float value_to_float(const __half value) {
+  return __half2float(value);
+}
+
+__device__ __forceinline__ float value_to_float(const __hip_bfloat16 value) {
+  return __bfloat162float(value);
+}
+
+__device__ __forceinline__ int8_t float_to_int8_rn_gfx12(const float x) {
+  int32_t rounded;
+  asm volatile("v_cvt_i32_f32 %[dst], %[src]"
+               : [dst] "=v"(rounded)
+               : [src] "v"(x));
+  rounded = rounded > 127 ? 127 : rounded;
+  rounded = rounded < -128 ? -128 : rounded;
+  return static_cast<int8_t>(rounded);
+}
+
+__device__ __forceinline__ int8_t float_to_int8_nearby_gfx12(const float x) {
+  const float clipped = fminf(127.0f, fmaxf(-128.0f, nearbyintf(x)));
+  return static_cast<int8_t>(clipped);
+}
+
+template <typename T, int HeadDim>
+__global__ void quant_qk_int8_hnd_kernel(
+    const T* __restrict__ query,
+    const T* __restrict__ key,
+    int8_t* __restrict__ query_out,
+    int8_t* __restrict__ key_out,
+    float* __restrict__ query_scale,
+    float* __restrict__ key_scale,
+    const int64_t batch,
+    const int64_t q_heads,
+    const int64_t kv_heads,
+    const int64_t q_len,
+    const int64_t kv_len,
+    const int q_groups,
+    const int k_groups) {
+  constexpr int Threads = 256;
+  __shared__ float shared_amax;
+
+  const int group = blockIdx.x;
+  const int head = blockIdx.y;
+  const int b = blockIdx.z;
+  const int tid = threadIdx.x;
+  const bool is_q = group < q_groups;
+  const int local_group = is_q ? group : group - q_groups;
+  const int rows_per_group = is_q ? 32 : 64;
+  const int64_t seq_len = is_q ? q_len : kv_len;
+  const int64_t base_row = static_cast<int64_t>(local_group) * rows_per_group;
+  const int active_heads = is_q ? static_cast<int>(q_heads) : static_cast<int>(kv_heads);
+  if (b >= batch || head >= active_heads || base_row >= seq_len) {
+    return;
+  }
+
+  const T* in = is_q ? query : key;
+  int8_t* out = is_q ? query_out : key_out;
+  float* scale_out = is_q ? query_scale : key_scale;
+  const int64_t heads = is_q ? q_heads : kv_heads;
+  const int scale_groups = is_q ? q_groups : k_groups;
+  constexpr int PackElems = 8;
+  static_assert((HeadDim % PackElems) == 0, "native quantization packs eight elements");
+  const int packs = (rows_per_group * HeadDim) / PackElems;
+
+  float local_amax = 0.0000001f;
+  for (int pack = tid; pack < packs; pack += Threads) {
+    const int elem_base = pack * PackElems;
+    const int row = elem_base / HeadDim;
+    const int d = elem_base - row * HeadDim;
+    const int64_t seq = base_row + row;
+    if (seq < seq_len) {
+      const int64_t off = ((static_cast<int64_t>(b) * heads + head) * seq_len + seq) * HeadDim + d;
+      const uint4 raw = *reinterpret_cast<const uint4*>(in + off);
+      const T* values = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+      for (int i = 0; i < PackElems; ++i) {
+        local_amax = fmaxf(local_amax, fabsf(value_to_float(values[i])));
+      }
+    }
+  }
+  const float block_amax = vllm::blockReduceMax(local_amax);
+  if (tid == 0) {
+    shared_amax = block_amax;
+    scale_out[(static_cast<int64_t>(b) * active_heads + head) * scale_groups + local_group] =
+        shared_amax / 127.0f;
+  }
+  __syncthreads();
+  const float inv_scale = 127.0f / shared_amax;
+
+  for (int pack = tid; pack < packs; pack += Threads) {
+    const int elem_base = pack * PackElems;
+    const int row = elem_base / HeadDim;
+    const int d = elem_base - row * HeadDim;
+    const int64_t seq = base_row + row;
+    if (seq < seq_len) {
+      const int64_t off = ((static_cast<int64_t>(b) * heads + head) * seq_len + seq) * HeadDim + d;
+      const uint4 raw = *reinterpret_cast<const uint4*>(in + off);
+      const T* values = reinterpret_cast<const T*>(&raw);
+      char4 out0;
+      char4 out1;
+      out0.x = float_to_int8_rn_gfx12(value_to_float(values[0]) * inv_scale);
+      out0.y = float_to_int8_rn_gfx12(value_to_float(values[1]) * inv_scale);
+      out0.z = float_to_int8_rn_gfx12(value_to_float(values[2]) * inv_scale);
+      out0.w = float_to_int8_rn_gfx12(value_to_float(values[3]) * inv_scale);
+      out1.x = float_to_int8_rn_gfx12(value_to_float(values[4]) * inv_scale);
+      out1.y = float_to_int8_rn_gfx12(value_to_float(values[5]) * inv_scale);
+      out1.z = float_to_int8_rn_gfx12(value_to_float(values[6]) * inv_scale);
+      out1.w = float_to_int8_rn_gfx12(value_to_float(values[7]) * inv_scale);
+      *reinterpret_cast<char4*>(out + off) = out0;
+      *reinterpret_cast<char4*>(out + off + 4) = out1;
+    }
+  }
+}
+
+template <typename T, int HeadDim>
+__global__ void quant_q_nhd_per_warp_kernel(
+    const T* __restrict__ query,
+    int8_t* __restrict__ query_out,
+    float* __restrict__ query_scale,
+    const int64_t batch,
+    const int64_t q_len,
+    const int64_t q_heads,
+    const int q_scale_groups) {
+  constexpr int Threads = 256;
+  constexpr int PackElems = 8;
+  constexpr int QRows = 32;
+  constexpr int GroupsPerBlock = 2;
+  static_assert((HeadDim % PackElems) == 0, "native Q quantization packs eight elements");
+
+  __shared__ float shared_amax[GroupsPerBlock];
+  __shared__ float shared_pair_amax[GroupsPerBlock][32];
+
+  const int group_base = static_cast<int>(blockIdx.x) * GroupsPerBlock;
+  const int head = blockIdx.y;
+  const int b = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int wid = tid >> 5;
+  if (b >= batch || head >= q_heads ||
+      static_cast<int64_t>(group_base) * QRows >= q_len) {
+    return;
+  }
+
+  constexpr int Packs = (QRows * HeadDim) / PackElems;
+  float local_amax0 = 0.0000001f;
+  float local_amax1 = 0.0000001f;
+  const bool has_group1 = (group_base + 1) < q_scale_groups;
+  const int64_t base_row0 = static_cast<int64_t>(group_base) * QRows;
+  const int64_t base_row1 = base_row0 + QRows;
+
+  for (int pack = tid; pack < Packs; pack += Threads) {
+    const int elem_base = pack * PackElems;
+    const int row = elem_base / HeadDim;
+    const int d = elem_base - row * HeadDim;
+    const int64_t seq0 = base_row0 + row;
+    if (seq0 < q_len) {
+      const int64_t off =
+          ((static_cast<int64_t>(b) * q_len + seq0) * q_heads + head) * HeadDim + d;
+      const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
+      const T* values = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+      for (int i = 0; i < PackElems; ++i) {
+        local_amax0 = fmaxf(local_amax0, fabsf(value_to_float(values[i])));
+      }
+    }
+    const int64_t seq1 = base_row1 + row;
+    if (has_group1 && seq1 < q_len) {
+      const int64_t off =
+          ((static_cast<int64_t>(b) * q_len + seq1) * q_heads + head) * HeadDim + d;
+      const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
+      const T* values = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+      for (int i = 0; i < PackElems; ++i) {
+        local_amax1 = fmaxf(local_amax1, fabsf(value_to_float(values[i])));
+      }
+    }
+  }
+
+  local_amax0 = vllm::warpReduceMax(local_amax0);
+  local_amax1 = vllm::warpReduceMax(local_amax1);
+  if (lane == 0) {
+    shared_pair_amax[0][wid] = local_amax0;
+    shared_pair_amax[1][wid] = local_amax1;
+  }
+  __syncthreads();
+
+  const bool warp_lane_active = tid < (blockDim.x / 32);
+  local_amax0 = warp_lane_active ? shared_pair_amax[0][lane] : -1e20f;
+  local_amax1 = warp_lane_active ? shared_pair_amax[1][lane] : -1e20f;
+  local_amax0 = vllm::warpReduceMax(local_amax0);
+  local_amax1 = vllm::warpReduceMax(local_amax1);
+  if (tid == 0) {
+    shared_amax[0] = local_amax0;
+    query_scale[(static_cast<int64_t>(b) * q_heads + head) * q_scale_groups +
+                group_base] = local_amax0 / 127.0f;
+    if (has_group1) {
+      shared_amax[1] = local_amax1;
+      query_scale[(static_cast<int64_t>(b) * q_heads + head) * q_scale_groups +
+                  group_base + 1] = local_amax1 / 127.0f;
+    }
+  }
+  __syncthreads();
+
+  const float inv_scale0 = 127.0f / shared_amax[0];
+  const float inv_scale1 = has_group1 ? (127.0f / shared_amax[1]) : 0.0f;
+  for (int pack = tid; pack < Packs; pack += Threads) {
+    const int elem_base = pack * PackElems;
+    const int row = elem_base / HeadDim;
+    const int d = elem_base - row * HeadDim;
+    const int64_t seq0 = base_row0 + row;
+    if (seq0 < q_len) {
+      const int64_t off =
+          ((static_cast<int64_t>(b) * q_len + seq0) * q_heads + head) * HeadDim + d;
+      const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
+      const T* values = reinterpret_cast<const T*>(&raw);
+      char4 out0;
+      char4 out1;
+      out0.x = float_to_int8_nearby_gfx12(value_to_float(values[0]) * inv_scale0);
+      out0.y = float_to_int8_nearby_gfx12(value_to_float(values[1]) * inv_scale0);
+      out0.z = float_to_int8_nearby_gfx12(value_to_float(values[2]) * inv_scale0);
+      out0.w = float_to_int8_nearby_gfx12(value_to_float(values[3]) * inv_scale0);
+      out1.x = float_to_int8_nearby_gfx12(value_to_float(values[4]) * inv_scale0);
+      out1.y = float_to_int8_nearby_gfx12(value_to_float(values[5]) * inv_scale0);
+      out1.z = float_to_int8_nearby_gfx12(value_to_float(values[6]) * inv_scale0);
+      out1.w = float_to_int8_nearby_gfx12(value_to_float(values[7]) * inv_scale0);
+      *reinterpret_cast<char4*>(query_out + off) = out0;
+      *reinterpret_cast<char4*>(query_out + off + 4) = out1;
+    }
+    const int64_t seq1 = base_row1 + row;
+    if (has_group1 && seq1 < q_len) {
+      const int64_t off =
+          ((static_cast<int64_t>(b) * q_len + seq1) * q_heads + head) * HeadDim + d;
+      const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
+      const T* values = reinterpret_cast<const T*>(&raw);
+      char4 out0;
+      char4 out1;
+      out0.x = float_to_int8_nearby_gfx12(value_to_float(values[0]) * inv_scale1);
+      out0.y = float_to_int8_nearby_gfx12(value_to_float(values[1]) * inv_scale1);
+      out0.z = float_to_int8_nearby_gfx12(value_to_float(values[2]) * inv_scale1);
+      out0.w = float_to_int8_nearby_gfx12(value_to_float(values[3]) * inv_scale1);
+      out1.x = float_to_int8_nearby_gfx12(value_to_float(values[4]) * inv_scale1);
+      out1.y = float_to_int8_nearby_gfx12(value_to_float(values[5]) * inv_scale1);
+      out1.z = float_to_int8_nearby_gfx12(value_to_float(values[6]) * inv_scale1);
+      out1.w = float_to_int8_nearby_gfx12(value_to_float(values[7]) * inv_scale1);
+      *reinterpret_cast<char4*>(query_out + off) = out0;
+      *reinterpret_cast<char4*>(query_out + off + 4) = out1;
+    }
+  }
+}
+
+template <typename T, typename OutT, bool ToFp8>
+__global__ void transpose_value_hnd_kernel(
+    const T* __restrict__ value,
+    OutT* __restrict__ output,
+    const int64_t total_heads,
+    const int64_t seq_len,
+    const int64_t head_dim) {
+  constexpr int TileS = 128;
+  constexpr int TileD = 16;
+  __shared__ OutT tile[TileS][TileD];
+
+  const int tid = threadIdx.x;
+  const int64_t bh = blockIdx.z;
+
+  for (int linear = tid; linear < TileS * TileD; linear += blockDim.x) {
+    const int load_s = linear / TileD;
+    const int load_d = linear - load_s * TileD;
+    const int64_t s = static_cast<int64_t>(blockIdx.x) * TileS + load_s;
+    const int64_t d = static_cast<int64_t>(blockIdx.y) * TileD + load_d;
+    if (bh < total_heads && s < seq_len && d < head_dim) {
+      const float v = value_to_float(value[(bh * seq_len + s) * head_dim + d]);
+      if constexpr (ToFp8) {
+        tile[load_s][load_d] =
+            __hip_cvt_float_to_fp8(v, __HIP_SATFINITE, __HIP_E4M3);
+      } else {
+        tile[load_s][load_d] = __float2half_rn(v);
+      }
+    }
+  }
+  __syncthreads();
+
+  for (int linear = tid; linear < TileS * TileD; linear += blockDim.x) {
+    const int store_d_local = linear / TileS;
+    const int store_s_local = linear - store_d_local * TileS;
+    const int64_t store_s = static_cast<int64_t>(blockIdx.x) * TileS + store_s_local;
+    const int64_t store_d = static_cast<int64_t>(blockIdx.y) * TileD + store_d_local;
+    if (bh < total_heads && store_s < seq_len && store_d < head_dim) {
+      output[(bh * head_dim + store_d) * seq_len + store_s] =
+          tile[store_s_local][store_d_local];
+    }
+  }
+}
+
+template <typename OutT, bool ToFp8>
+Tensor transpose_value_hnd_gfx12(Tensor value) {
+  STD_TORCH_CHECK(value.is_cuda(), "gfx12 value transpose expects a CUDA/HIP tensor");
+  STD_TORCH_CHECK(value.dim() == 4, "gfx12 value transpose expects [B, H, S, D]");
+  STD_TORCH_CHECK(value.is_contiguous(), "gfx12 value transpose expects contiguous HND input");
+  STD_TORCH_CHECK(value.scalar_type() == ScalarType::Half || value.scalar_type() == ScalarType::BFloat16,
+              "gfx12 value transpose supports fp16/bf16 input");
+
+  const int64_t batch = value.size(0);
+  const int64_t heads = value.size(1);
+  const int64_t seq_len = value.size(2);
+  const int64_t head_dim = value.size(3);
+  const ScalarType out_dtype = ToFp8 ? ScalarType::Byte : ScalarType::Half;
+  Tensor output = new_empty_like(value, {batch, heads, head_dim, seq_len}, out_dtype);
+
+  dim3 block(256);
+  dim3 grid((seq_len + 127) / 128, (head_dim + 15) / 16, batch * heads);
+    if (value.scalar_type() == ScalarType::Half) {
+    transpose_value_hnd_kernel<__half, OutT, ToFp8><<<grid, block, 0>>>(
+                       reinterpret_cast<const __half*>(value.data_ptr()),
+                       reinterpret_cast<OutT*>(output.data_ptr()),
+                       batch * heads, seq_len, head_dim);
+  } else {
+    transpose_value_hnd_kernel<__hip_bfloat16, OutT, ToFp8><<<grid, block, 0>>>(
+                       reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                       reinterpret_cast<OutT*>(output.data_ptr()),
+                       batch * heads, seq_len, head_dim);
+  }
+  hip_kernel_launch_check();
+  return output;
+}
+
+template <typename T>
+__global__ void transpose_value_fp8_scaled_hnd_kernel(
+    const T* __restrict__ value,
+    const float* __restrict__ value_scale,
+    uint8_t* __restrict__ output,
+    const int64_t total_heads,
+    const int64_t seq_len,
+    const int64_t head_dim) {
+  constexpr int TileS = 128;
+  constexpr int TileD = 16;
+  __shared__ uint8_t tile[TileS][TileD];
+
+  const int tid = threadIdx.x;
+  const int64_t bh = blockIdx.z;
+
+  for (int linear = tid; linear < TileS * TileD; linear += blockDim.x) {
+    const int load_s = linear / TileD;
+    const int load_d = linear - load_s * TileD;
+    const int64_t s = static_cast<int64_t>(blockIdx.x) * TileS + load_s;
+    const int64_t d = static_cast<int64_t>(blockIdx.y) * TileD + load_d;
+    if (bh < total_heads && s < seq_len && d < head_dim) {
+      const float scale = value_scale[bh * head_dim + d];
+      const float v = scale == 0.0f ? 0.0f :
+          value_to_float(value[(bh * seq_len + s) * head_dim + d]) / scale;
+      tile[load_s][load_d] =
+          __hip_cvt_float_to_fp8(v, __HIP_SATFINITE, __HIP_E4M3);
+    }
+  }
+  __syncthreads();
+
+  for (int linear = tid; linear < TileS * TileD; linear += blockDim.x) {
+    const int store_d_local = linear / TileS;
+    const int store_s_local = linear - store_d_local * TileS;
+    const int64_t store_s = static_cast<int64_t>(blockIdx.x) * TileS + store_s_local;
+    const int64_t store_d = static_cast<int64_t>(blockIdx.y) * TileD + store_d_local;
+    if (bh < total_heads && store_s < seq_len && store_d < head_dim) {
+      output[(bh * head_dim + store_d) * seq_len + store_s] =
+          tile[store_s_local][store_d_local];
+    }
+  }
+}
+
+__device__ __forceinline__ int64_t qkv_offset(
+    const int tensor_layout,
+    const int64_t b,
+    const int64_t h,
+    const int64_t n,
+    const int64_t d,
+    const int64_t stride_b,
+    const int64_t stride_n,
+    const int64_t stride_h) {
+  return tensor_layout == kNHD
+      ? b * stride_b + n * stride_n + h * stride_h + d
+      : b * stride_b + h * stride_h + n * stride_n + d;
+}
+
+template <int HeadDim, bool HndContiguous>
+__device__ __forceinline__ int64_t qkv_offset_dispatch(
+    const int tensor_layout,
+    const int64_t b,
+    const int64_t h,
+    const int64_t n,
+    const int64_t d,
+    const int64_t stride_b,
+    const int64_t stride_n,
+    const int64_t stride_h) {
+  if constexpr (HndContiguous) {
+    return b * stride_b + h * stride_h + n * HeadDim + d;
+  } else {
+    return qkv_offset(tensor_layout, b, h, n, d, stride_b, stride_n, stride_h);
+  }
+}
+
+__device__ __forceinline__ int q_scale_col_per_warp(const int64_t q_idx) {
+  return static_cast<int>((q_idx / 128) * 4 + ((q_idx & 127) / 32));
+}
+
+__device__ __forceinline__ int k_scale_col_per_warp(const int64_t k_idx) {
+  return static_cast<int>(k_idx / 64);
+}
+
+template <bool IsCausal, int BlockRows>
+__device__ __forceinline__ int64_t q_block_base_for_launch(
+    const int64_t block_x,
+    const int64_t qo_len) {
+  if constexpr (IsCausal) {
+    const int64_t q_blocks = (qo_len + BlockRows - 1) / BlockRows;
+    return (q_blocks - 1 - block_x) * BlockRows;
+  } else {
+    return block_x * BlockRows;
+  }
+}
+
+__device__ __forceinline__ float fast_exp2(float x) {
+  return __builtin_amdgcn_exp2f(x);
+}
+
+template <bool IsCausal>
+__device__ __forceinline__ void apply_tqk_causal_mask(
+    float8_vec& scores,
+    const int q_start,
+    const int kb_base,
+    const int col_tile,
+    const int lane) {
+  if constexpr (IsCausal) {
+    const int tile_end = kb_base + col_tile * 16 + 15;
+    if (tile_end <= q_start) {
+      return;
+    }
+    const int q_idx = q_start + (lane & 15);
+    const int k_base = kb_base + col_tile * 16 + ((lane >> 4) << 3);
+#pragma unroll
+    for (int elem = 0; elem < 8; ++elem) {
+      scores[elem] = (k_base + elem) > q_idx ? -FLT_MAX * 0.5f : scores[elem];
+    }
+  }
+}
+
+template <bool ApplyCausalMask, int ColTiles>
+__device__ __forceinline__ int active_causal_col_tiles(
+    const int64_t q_start,
+    const int64_t kb_base) {
+  if constexpr (!ApplyCausalMask) {
+    return ColTiles;
+  } else {
+    constexpr int BK = 16;
+    constexpr int RM = 16;
+    const int64_t q_end = q_start + RM;
+    if (q_end <= kb_base) {
+      return 0;
+    }
+    const int64_t cols = (q_end - kb_base + BK - 1) / BK;
+    return static_cast<int>(cols < ColTiles ? cols : ColTiles);
+  }
+}
+
+__device__ __forceinline__ int wmma_f16_k_for_lane_elem(
+    const int lane,
+    const int elem) {
+  const int reg = elem >> 1;
+  const int half = elem & 1;
+  return ((reg >> 1) << 3) + (((lane >> 4) & 1) << 2) + ((reg & 1) << 1) + half;
+}
+
+template <bool PvOrdered = false>
+__device__ __forceinline__ void apply_tqk_kv_tail_mask(
+    float8_vec& scores,
+    const int64_t valid_kv_len,
+    const int64_t kb_base,
+    const int col_tile,
+    const int lane) {
+  const int64_t col_base = kb_base + static_cast<int64_t>(col_tile) * 16;
+  if (col_base + 15 < valid_kv_len) {
+    return;
+  }
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    const int k_local = PvOrdered ?
+        wmma_f16_k_for_lane_elem(lane, elem) :
+        (((lane >> 4) << 3) + elem);
+    scores[elem] = (col_base + k_local) >= valid_kv_len ?
+        -FLT_MAX * 0.5f : scores[elem];
+  }
+}
+
+__device__ __forceinline__ int gfx12_tr_b128_source_row_for_lane(const int lane) {
+  const int quad_group = lane >> 2;
+  const int quad_pos = lane & 3;
+  return quad_pos + ((quad_group & 1) << 3) + ((lane >> 4) << 2);
+}
+
+__device__ __forceinline__ int gfx12_tr_b128_source_col_for_lane(const int lane) {
+  return ((lane >> 3) & 1) << 3;
+}
+
+__device__ __forceinline__ half8_vec gfx12_global_load_tr_b128_f16(const __half* ptr) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+  const i16x8_vec bits = __builtin_amdgcn_global_load_tr_b128_v8i16(
+      reinterpret_cast<i16x8_vec*>(const_cast<__half*>(ptr)));
+  return *reinterpret_cast<const half8_vec*>(&bits);
+#else
+  half8_vec regs;
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    regs[elem] = static_cast<_Float16>(ptr[elem]);
+  }
+  return regs;
+#endif
+}
+
+__device__ __forceinline__ int pv_k_order_for_acc_row(const int row) {
+  return (row & 3) | ((row & 4) << 1) | ((row & 8) >> 1);
+}
+
+template <bool IsCausal>
+__device__ __forceinline__ void apply_tqk_causal_mask_pv_order(
+    float8_vec& scores,
+    const int q_start,
+    const int kb_base,
+    const int col_tile,
+    const int lane) {
+  if constexpr (IsCausal) {
+    const int tile_end = kb_base + col_tile * 16 + 15;
+    if (tile_end <= q_start) {
+      return;
+    }
+    const int q_idx = q_start + (lane & 15);
+#pragma unroll
+    for (int elem = 0; elem < 8; ++elem) {
+      const int k_idx = kb_base + col_tile * 16 + wmma_f16_k_for_lane_elem(lane, elem);
+      scores[elem] = k_idx > q_idx ? -FLT_MAX * 0.5f : scores[elem];
+    }
+  }
+}
+
+template <typename QueryT, int HeadDim, bool HndContiguous>
+__device__ __forceinline__ i32x2_vec pack_quant_q_i8_wmma_b_regs(
+    const QueryT* __restrict__ q,
+    const int tensor_layout,
+    const int lane,
+    const int64_t b,
+    const int64_t h,
+    const int64_t q_start,
+    const int64_t qo_len,
+    const int d_base,
+    const int64_t q_stride_b,
+    const int64_t q_stride_n,
+    const int64_t q_stride_h,
+    const float inv_q_scale) {
+  i32x2_vec regs;
+  const int row = lane & 15;
+  const int k_base = 8 * (lane >> 4);
+  const int64_t q_idx = q_start + row;
+  if (q_idx >= qo_len) {
+#pragma unroll
+    for (int gpr = 0; gpr < 2; ++gpr) {
+      regs[gpr] = 0;
+    }
+    return regs;
+  }
+
+  const int d = d_base + k_base;
+  const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+      tensor_layout, b, h, q_idx, d, q_stride_b, q_stride_n, q_stride_h);
+  const uint4 raw = *reinterpret_cast<const uint4*>(q + q_off);
+  const QueryT* values = reinterpret_cast<const QueryT*>(&raw);
+#pragma unroll
+  for (int gpr = 0; gpr < 2; ++gpr) {
+    uint32_t packed = 0;
+#pragma unroll
+    for (int byte = 0; byte < 4; ++byte) {
+      packed |= static_cast<uint32_t>(static_cast<unsigned char>(
+          float_to_int8_nearby_gfx12(value_to_float(values[4 * gpr + byte]) * inv_q_scale)))
+          << (8 * byte);
+    }
+    regs[gpr] = static_cast<int32_t>(packed);
+  }
+  return regs;
+}
+
+template <int HeadDim, bool HndContiguous>
+__device__ __forceinline__ i32x2_vec pack_q_i8_wmma_b_regs(
+    const int8_t* __restrict__ q,
+    const int tensor_layout,
+    const int lane,
+    const int64_t b,
+    const int64_t h,
+    const int64_t q_start,
+    const int64_t qo_len,
+    const int d_base,
+    const int64_t q_stride_b,
+    const int64_t q_stride_n,
+    const int64_t q_stride_h) {
+  i32x2_vec regs;
+  const int row = lane & 15;
+  const int k_base = 8 * (lane >> 4);
+  const int64_t q_idx = q_start + row;
+  if (q_idx >= qo_len) {
+#pragma unroll
+    for (int gpr = 0; gpr < 2; ++gpr) {
+      regs[gpr] = 0;
+    }
+    return regs;
+  }
+
+  const int d = d_base + k_base;
+  const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+      tensor_layout, b, h, q_idx, d, q_stride_b, q_stride_n, q_stride_h);
+  const uint2 raw = *reinterpret_cast<const uint2*>(q + q_off);
+  regs[0] = static_cast<int32_t>(raw.x);
+  regs[1] = static_cast<int32_t>(raw.y);
+  return regs;
+}
+
+template <int SharedHeadStride>
+__device__ __forceinline__ i32x2_vec pack_k_i8_wmma_b_regs_from_shared(
+    const int8_t* __restrict__ k_tile,
+    const int lane,
+    const int col_tile,
+    const int d_base) {
+  i32x2_vec regs;
+  const int col = lane & 15;
+  const int k_base = 8 * (lane >> 4);
+  const int row = col_tile * 16 + col;
+#pragma unroll
+  for (int gpr = 0; gpr < 2; ++gpr) {
+    const int d = d_base + k_base + 4 * gpr;
+    regs[gpr] = *reinterpret_cast<const int32_t*>(
+        k_tile + row * SharedHeadStride + d);
+  }
+  return regs;
+}
+
+template <int SharedHeadStride>
+__device__ __forceinline__ i32x2_vec pack_k_i8_wmma_b_regs_from_shared_pv_order(
+    const int8_t* __restrict__ k_tile,
+    const int lane,
+    const int col_tile,
+    const int d_base) {
+  i32x2_vec regs;
+  const int col = lane & 15;
+  const int k_base = 8 * (lane >> 4);
+  const int row = col_tile * 16 + pv_k_order_for_acc_row(col);
+#pragma unroll
+  for (int gpr = 0; gpr < 2; ++gpr) {
+    const int d = d_base + k_base + 4 * gpr;
+    regs[gpr] = *reinterpret_cast<const int32_t*>(
+        k_tile + row * SharedHeadStride + d);
+  }
+  return regs;
+}
+
+template <int DTiles>
+__device__ __forceinline__ i32x2_vec pack_k_i8_wmma_b_regs_from_lane_major_global(
+    const int8_t* __restrict__ k,
+    const int64_t k_head_base,
+    const int64_t k_group_stride,
+    const int64_t kb_base,
+    const int col_tile,
+    const int d_tile,
+    const int lane) {
+  const int64_t group = kb_base >> 6;
+  const int group_col_tile = ((static_cast<int>(kb_base) & 63) >> 4) + col_tile;
+  const int64_t off = k_head_base + group * k_group_stride +
+      (((static_cast<int64_t>(group_col_tile) * DTiles + d_tile) * 32 + lane) * 8);
+  const uint2 raw = *reinterpret_cast<const uint2*>(k + off);
+  i32x2_vec regs;
+  regs[0] = static_cast<int32_t>(raw.x);
+  regs[1] = static_cast<int32_t>(raw.y);
+  return regs;
+}
+
+template <int DTiles>
+__device__ __forceinline__ i32x2_vec pack_k_i8_wmma_b_regs_from_lane_major_shared(
+    const uint2* __restrict__ k_lane_tile,
+    const int col_tile,
+    const int d_tile,
+    const int lane) {
+  const uint2 raw = k_lane_tile[(col_tile * DTiles + d_tile) * 32 + lane];
+  i32x2_vec regs;
+  regs[0] = static_cast<int32_t>(raw.x);
+  regs[1] = static_cast<int32_t>(raw.y);
+  return regs;
+}
+
+__device__ __forceinline__ int wmma_fp8_k_for_lane_byte(
+    const int lane,
+    const int gpr,
+    const int byte) {
+  return 8 * (lane >> 4) + 4 * gpr + byte;
+}
+
+__device__ __forceinline__ int32_t pack_f32x4_to_ocp_fp8(
+    const float x0,
+    const float x1,
+    const float x2,
+    const float x3) {
+  float a0 = x0;
+  float a1 = x1;
+  float a2 = x2;
+  float a3 = x3;
+  uint32_t packed;
+  asm volatile("v_cvt_pk_fp8_f32 %[dst], %[a0], %[a1]\n"
+               "v_cvt_pk_fp8_f32 %[dst], %[a2], %[a3], op_sel:[0, 0, 1]\n"
+               : [dst] "=v"(packed), [a0] "+v"(a0), [a1] "+v"(a1),
+                 [a2] "+v"(a2), [a3] "+v"(a3));
+  return static_cast<int32_t>(packed);
+}
+
+__device__ __forceinline__ uint16_t half_to_u16_bits(const _Float16 value) {
+  return __builtin_bit_cast(uint16_t, value);
+}
+
+__device__ __forceinline__ _Float16 u16_bits_to_half(const uint16_t value) {
+  return __builtin_bit_cast(_Float16, value);
+}
+
+__device__ __forceinline__ i32x2_vec make_p_fp8_regs_from_tqk_prob_regs(
+    const float8_vec prob_values,
+    const int lane) {
+  (void)lane;
+  i32x2_vec regs;
+  regs[0] = pack_f32x4_to_ocp_fp8(
+      prob_values[0], prob_values[1], prob_values[2], prob_values[3]);
+  regs[1] = pack_f32x4_to_ocp_fp8(
+      prob_values[4], prob_values[5], prob_values[6], prob_values[7]);
+  return regs;
+}
+
+__device__ __forceinline__ half8_vec make_p_regs_from_tqk_prob_regs(
+    const half8_vec prob_values,
+    const int lane) {
+  half8_vec regs;
+  const bool lane_upper = lane >= 16;
+  u32x4_vec local_values;
+  u32x4_vec peer_values;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t lo = half_to_u16_bits(prob_values[2 * i]);
+    const uint32_t hi = half_to_u16_bits(prob_values[2 * i + 1]);
+    local_values[i] = lo | (hi << 16);
+    peer_values[i] = __shfl_xor(local_values[i], 16, 32);
+  }
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    const int p_col = wmma_f16_k_for_lane_elem(lane, elem);
+    const int source_elem = p_col & 7;
+    const bool source_upper = p_col >= 8;
+    const uint32_t packed = source_upper == lane_upper
+        ? local_values[source_elem >> 1]
+        : peer_values[source_elem >> 1];
+    const uint16_t bits = static_cast<uint16_t>(packed >> (16 * (source_elem & 1)));
+    regs[elem] = u16_bits_to_half(bits);
+  }
+  return regs;
+}
+
+template <int SharedHeadStride>
+__device__ __forceinline__ i32x2_vec make_v_fp8_regs_from_shared(
+    const uint8_t* __restrict__ v_tile,
+    const int col_tile,
+    const int d_tile,
+    const int lane) {
+  constexpr int BK = 16;
+  i32x2_vec regs;
+  const int d = d_tile * BK + (lane & 15);
+#pragma unroll
+  for (int gpr = 0; gpr < 2; ++gpr) {
+    uint32_t packed = 0;
+#pragma unroll
+    for (int byte = 0; byte < 4; ++byte) {
+      const int k_local = wmma_fp8_k_for_lane_byte(lane, gpr, byte);
+      const int row = col_tile * BK + k_local;
+      packed |= static_cast<uint32_t>(v_tile[row * SharedHeadStride + d]) << (8 * byte);
+    }
+    regs[gpr] = static_cast<int32_t>(packed);
+  }
+  return regs;
+}
+
+template <int SharedValueStride32>
+__device__ __forceinline__ i32x2_vec make_v_fp8_regs_from_transposed_shared(
+    const uint32_t* __restrict__ v_tile,
+    const int col_tile,
+    const int d_tile,
+    const int lane) {
+  constexpr int BK = 16;
+  i32x2_vec regs;
+  const int d = d_tile * BK + (lane & 15);
+#pragma unroll
+  for (int gpr = 0; gpr < 2; ++gpr) {
+    const int k_local = wmma_fp8_k_for_lane_byte(lane, gpr, 0);
+    const int n_group = (col_tile * BK + k_local) >> 2;
+    regs[gpr] = static_cast<int32_t>(v_tile[d * SharedValueStride32 + n_group]);
+  }
+  return regs;
+}
+
+template <int SharedValueStride>
+__device__ __forceinline__ i32x2_vec make_v_fp8_regs_from_transposed_shared(
+    const uint8_t* __restrict__ v_tile,
+    const int col_tile,
+    const int d_tile,
+    const int lane) {
+  constexpr int BK = 16;
+  i32x2_vec regs;
+  const int d = d_tile * BK + (lane & 15);
+#pragma unroll
+  for (int gpr = 0; gpr < 2; ++gpr) {
+    uint32_t packed = 0;
+#pragma unroll
+    for (int byte = 0; byte < 4; ++byte) {
+      const int k_local = wmma_fp8_k_for_lane_byte(lane, gpr, byte);
+      const int n = col_tile * BK + k_local;
+      packed |= static_cast<uint32_t>(v_tile[d * SharedValueStride + n]) << (8 * byte);
+    }
+    regs[gpr] = static_cast<int32_t>(packed);
+  }
+  return regs;
+}
+
+template <int DTiles>
+__device__ __forceinline__ i32x2_vec make_v_fp8_regs_from_lane_major_global(
+    const uint8_t* __restrict__ v,
+    const int64_t v_head_base,
+    const int64_t kb_base,
+    const int col_tile,
+    const int d_tile,
+    const int lane) {
+  constexpr int ColTiles64 = 4;
+  const int64_t group = kb_base >> 6;
+  const int group_col_tile = ((static_cast<int>(kb_base) & 63) >> 4) + col_tile;
+  const int64_t off = v_head_base +
+      group * (ColTiles64 * DTiles * 32 * 8) +
+      (((static_cast<int64_t>(group_col_tile) * DTiles + d_tile) * 32 + lane) * 8);
+  const uint2 raw = *reinterpret_cast<const uint2*>(v + off);
+  i32x2_vec regs;
+  regs[0] = static_cast<int32_t>(raw.x);
+  regs[1] = static_cast<int32_t>(raw.y);
+  return regs;
+}
+
+template <
+    int DTiles,
+    int SharedHeadStride,
+    typename FragK,
+    typename FragQ,
+    typename FragScoreT>
+__device__ __forceinline__ float8_vec compute_tqk_score_regs(
+    const int8_t* __restrict__ k_tile,
+    const FragQ (&q_frag)[DTiles],
+    const int col_tile,
+    const float score_scale) {
+  constexpr int BK = 16;
+  FragScoreT score_acc;
+  rocwmma::fill_fragment(score_acc, 0);
+#pragma unroll
+  for (int dt = 0; dt < DTiles; ++dt) {
+    FragK k_frag;
+    rocwmma::load_matrix_sync(
+        k_frag,
+        &k_tile[(col_tile * BK) * SharedHeadStride + dt * BK],
+        static_cast<uint32_t>(SharedHeadStride));
+    rocwmma::mma_sync(score_acc, k_frag, q_frag[dt], score_acc);
+  }
+
+  const auto score_rm = rocwmma::apply_data_layout<rocwmma::row_major>(score_acc);
+  float8_vec scores;
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    scores[elem] = static_cast<float>(score_rm[elem]) * score_scale;
+  }
+  return scores;
+}
+
+template <int DTiles, int SharedHeadStride>
+__device__ __forceinline__ float8_vec compute_tqk_score_regs_raw_kq(
+    const int8_t* __restrict__ k_tile,
+    const i32x2_vec (&q_regs)[DTiles],
+    const int lane,
+    const int col_tile,
+    const float score_scale) {
+  constexpr int BK = 16;
+  i32x8_vec score_acc;
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    score_acc[elem] = 0;
+  }
+#pragma unroll
+  for (int dt = 0; dt < DTiles; ++dt) {
+    const i32x2_vec k_regs =
+        pack_k_i8_wmma_b_regs_from_shared<SharedHeadStride>(
+            k_tile, lane, col_tile, dt * BK);
+    score_acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+        true, k_regs, true, q_regs[dt], score_acc, true);
+  }
+
+  float8_vec scores;
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    scores[elem] = static_cast<float>(score_acc[elem]) * score_scale;
+  }
+  return scores;
+}
+
+template <bool PvOrderedQK, int DTiles, int SharedHeadStride>
+__device__ __forceinline__ float8_vec compute_tqk_score_regs_raw_kq_one(
+    const int8_t* __restrict__ k_tile,
+    const i32x2_vec (&q_regs)[DTiles],
+    const int lane,
+    const int col_tile,
+    const float score_scale) {
+  constexpr int BK = 16;
+  i32x8_vec score_acc;
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    score_acc[elem] = 0;
+  }
+#pragma unroll
+  for (int dt = 0; dt < DTiles; ++dt) {
+    i32x2_vec k_regs;
+    if constexpr (PvOrderedQK) {
+      k_regs = pack_k_i8_wmma_b_regs_from_shared_pv_order<SharedHeadStride>(
+          k_tile, lane, col_tile, dt * BK);
+    } else {
+      k_regs = pack_k_i8_wmma_b_regs_from_shared<SharedHeadStride>(
+          k_tile, lane, col_tile, dt * BK);
+    }
+    score_acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+        true, k_regs, true, q_regs[dt], score_acc, true);
+  }
+
+  float8_vec scores;
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    scores[elem] = static_cast<float>(score_acc[elem]) * score_scale;
+  }
+  return scores;
+}
+
+template <bool PvOrderedQK, int DTiles, int SharedHeadStride>
+__device__ __forceinline__ void compute_tqk_score_regs_raw_kq_2(
+    const int8_t* __restrict__ k_tile,
+    const i32x2_vec (&q_regs)[2][DTiles],
+    const int lane,
+    const int col_tile,
+    const float score_scale0,
+    const float score_scale1,
+    const bool do0,
+    const bool do1,
+    float8_vec& scores0,
+    float8_vec& scores1) {
+  constexpr int BK = 16;
+  i32x8_vec score_acc0;
+  i32x8_vec score_acc1;
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    score_acc0[elem] = 0;
+    score_acc1[elem] = 0;
+  }
+#pragma unroll
+  for (int dt = 0; dt < DTiles; ++dt) {
+    i32x2_vec k_regs;
+    if constexpr (PvOrderedQK) {
+      k_regs = pack_k_i8_wmma_b_regs_from_shared_pv_order<SharedHeadStride>(
+          k_tile, lane, col_tile, dt * BK);
+    } else {
+      k_regs = pack_k_i8_wmma_b_regs_from_shared<SharedHeadStride>(
+          k_tile, lane, col_tile, dt * BK);
+    }
+    if (do0) {
+      score_acc0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+          true, k_regs, true, q_regs[0][dt], score_acc0, true);
+    }
+    if (do1) {
+      score_acc1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+          true, k_regs, true, q_regs[1][dt], score_acc1, true);
+    }
+  }
+
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    scores0[elem] = do0 ? static_cast<float>(score_acc0[elem]) * score_scale0 : -FLT_MAX * 0.5f;
+    scores1[elem] = do1 ? static_cast<float>(score_acc1[elem]) * score_scale1 : -FLT_MAX * 0.5f;
+  }
+}
+
+template <int DTiles>
+__device__ __forceinline__ void compute_tqk_score_regs_raw_kq_2_lane_key(
+    const int8_t* __restrict__ k,
+    const int64_t k_head_base,
+    const int64_t k_group_stride,
+    const int64_t kb_base,
+    const i32x2_vec (&q_regs)[2][DTiles],
+    const int lane,
+    const int col_tile,
+    const float score_scale0,
+    const float score_scale1,
+    const bool do0,
+    const bool do1,
+    float8_vec& scores0,
+    float8_vec& scores1) {
+  i32x8_vec score_acc0;
+  i32x8_vec score_acc1;
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    score_acc0[elem] = 0;
+    score_acc1[elem] = 0;
+  }
+#pragma unroll
+  for (int dt = 0; dt < DTiles; ++dt) {
+    const i32x2_vec k_regs =
+        pack_k_i8_wmma_b_regs_from_lane_major_global<DTiles>(
+            k, k_head_base, k_group_stride, kb_base, col_tile, dt, lane);
+    if (do0) {
+      score_acc0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+          true, k_regs, true, q_regs[0][dt], score_acc0, true);
+    }
+    if (do1) {
+      score_acc1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+          true, k_regs, true, q_regs[1][dt], score_acc1, true);
+    }
+  }
+
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    scores0[elem] = do0 ? static_cast<float>(score_acc0[elem]) * score_scale0 : -FLT_MAX * 0.5f;
+    scores1[elem] = do1 ? static_cast<float>(score_acc1[elem]) * score_scale1 : -FLT_MAX * 0.5f;
+  }
+}
+
+template <int DTiles>
+__device__ __forceinline__ void compute_tqk_score_regs_raw_kq_2_lane_shared_key(
+    const uint2* __restrict__ k_lane_tile,
+    const i32x2_vec (&q_regs)[2][DTiles],
+    const int lane,
+    const int col_tile,
+    const float score_scale0,
+    const float score_scale1,
+    const bool do0,
+    const bool do1,
+    float8_vec& scores0,
+    float8_vec& scores1) {
+  i32x8_vec score_acc0;
+  i32x8_vec score_acc1;
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    score_acc0[elem] = 0;
+    score_acc1[elem] = 0;
+  }
+#pragma unroll
+  for (int dt = 0; dt < DTiles; ++dt) {
+    const i32x2_vec k_regs =
+        pack_k_i8_wmma_b_regs_from_lane_major_shared<DTiles>(
+            k_lane_tile, col_tile, dt, lane);
+    if (do0) {
+      score_acc0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+          true, k_regs, true, q_regs[0][dt], score_acc0, true);
+    }
+    if (do1) {
+      score_acc1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+          true, k_regs, true, q_regs[1][dt], score_acc1, true);
+    }
+  }
+
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    scores0[elem] = do0 ? static_cast<float>(score_acc0[elem]) * score_scale0 : -FLT_MAX * 0.5f;
+    scores1[elem] = do1 ? static_cast<float>(score_acc1[elem]) * score_scale1 : -FLT_MAX * 0.5f;
+  }
+}
+
+template <int SharedHeadStride>
+__device__ __forceinline__ half8_vec make_v_regs_from_shared(
+    const __half* __restrict__ v_tile,
+    const int col_tile,
+    const int d_tile,
+    const int lane) {
+  constexpr int BK = 16;
+  half8_vec regs;
+  const int d = d_tile * BK + (lane & 15);
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    const int k_local = wmma_f16_k_for_lane_elem(lane, elem);
+    const int row = col_tile * BK + k_local;
+    regs[elem] = static_cast<_Float16>(v_tile[row * SharedHeadStride + d]);
+  }
+  return regs;
+}
+
+template <int SharedValueStride>
+__device__ __forceinline__ half8_vec make_v_regs_from_transposed_shared(
+    const __half* __restrict__ v_tile,
+    const int col_tile,
+    const int d_tile,
+    const int lane) {
+  constexpr int BK = 16;
+  half8_vec regs;
+  const int d = d_tile * BK + (lane & 15);
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    const int k_local = wmma_f16_k_for_lane_elem(lane, elem);
+    const int n = col_tile * BK + k_local;
+    regs[elem] = static_cast<_Float16>(v_tile[d * SharedValueStride + n]);
+  }
+  return regs;
+}
+
+__device__ __forceinline__ half8_vec make_v_regs_from_transposed_global(
+    const __half* __restrict__ v,
+    const int64_t v_head_base,
+    const int64_t v_stride_n,
+    const int64_t kb_base,
+    const int col_tile,
+    const int d_tile,
+    const int lane) {
+  constexpr int BK = 16;
+  half8_vec regs;
+  const int d = d_tile * BK + (lane & 15);
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    const int k_local = wmma_f16_k_for_lane_elem(lane, elem);
+    const int64_t n = kb_base + col_tile * BK + k_local;
+    regs[elem] = static_cast<_Float16>(v[v_head_base + static_cast<int64_t>(d) * v_stride_n + n]);
+  }
+  return regs;
+}
+
+__device__ __forceinline__ half8_vec make_v_regs_from_hnd_global(
+    const __half* __restrict__ v,
+    const int64_t v_head_base,
+    const int64_t v_stride_n,
+    const int64_t kb_base,
+    const int col_tile,
+    const int d_tile,
+    const int lane) {
+  constexpr int BK = 16;
+  const int source_row = gfx12_tr_b128_source_row_for_lane(lane);
+  const int source_col = gfx12_tr_b128_source_col_for_lane(lane);
+  const int64_t n = kb_base + col_tile * BK + source_row;
+  const int64_t d = d_tile * BK + source_col;
+  return gfx12_global_load_tr_b128_f16(v + v_head_base + n * v_stride_n + d);
+}
+
+template <int DTiles>
+__device__ __forceinline__ half8_vec make_v_regs_from_lane_major_shared(
+    const uint4* __restrict__ v_lane_tile,
+    const int col_tile,
+    const int d_tile,
+    const int lane) {
+  const uint4 packed = v_lane_tile[(col_tile * DTiles + d_tile) * 32 + lane];
+  return *reinterpret_cast<const half8_vec*>(&packed);
+}
+
+template <int DTiles>
+__device__ __forceinline__ half8_vec make_v_regs_from_lane_major_global(
+    const __half* __restrict__ v,
+    const int64_t v_head_base,
+    const int64_t v_group_stride,
+    const int64_t kb_base,
+    const int col_tile,
+    const int d_tile,
+    const int lane) {
+  const int64_t group = kb_base >> 6;
+  const int group_col_tile = ((static_cast<int>(kb_base) & 63) >> 4) + col_tile;
+  const int64_t off = v_head_base + group * v_group_stride +
+      (((static_cast<int64_t>(group_col_tile) * DTiles + d_tile) * 32 + lane) * 8);
+  const uint4 packed = *reinterpret_cast<const uint4*>(v + off);
+  return *reinterpret_cast<const half8_vec*>(&packed);
+}
+
+__device__ __forceinline__ void store_half(__half* output, const int64_t offset, const float value) {
+  output[offset] = __float2half_rn(value);
+}
+
+__device__ __forceinline__ void store_output_value(
+    __half* output,
+    const int64_t offset,
+    const float value) {
+  output[offset] = __float2half_rn(value);
+}
+
+__device__ __forceinline__ void store_output_value(
+    __hip_bfloat16* output,
+    const int64_t offset,
+    const float value) {
+  output[offset] = __float2bfloat16(value);
+}
+
+template <
+    int BlockCols,
+    int BlockRows,
+    bool HndContiguous = false,
+    bool ValueTransposed = false,
+    int ValuePad = SAGEATTN_GFX12_NATIVE_F16_TV_PAD,
+    bool IsCausal = false,
+    bool TransposeValueOnLoad = false,
+    bool F16PvAccum = false,
+    bool PvOrderedQK = false,
+    typename QueryT = int8_t,
+    bool QuantizeQuery = false,
+    bool SplitCausalPrefix = false>
+SAGEATTN_NATIVE_WAVES_PER_EU __global__ __launch_bounds__((BlockRows / 16) * 32, 1) void qk_int8_sv_f16_d64_native_kernel(
+    const QueryT* __restrict__ q,
+    const int8_t* __restrict__ k,
+    const __half* __restrict__ v,
+    __half* __restrict__ output,
+    const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale,
+    const int64_t batch_size,
+    const int64_t qo_len,
+    const int64_t kv_len,
+    const int64_t num_qo_heads,
+    const int64_t num_kv_heads,
+    const int64_t q_stride_b,
+    const int64_t q_stride_n,
+    const int64_t q_stride_h,
+    const int64_t k_stride_b,
+    const int64_t k_stride_n,
+    const int64_t k_stride_h,
+    const int64_t v_stride_b,
+    const int64_t v_stride_n,
+    const int64_t v_stride_h,
+    const int64_t o_stride_b,
+    const int64_t o_stride_n,
+    const int64_t o_stride_h,
+    const int64_t qs_stride_b,
+    const int64_t qs_stride_h,
+    const int64_t ks_stride_b,
+    const int64_t ks_stride_h,
+    const int tensor_layout,
+    const float sm_scale) {
+  constexpr int HeadDim = 64;
+  constexpr int BR = BlockRows;
+  constexpr int RM = 16;
+  constexpr int BK = 16;
+  constexpr int BC = BlockCols;
+  constexpr int Threads = (BlockRows / RM) * 32;
+  constexpr int DTiles = HeadDim / BK;
+  constexpr int ColTiles = BC / BK;
+  constexpr int SharedHeadStride = HeadDim + 16;
+  constexpr bool UseTransposedValueLayout = ValueTransposed || TransposeValueOnLoad;
+  constexpr bool UseTrLoadLaneMajorValue = false;
+  constexpr int SharedValueRows = UseTransposedValueLayout ? HeadDim : BC;
+  constexpr int SharedValueStride = UseTransposedValueLayout ? (BC + ValuePad) : SharedHeadStride;
+  constexpr int LaneMajorValueElems = ColTiles * DTiles * 32;
+  constexpr int PackedRows = 4;
+  static_assert(BlockCols == 64 || BlockCols == 128,
+                "native gfx12 D64 kernel supports BC64/BC128.");
+  static_assert(BlockRows == 64 || BlockRows == 128,
+                "native gfx12 D64 kernel supports BR64/BR128.");
+  static_assert(!UseTransposedValueLayout || HndContiguous,
+                "transposed fp16 value path requires contiguous HND tensors.");
+  static_assert(!IsCausal || ((BlockRows == 64 || BlockRows == 128) && BlockCols == 64),
+                "native gfx12 D64 single-q causal path supports BR64/BR128/BC64.");
+  static_assert(!QuantizeQuery || HndContiguous,
+                "direct fp16 Q quantization requires contiguous HND tensors.");
+
+  __shared__ int8_t k_tile[BC][SharedHeadStride];
+  __shared__ __half v_tile[UseTrLoadLaneMajorValue ? 1 : SharedValueRows]
+                          [UseTrLoadLaneMajorValue ? 1 : SharedValueStride];
+  __shared__ uint4 v_lane_tile[UseTrLoadLaneMajorValue ? LaneMajorValueElems : 1];
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int wave = tid >> 5;
+  const int row_base = (lane >> 4) << 3;
+  const int col = lane & 15;
+  const int64_t q_base =
+      q_block_base_for_launch<IsCausal, BR>(static_cast<int64_t>(blockIdx.x), qo_len);
+  const int64_t hq = blockIdx.y;
+  const int64_t b = blockIdx.z;
+  if (b >= batch_size || hq >= num_qo_heads || q_base >= qo_len) {
+    return;
+  }
+
+  const int64_t hkv = hq / (num_qo_heads / num_kv_heads);
+  const int64_t q_start = q_base + static_cast<int64_t>(wave) * RM;
+  float qs = 1.0f;
+
+  using FragK = rocwmma::fragment<rocwmma::matrix_a, RM, BK, BK, int8_t, rocwmma::row_major>;
+  using FragQ = rocwmma::fragment<rocwmma::matrix_b, RM, BK, BK, int8_t, rocwmma::col_major>;
+  using FragScoreT = rocwmma::fragment<rocwmma::accumulator, RM, BK, BK, int32_t>;
+  constexpr bool UseRawPreparedQ = !QuantizeQuery && HndContiguous;
+
+  i32x2_vec q_regs[DTiles];
+  FragQ q_frag[DTiles];
+  if constexpr (QuantizeQuery) {
+    constexpr int QPackElems = 8;
+    constexpr int QPacks = (RM * HeadDim) / QPackElems;
+    float local_q_amax = 0.0000001f;
+    for (int pack = lane; pack < QPacks; pack += 32) {
+      const int elem_base = pack * QPackElems;
+      const int row = elem_base / HeadDim;
+      const int d = elem_base - row * HeadDim;
+      const int64_t q_idx = q_start + row;
+      if (q_idx < qo_len) {
+        const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hq, q_idx, d, q_stride_b, q_stride_n, q_stride_h);
+        const uint4 raw = *reinterpret_cast<const uint4*>(q + q_off);
+        const QueryT* values = reinterpret_cast<const QueryT*>(&raw);
+#pragma unroll
+        for (int i = 0; i < QPackElems; ++i) {
+          local_q_amax = fmaxf(local_q_amax, fabsf(value_to_float(values[i])));
+        }
+      }
+    }
+    local_q_amax = vllm::warpReduceMax(local_q_amax);
+    const float q_amax = __shfl(local_q_amax, 0, 32);
+    const float inv_q_scale = 127.0f / q_amax;
+    qs = (q_amax / 127.0f) * sm_scale * kLog2e;
+#pragma unroll
+    for (int dt = 0; dt < DTiles; ++dt) {
+      q_regs[dt] = pack_quant_q_i8_wmma_b_regs<QueryT, HeadDim, HndContiguous>(
+          q, tensor_layout, lane, b, hq, q_start, qo_len, dt * BK,
+          q_stride_b, q_stride_n, q_stride_h, inv_q_scale);
+    }
+  } else {
+    const int q_scale_idx = q_scale_col_per_warp(q_start);
+    qs = q_scale[b * qs_stride_b + hq * qs_stride_h + q_scale_idx] *
+        sm_scale * kLog2e;
+    if constexpr (UseRawPreparedQ) {
+#pragma unroll
+      for (int dt = 0; dt < DTiles; ++dt) {
+        q_regs[dt] = pack_q_i8_wmma_b_regs<HeadDim, HndContiguous>(
+            reinterpret_cast<const int8_t*>(q), tensor_layout, lane, b, hq, q_start,
+            qo_len, dt * BK, q_stride_b, q_stride_n, q_stride_h);
+      }
+    } else {
+#pragma unroll
+      for (int dt = 0; dt < DTiles; ++dt) {
+        const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hq, q_start, dt * BK, q_stride_b, q_stride_n, q_stride_h);
+        rocwmma::load_matrix_sync(q_frag[dt], q + q_off, static_cast<uint32_t>(q_stride_n));
+      }
+    }
+  }
+
+  using PvAccumVec = std::conditional_t<F16PvAccum, half8_vec, float8_vec>;
+  PvAccumVec out_frag[DTiles];
+#pragma unroll
+  for (int dt = 0; dt < DTiles; ++dt) {
+#pragma unroll
+    for (int elem = 0; elem < 8; ++elem) {
+      out_frag[dt][elem] = 0.0f;
+    }
+  }
+  float m = -FLT_MAX * 0.5f;
+  float l = 0.0f;
+
+  auto process_kv_tile = [&](const int64_t kb_base, auto causal_mask_tag) {
+    constexpr bool ApplyCausalMask = decltype(causal_mask_tag)::value;
+    constexpr int KVecBytes = 16;
+    constexpr int KVecsPerRow = HeadDim / KVecBytes;
+    for (int vec = tid; vec < BC * KVecsPerRow; vec += Threads) {
+      const int n = vec / KVecsPerRow;
+      const int d = (vec - n * KVecsPerRow) * KVecBytes;
+      const int64_t k_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+          tensor_layout, b, hkv, kb_base + n, d, k_stride_b, k_stride_n, k_stride_h);
+      *reinterpret_cast<uint4*>(&k_tile[n][d]) =
+          *reinterpret_cast<const uint4*>(k + k_off);
+    }
+
+    if constexpr (UseTrLoadLaneMajorValue) {
+      for (int idx = tid; idx < LaneMajorValueElems; idx += Threads) {
+        const int lane_local = idx & 31;
+        const int d_tile = (idx >> 5) % DTiles;
+        const int col_tile = idx / (DTiles * 32);
+        const half8_vec regs = make_v_regs_from_hnd_global(
+            v, b * v_stride_b + hkv * v_stride_h, v_stride_n,
+            kb_base, col_tile, d_tile, lane_local);
+        v_lane_tile[idx] = *reinterpret_cast<const uint4*>(&regs);
+      }
+    } else if constexpr (ValueTransposed) {
+      constexpr int VElemsPerVec = 8;
+      constexpr int VVecsPerD = BC / VElemsPerVec;
+      for (int vec = tid; vec < HeadDim * VVecsPerD; vec += Threads) {
+        const int d = vec / VVecsPerD;
+        const int n = (vec - d * VVecsPerD) * VElemsPerVec;
+        const int64_t v_off = b * v_stride_b + hkv * v_stride_h +
+            static_cast<int64_t>(d) * v_stride_n + kb_base + n;
+        *reinterpret_cast<uint4*>(&v_tile[d][n]) =
+            *reinterpret_cast<const uint4*>(v + v_off);
+      }
+    } else if constexpr (TransposeValueOnLoad) {
+      constexpr int VElemsPerVec = 8;
+      constexpr int VVecsPerRow = HeadDim / VElemsPerVec;
+      for (int vec = tid; vec < BC * VVecsPerRow; vec += Threads) {
+        const int n = vec / VVecsPerRow;
+        const int d = (vec - n * VVecsPerRow) * VElemsPerVec;
+        const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hkv, kb_base + n, d, v_stride_b, v_stride_n, v_stride_h);
+        const uint4 packed = *reinterpret_cast<const uint4*>(v + v_off);
+        const __half* vals = reinterpret_cast<const __half*>(&packed);
+#pragma unroll
+        for (int elem = 0; elem < VElemsPerVec; ++elem) {
+          v_tile[d + elem][n] = vals[elem];
+        }
+      }
+    } else {
+      constexpr int VElemsPerVec = 8;
+      constexpr int VVecsPerRow = HeadDim / VElemsPerVec;
+      for (int vec = tid; vec < BC * VVecsPerRow; vec += Threads) {
+        const int n = vec / VVecsPerRow;
+        const int d = (vec - n * VVecsPerRow) * VElemsPerVec;
+        const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hkv, kb_base + n, d, v_stride_b, v_stride_n, v_stride_h);
+        *reinterpret_cast<uint4*>(&v_tile[n][d]) =
+            *reinterpret_cast<const uint4*>(v + v_off);
+      }
+    }
+      __syncthreads();
+
+    if constexpr (IsCausal) {
+      float8_vec score_cache[ColTiles];
+      half8_vec prob_cache[ColTiles];
+      float local_max = -FLT_MAX * 0.5f;
+#pragma unroll
+      for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+        const int k_scale_idx = k_scale_col_per_warp(kb_base + col_tile * BK);
+        const float score_scale = qs *
+            k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+        float8_vec scores;
+        const int64_t k_col_start = kb_base + static_cast<int64_t>(col_tile) * BK;
+        const bool fully_future =
+            ApplyCausalMask && (k_col_start > q_start + RM - 1);
+        if constexpr (ApplyCausalMask) {
+          if (fully_future) {
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              scores[elem] = -FLT_MAX * 0.5f;
+            }
+          } else if constexpr (QuantizeQuery || UseRawPreparedQ) {
+            scores = compute_tqk_score_regs_raw_kq_one<PvOrderedQK, DTiles, SharedHeadStride>(
+                &k_tile[0][0], q_regs, lane, col_tile, score_scale);
+          } else {
+            scores = compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
+                &k_tile[0][0], q_frag, col_tile, score_scale);
+          }
+        } else if constexpr (QuantizeQuery || UseRawPreparedQ) {
+          scores = compute_tqk_score_regs_raw_kq_one<PvOrderedQK, DTiles, SharedHeadStride>(
+              &k_tile[0][0], q_regs, lane, col_tile, score_scale);
+        } else {
+          scores = compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
+              &k_tile[0][0], q_frag, col_tile, score_scale);
+        }
+        if constexpr (ApplyCausalMask) {
+          if (!fully_future && k_col_start + BK > q_start) {
+            if constexpr (PvOrderedQK) {
+              apply_tqk_causal_mask_pv_order<true>(
+                  scores, static_cast<int>(q_start), static_cast<int>(kb_base), col_tile, lane);
+            } else {
+              apply_tqk_causal_mask<true>(
+                  scores, static_cast<int>(q_start), static_cast<int>(kb_base), col_tile, lane);
+            }
+          }
+        }
+        if (k_col_start + BK > kv_len) {
+          apply_tqk_kv_tail_mask<PvOrderedQK>(scores, kv_len, kb_base, col_tile, lane);
+        }
+        score_cache[col_tile] = scores;
+#pragma unroll
+        for (int elem = 0; elem < 8; ++elem) {
+          local_max = fmaxf(local_max, scores[elem]);
+        }
+      }
+      const float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
+      const float old_m = m;
+      const float new_m = fmaxf(old_m, tile_max);
+      const float alpha = l == 0.0f ? 0.0f : fast_exp2(old_m - new_m);
+      m = new_m;
+      l *= alpha;
+
+#pragma unroll
+      for (int dt = 0; dt < DTiles; ++dt) {
+#pragma unroll
+        for (int elem = 0; elem < 8; ++elem) {
+          const int row = row_base + elem;
+          out_frag[dt][elem] *= __shfl(alpha, row, 32);
+        }
+      }
+
+      float local_sum = 0.0f;
+#pragma unroll
+      for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+        half8_vec prob_values;
+        const int64_t k_col_start = kb_base + static_cast<int64_t>(col_tile) * BK;
+        const bool fully_future =
+            ApplyCausalMask && (k_col_start > q_start + RM - 1);
+#pragma unroll
+        for (int elem = 0; elem < 8; ++elem) {
+          const float prob = fully_future ? 0.0f :
+              fast_exp2(score_cache[col_tile][elem] - m + kF16SoftmaxOffset);
+          local_sum += prob;
+          prob_values[elem] = static_cast<_Float16>(prob);
+        }
+        if constexpr (PvOrderedQK) {
+          prob_cache[col_tile] = prob_values;
+        } else {
+          prob_cache[col_tile] = make_p_regs_from_tqk_prob_regs(prob_values, lane);
+        }
+      }
+      l += local_sum + __shfl_xor(local_sum, 16, 32);
+#pragma unroll
+      for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+        const int64_t k_col_start = kb_base + static_cast<int64_t>(col_tile) * BK;
+        const bool fully_future =
+            ApplyCausalMask && (k_col_start > q_start + RM - 1);
+        if constexpr (ApplyCausalMask) {
+          if (fully_future) {
+            continue;
+          }
+        }
+#pragma unroll
+        for (int dt = 0; dt < DTiles; ++dt) {
+          half8_vec v_regs;
+          if constexpr (UseTrLoadLaneMajorValue) {
+            v_regs = make_v_regs_from_lane_major_shared<DTiles>(
+                v_lane_tile, col_tile, dt, lane);
+          } else if constexpr (UseTransposedValueLayout) {
+            v_regs = make_v_regs_from_transposed_shared<SharedValueStride>(
+                &v_tile[0][0], col_tile, dt, lane);
+          } else {
+            v_regs = make_v_regs_from_shared<SharedValueStride>(
+                &v_tile[0][0], col_tile, dt, lane);
+          }
+          PvAccumVec acc;
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            acc[elem] = out_frag[dt][elem];
+          }
+          PvAccumVec pv_acc;
+          if constexpr (F16PvAccum) {
+            pv_acc =
+                __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(
+                    prob_cache[col_tile], v_regs, acc);
+          } else {
+            pv_acc =
+                __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                    prob_cache[col_tile], v_regs, acc);
+          }
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            out_frag[dt][elem] = pv_acc[elem];
+          }
+        }
+      }
+    } else {
+      float local_max = -FLT_MAX * 0.5f;
+#pragma unroll
+      for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+        const int k_scale_idx = k_scale_col_per_warp(kb_base + col_tile * BK);
+        const float score_scale = qs *
+            k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+        const int64_t k_col_start = kb_base + static_cast<int64_t>(col_tile) * BK;
+        float8_vec scores;
+        if constexpr (QuantizeQuery || UseRawPreparedQ) {
+          scores = compute_tqk_score_regs_raw_kq<DTiles, SharedHeadStride>(
+              &k_tile[0][0], q_regs, lane, col_tile, score_scale);
+        } else {
+          scores = compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
+              &k_tile[0][0], q_frag, col_tile, score_scale);
+        }
+        if (k_col_start + BK > kv_len) {
+          apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
+        }
+        for (int elem = 0; elem < 8; ++elem) {
+          local_max = fmaxf(local_max, scores[elem]);
+        }
+      }
+      const float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
+      const float old_m = m;
+      const float new_m = fmaxf(old_m, tile_max);
+      const float alpha = l == 0.0f ? 0.0f : fast_exp2(old_m - new_m);
+      m = new_m;
+      l *= alpha;
+
+#pragma unroll
+      for (int dt = 0; dt < DTiles; ++dt) {
+#pragma unroll
+        for (int elem = 0; elem < 8; ++elem) {
+          const int row = row_base + elem;
+          out_frag[dt][elem] *= __shfl(alpha, row, 32);
+        }
+      }
+
+      float local_sum = 0.0f;
+#pragma unroll
+      for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+        const int k_scale_idx = k_scale_col_per_warp(kb_base + col_tile * BK);
+        const float score_scale = qs *
+            k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+        const int64_t k_col_start = kb_base + static_cast<int64_t>(col_tile) * BK;
+        float8_vec scores;
+          if constexpr (QuantizeQuery || UseRawPreparedQ) {
+            scores = compute_tqk_score_regs_raw_kq<DTiles, SharedHeadStride>(
+                &k_tile[0][0], q_regs, lane, col_tile, score_scale);
+          } else {
+          scores = compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
+              &k_tile[0][0], q_frag, col_tile, score_scale);
+        }
+        if (k_col_start + BK > kv_len) {
+          apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
+        }
+        half8_vec prob_values;
+#pragma unroll
+        for (int elem = 0; elem < 8; ++elem) {
+          const float prob = fast_exp2(scores[elem] - m + kF16SoftmaxOffset);
+          local_sum += prob;
+          prob_values[elem] = static_cast<_Float16>(prob);
+        }
+
+#if SAGEATTN_NATIVE_HAS_GFX12_WMMA
+        const half8_vec p_regs = make_p_regs_from_tqk_prob_regs(prob_values, lane);
+#pragma unroll
+        for (int dt = 0; dt < DTiles; ++dt) {
+          half8_vec v_regs;
+          if constexpr (UseTrLoadLaneMajorValue) {
+            v_regs = make_v_regs_from_lane_major_shared<DTiles>(
+                v_lane_tile, col_tile, dt, lane);
+          } else if constexpr (UseTransposedValueLayout) {
+            v_regs = make_v_regs_from_transposed_shared<SharedValueStride>(
+                &v_tile[0][0], col_tile, dt, lane);
+          } else {
+            v_regs = make_v_regs_from_shared<SharedValueStride>(
+                &v_tile[0][0], col_tile, dt, lane);
+          }
+          PvAccumVec acc;
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            acc[elem] = out_frag[dt][elem];
+          }
+          PvAccumVec pv_acc;
+          if constexpr (F16PvAccum) {
+            pv_acc =
+                __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(p_regs, v_regs, acc);
+          } else {
+            pv_acc =
+                __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_regs, v_regs, acc);
+          }
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            out_frag[dt][elem] = pv_acc[elem];
+          }
+        }
+#else
+      static_assert(SAGEATTN_NATIVE_HAS_GFX12_WMMA, "native gfx12 kernel requires gfx12 WMMA builtins");
+#endif
+      }
+      l += local_sum + __shfl_xor(local_sum, 16, 32);
+    }
+    __syncthreads();
+  };
+
+  const int64_t kv_limit = IsCausal && (q_base + BR) < kv_len ? q_base + BR : kv_len;
+  if constexpr (IsCausal && SplitCausalPrefix) {
+    const int64_t prefix_limit = q_base < kv_limit ? q_base : kv_limit;
+    for (int64_t kb_base = 0; kb_base < prefix_limit; kb_base += BC) {
+      process_kv_tile(kb_base, std::false_type{});
+    }
+    for (int64_t kb_base = prefix_limit; kb_base < kv_limit; kb_base += BC) {
+      process_kv_tile(kb_base, std::true_type{});
+    }
+  } else {
+    for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BC) {
+      process_kv_tile(kb_base, std::integral_constant<bool, IsCausal>{});
+    }
+  }
+
+#pragma unroll
+  for (int dt = 0; dt < DTiles; ++dt) {
+    const int d = dt * BK + col;
+#pragma unroll
+    for (int pair = 0; pair < PackedRows; ++pair) {
+      const int elem = pair * 2;
+      const int64_t q_idx0 = q_start + row_base + elem;
+      const int64_t q_idx1 = q_idx0 + 1;
+      const float l_sum0 = __shfl(l, row_base + elem, 32);
+      const float l_sum1 = __shfl(l, row_base + elem + 1, 32);
+      const float value0 = l_sum0 == 0.0f ? 0.0f : out_frag[dt][elem] / l_sum0;
+      const float value1 = l_sum1 == 0.0f ? 0.0f : out_frag[dt][elem + 1] / l_sum1;
+      store_half(output, qkv_offset_dispatch<HeadDim, HndContiguous>(
+          tensor_layout, b, hq, q_idx0, d, o_stride_b, o_stride_n, o_stride_h), value0);
+      store_half(output, qkv_offset_dispatch<HeadDim, HndContiguous>(
+          tensor_layout, b, hq, q_idx1, d, o_stride_b, o_stride_n, o_stride_h), value1);
+    }
+  }
+}
+
+template <int BlockCols,
+          bool HndContiguous = false,
+          int BlockRows = 128,
+          bool ValueTransposed = false,
+          int ValuePad = SAGEATTN_GFX12_NATIVE_F16_TV_PAD,
+          bool IsCausal = false,
+          bool TransposeValueOnLoad = false,
+          bool F16PvAccum = false,
+          typename QueryT = int8_t,
+          bool QuantizeQuery = false,
+          typename KeyT = int8_t,
+          bool QuantizeKey = false,
+          bool PvOrderedQK = false,
+          bool LaneMajorValue = false,
+          bool StreamColTiles = false,
+          bool LaneMajorKey = false,
+          int HeadDim = 64,
+          bool FlatCausalSchedule = false>
+SAGEATTN_NATIVE_2Q_WAVES_PER_EU(HeadDim, IsCausal) __global__
+SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2q_kernel(
+    const QueryT* __restrict__ q,
+    const KeyT* __restrict__ k,
+    const __half* __restrict__ v,
+    __half* __restrict__ output,
+    const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale,
+    const int64_t batch_size,
+    const int64_t qo_len,
+    const int64_t kv_len,
+    const int64_t num_qo_heads,
+    const int64_t num_kv_heads,
+    const int64_t q_stride_b,
+    const int64_t q_stride_n,
+    const int64_t q_stride_h,
+    const int64_t k_stride_b,
+    const int64_t k_stride_n,
+    const int64_t k_stride_h,
+    const int64_t v_stride_b,
+    const int64_t v_stride_n,
+    const int64_t v_stride_h,
+    const int64_t o_stride_b,
+    const int64_t o_stride_n,
+    const int64_t o_stride_h,
+    const int64_t qs_stride_b,
+    const int64_t qs_stride_h,
+    const int64_t ks_stride_b,
+    const int64_t ks_stride_h,
+    const int tensor_layout,
+    const float sm_scale) {
+  static_assert(HeadDim == 16 || HeadDim == 64,
+                "native gfx12 fp16 2q kernel supports D16/D64.");
+  constexpr int BR = BlockRows;
+  constexpr int RM = 16;
+  constexpr int RowsPerWave = 32;
+  constexpr int QGroups = 2;
+  constexpr int BK = 16;
+  constexpr int BC = BlockCols;
+  constexpr int Threads = BlockRows;
+  constexpr int DTiles = HeadDim / BK;
+  constexpr int ColTiles = BC / BK;
+  constexpr int SharedHeadStride = HeadDim + 16;
+  constexpr int SharedQKHeadStride = SharedHeadStride;
+  constexpr bool UseTransposedValueLayout = ValueTransposed || TransposeValueOnLoad;
+  constexpr bool UseLaneMajorKey =
+      LaneMajorKey && !QuantizeKey && HndContiguous && BlockCols == 64 && PvOrderedQK;
+  constexpr bool UseLaneMajorValue =
+      LaneMajorValue && HndContiguous &&
+      (ValueTransposed || TransposeValueOnLoad);
+  constexpr bool StageValueInShared = !UseLaneMajorValue;
+  constexpr bool UsesTileSharedMemory = true;
+  constexpr bool UsesKeySharedMemory = true;
+  constexpr bool UsesValueSharedMemory = StageValueInShared || UseLaneMajorValue;
+  constexpr int SharedValueRows =
+      StageValueInShared ? (UseTransposedValueLayout ? HeadDim : BC) : 1;
+  constexpr int SharedValueStride =
+      StageValueInShared ? (UseTransposedValueLayout ? (BC + ValuePad) : SharedHeadStride) : 1;
+  constexpr int PackedRows = 4;
+  static_assert(BlockCols == 32 || BlockCols == 64 || BlockCols == 128,
+                "native gfx12 fp16 2q kernel supports BC32/BC64/BC128.");
+  static_assert(BlockRows == 32 || BlockRows == 64 || BlockRows == 128 ||
+                    BlockRows == 256 || BlockRows == 512 || BlockRows == 1024,
+                "native gfx12 fp16 2q kernel supports BR32/BR64/BR128/BR256/BR512/BR1024.");
+  static_assert(!UseTransposedValueLayout || HndContiguous,
+                "transposed fp16 value layout requires contiguous HND tensors.");
+  static_assert(!F16PvAccum || BlockCols <= 64,
+                "fp16 PV accumulation currently supports the BC64 2q path.");
+  static_assert(!QuantizeQuery || HndContiguous,
+                "direct fp16 Q quantization currently requires contiguous HND tensors.");
+  static_assert(!QuantizeKey || (HndContiguous && BlockCols == 64),
+                "direct fp16 K quantization currently requires contiguous HND BC64 tensors.");
+  static_assert(!LaneMajorValue ||
+                    (HndContiguous && (ValueTransposed || TransposeValueOnLoad)),
+                "lane-major fp16 value staging requires contiguous HND values.");
+  static_assert(!LaneMajorKey ||
+                     (!QuantizeKey && HndContiguous && BlockCols == 64 && PvOrderedQK),
+                "lane-major fp16 key staging requires prepared HND BC64 PvOrderedQK.");
+  static_assert(!StreamColTiles || (BlockCols <= 128 && (QuantizeQuery || HndContiguous)),
+                "streaming col-tile softmax is specialized for raw/quantized QK.");
+  __shared__ int8_t k_tile[UseLaneMajorKey ? 1 : BC]
+                        [SharedQKHeadStride];
+  __shared__ uint2 k_lane_tile[UseLaneMajorKey ? (ColTiles * DTiles * 32) : 1];
+  __shared__ __half v_tile[SharedValueRows][SharedValueStride];
+  __shared__ uint4 v_lane_tile[UseLaneMajorValue ? (ColTiles * DTiles * 32) : 1];
+  __shared__ float raw_k_amax_shared;
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int wave = tid >> 5;
+  const int row_base = (lane >> 4) << 3;
+  const int col = lane & 15;
+  const int64_t q_block_count = (qo_len + BR - 1) / BR;
+  const int64_t hb_count = num_qo_heads * batch_size;
+  for (;;) {
+    int64_t q_block = static_cast<int64_t>(blockIdx.x);
+    int64_t hq = blockIdx.y;
+    int64_t b = blockIdx.z;
+    if constexpr (FlatCausalSchedule) {
+      static_assert(IsCausal, "flat q scheduling is causal-only");
+      const int64_t hb = static_cast<int64_t>(blockIdx.x) % hb_count;
+      q_block = static_cast<int64_t>(blockIdx.x) / hb_count;
+      hq = hb % num_qo_heads;
+      b = hb / num_qo_heads;
+    }
+    const int64_t q_base = q_block_base_for_launch<IsCausal, BR>(q_block, qo_len);
+    if (b >= batch_size || hq >= num_qo_heads || q_base >= qo_len) {
+      return;
+    }
+
+    const int64_t hkv = hq / (num_qo_heads / num_kv_heads);
+    const int64_t q_head_base = b * q_stride_b + hq * q_stride_h;
+    const int64_t k_head_base = b * k_stride_b + hkv * k_stride_h;
+    const int64_t v_head_base = b * v_stride_b + hkv * v_stride_h;
+    const int64_t o_head_base = b * o_stride_b + hq * o_stride_h;
+    int64_t q_start[QGroups];
+    float qs[QGroups];
+#pragma unroll
+    for (int qg = 0; qg < QGroups; ++qg) {
+      q_start[qg] = q_base + static_cast<int64_t>(wave) * RowsPerWave + qg * RM;
+    }
+
+  using FragK = rocwmma::fragment<rocwmma::matrix_a, RM, BK, BK, int8_t, rocwmma::row_major>;
+  using FragQ = rocwmma::fragment<rocwmma::matrix_b, RM, BK, BK, int8_t, rocwmma::col_major>;
+  using FragScoreT = rocwmma::fragment<rocwmma::accumulator, RM, BK, BK, int32_t>;
+  constexpr bool UseRawPreparedQ = !QuantizeQuery && HndContiguous;
+
+  i32x2_vec q_regs[QGroups][DTiles];
+  if constexpr (QuantizeQuery) {
+    constexpr int QPackElems = 8;
+    constexpr int QPacksPerWave = (RowsPerWave * HeadDim) / QPackElems;
+    const int local_q_row_base = wave * RowsPerWave;
+    float local_q_amax = 0.0000001f;
+    for (int pack = lane; pack < QPacksPerWave; pack += 32) {
+      const int elem_base = pack * QPackElems;
+      const int row = elem_base / HeadDim;
+      const int d = elem_base - row * HeadDim;
+      const int64_t q_idx = q_base + local_q_row_base + row;
+      if (q_idx < qo_len) {
+        const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hq, q_idx, d, q_stride_b, q_stride_n, q_stride_h);
+        const uint4 raw = *reinterpret_cast<const uint4*>(q + q_off);
+        const QueryT* values = reinterpret_cast<const QueryT*>(&raw);
+#pragma unroll
+        for (int i = 0; i < QPackElems; ++i) {
+          local_q_amax = fmaxf(local_q_amax, fabsf(value_to_float(values[i])));
+        }
+      }
+    }
+    local_q_amax = vllm::warpReduceMax(local_q_amax);
+    const float q_scale_local = __shfl(local_q_amax, 0, 32) / 127.0f;
+    const float inv_q_scale = 127.0f / __shfl(local_q_amax, 0, 32);
+#pragma unroll
+    for (int qg = 0; qg < QGroups; ++qg) {
+      qs[qg] = q_scale_local * sm_scale * kLog2e;
+      const int64_t qg_start = q_start[qg];
+#pragma unroll
+      for (int dt = 0; dt < DTiles; ++dt) {
+        q_regs[qg][dt] = pack_quant_q_i8_wmma_b_regs<QueryT, HeadDim, HndContiguous>(
+            q, tensor_layout, lane, b, hq, qg_start, qo_len, dt * BK,
+            q_stride_b, q_stride_n, q_stride_h, inv_q_scale);
+      }
+    }
+  } else {
+#pragma unroll
+    for (int qg = 0; qg < QGroups; ++qg) {
+      const int q_scale_idx = q_scale_col_per_warp(q_start[qg]);
+      qs[qg] = q_scale[b * qs_stride_b + hq * qs_stride_h + q_scale_idx] *
+          sm_scale * kLog2e;
+    }
+    if constexpr (UseRawPreparedQ) {
+#pragma unroll
+      for (int qg = 0; qg < QGroups; ++qg) {
+#pragma unroll
+        for (int dt = 0; dt < DTiles; ++dt) {
+          q_regs[qg][dt] = pack_q_i8_wmma_b_regs<HeadDim, HndContiguous>(
+              reinterpret_cast<const int8_t*>(q), tensor_layout, lane, b, hq, q_start[qg],
+              qo_len, dt * BK, q_stride_b, q_stride_n, q_stride_h);
+        }
+      }
+    }
+  }
+
+  FragQ q_frag[QGroups][DTiles];
+  if constexpr (!QuantizeQuery && !UseRawPreparedQ) {
+#pragma unroll
+    for (int qg = 0; qg < QGroups; ++qg) {
+#pragma unroll
+      for (int dt = 0; dt < DTiles; ++dt) {
+        int64_t q_off;
+        if constexpr (HndContiguous) {
+          q_off = q_head_base + q_start[qg] * HeadDim + dt * BK;
+        } else {
+          q_off = qkv_offset(
+              tensor_layout, b, hq, q_start[qg], dt * BK, q_stride_b, q_stride_n, q_stride_h);
+        }
+        rocwmma::load_matrix_sync(q_frag[qg][dt], q + q_off, static_cast<uint32_t>(q_stride_n));
+      }
+    }
+  }
+
+  using PvAccumVec = std::conditional_t<F16PvAccum, half8_vec, float8_vec>;
+  PvAccumVec out_frag[QGroups][DTiles];
+  float m[QGroups];
+  float l[QGroups];
+#pragma unroll
+  for (int qg = 0; qg < QGroups; ++qg) {
+    m[qg] = -FLT_MAX * 0.5f;
+    l[qg] = 0.0f;
+#pragma unroll
+    for (int dt = 0; dt < DTiles; ++dt) {
+#pragma unroll
+      for (int elem = 0; elem < 8; ++elem) {
+        out_frag[qg][dt][elem] = 0.0f;
+      }
+    }
+  }
+
+  const int64_t kv_limit = IsCausal && (q_base + BR) < kv_len ? q_base + BR : kv_len;
+  auto process_kv_tile = [&](const int64_t kb_base, auto apply_causal_mask_tag) {
+    constexpr int KVecBytes = 16;
+    constexpr int KBytesPerRow = HeadDim;
+    constexpr int KVecsPerRow = KBytesPerRow / KVecBytes;
+    float k_scale_tile = 1.0f;
+    if constexpr (QuantizeKey) {
+      constexpr int PackElems = 8;
+      constexpr int Packs = (BC * HeadDim) / PackElems;
+      float local_k_amax = 0.0000001f;
+      for (int pack = tid; pack < Packs; pack += Threads) {
+        const int elem_base = pack * PackElems;
+        const int n = elem_base / HeadDim;
+        const int d = elem_base - n * HeadDim;
+        const int64_t k_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hkv, kb_base + n, d, k_stride_b, k_stride_n, k_stride_h);
+        const uint4 raw = *reinterpret_cast<const uint4*>(k + k_off);
+        const KeyT* values = reinterpret_cast<const KeyT*>(&raw);
+#pragma unroll
+        for (int i = 0; i < PackElems; ++i) {
+          local_k_amax = fmaxf(local_k_amax, fabsf(value_to_float(values[i])));
+        }
+      }
+      const float block_k_amax = vllm::blockReduceMax(local_k_amax);
+      if (tid == 0) {
+        raw_k_amax_shared = block_k_amax;
+      }
+      __syncthreads();
+      const float raw_k_amax = raw_k_amax_shared;
+      k_scale_tile = raw_k_amax / 127.0f;
+      const float inv_k_scale = 127.0f / raw_k_amax;
+
+      for (int pack = tid; pack < Packs; pack += Threads) {
+        const int elem_base = pack * PackElems;
+        const int n = elem_base / HeadDim;
+        const int d = elem_base - n * HeadDim;
+        const int64_t k_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hkv, kb_base + n, d, k_stride_b, k_stride_n, k_stride_h);
+        const uint4 raw = *reinterpret_cast<const uint4*>(k + k_off);
+        const KeyT* values = reinterpret_cast<const KeyT*>(&raw);
+        char4 out0;
+        char4 out1;
+        out0.x = float_to_int8_rn_gfx12(value_to_float(values[0]) * inv_k_scale);
+        out0.y = float_to_int8_rn_gfx12(value_to_float(values[1]) * inv_k_scale);
+        out0.z = float_to_int8_rn_gfx12(value_to_float(values[2]) * inv_k_scale);
+        out0.w = float_to_int8_rn_gfx12(value_to_float(values[3]) * inv_k_scale);
+        out1.x = float_to_int8_rn_gfx12(value_to_float(values[4]) * inv_k_scale);
+        out1.y = float_to_int8_rn_gfx12(value_to_float(values[5]) * inv_k_scale);
+        out1.z = float_to_int8_rn_gfx12(value_to_float(values[6]) * inv_k_scale);
+        out1.w = float_to_int8_rn_gfx12(value_to_float(values[7]) * inv_k_scale);
+        *reinterpret_cast<char4*>(&k_tile[n][d]) = out0;
+        *reinterpret_cast<char4*>(&k_tile[n][d + 4]) = out1;
+      }
+    } else if constexpr (UseLaneMajorKey) {
+      constexpr int LaneMajorElems = ColTiles * DTiles * 32;
+      for (int idx = tid; idx < LaneMajorElems; idx += Threads) {
+        const int lane_local = idx & 31;
+        const int d_tile = (idx >> 5) % DTiles;
+        const int col_tile = idx / (DTiles * 32);
+        const int col_local = lane_local & 15;
+        const int row = col_tile * BK + pv_k_order_for_acc_row(col_local);
+        const int d = d_tile * BK + 8 * (lane_local >> 4);
+        const int64_t k_off = k_head_base + (kb_base + row) * HeadDim + d;
+        k_lane_tile[idx] = *reinterpret_cast<const uint2*>(k + k_off);
+      }
+    } else {
+      for (int vec = tid; vec < BC * KVecsPerRow; vec += Threads) {
+        const int n = vec / KVecsPerRow;
+        const int d = (vec - n * KVecsPerRow) * KVecBytes;
+        int64_t k_off;
+        if constexpr (HndContiguous) {
+          k_off = k_head_base + (kb_base + n) * HeadDim + d;
+        } else {
+          k_off = qkv_offset(
+              tensor_layout, b, hkv, kb_base + n, d, k_stride_b, k_stride_n, k_stride_h);
+        }
+        *reinterpret_cast<uint4*>(&k_tile[n][d]) =
+            *reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(k) + k_off);
+      }
+    }
+
+    float prepared_k_scale_tile = k_scale_tile;
+    if constexpr (!QuantizeKey && BC <= 64) {
+      const int k_scale_idx = k_scale_col_per_warp(kb_base);
+      prepared_k_scale_tile =
+          k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+    }
+
+    auto stage_value_tile = [&]() {
+    if constexpr (UseLaneMajorValue) {
+      if constexpr (ValueTransposed) {
+        constexpr int LaneMajorElems = ColTiles * DTiles * 32;
+        for (int idx = tid; idx < LaneMajorElems; idx += Threads) {
+          const int lane_local = idx & 31;
+          const int d_tile = (idx >> 5) % DTiles;
+          const int col_tile = idx / (DTiles * 32);
+          const int d = d_tile * BK + (lane_local & 15);
+          const int high_half = (lane_local >> 4) & 1;
+          const int n0 = col_tile * BK + high_half * 4;
+          const int n1 = col_tile * BK + 8 + high_half * 4;
+          const int64_t base = v_head_base + static_cast<int64_t>(d) * v_stride_n + kb_base;
+          const uint2 raw0 = *reinterpret_cast<const uint2*>(v + base + n0);
+          const uint2 raw1 = *reinterpret_cast<const uint2*>(v + base + n1);
+          uint4 packed;
+          packed.x = raw0.x;
+          packed.y = raw0.y;
+          packed.z = raw1.x;
+          packed.w = raw1.y;
+          v_lane_tile[idx] = packed;
+        }
+      } else {
+        constexpr int VElemsPerVec = 8;
+        constexpr int VVecsPerRow = HeadDim / VElemsPerVec;
+        __half* lane_values = reinterpret_cast<__half*>(v_lane_tile);
+        for (int vec = tid; vec < BC * VVecsPerRow; vec += Threads) {
+          const int n = vec / VVecsPerRow;
+          const int d_base = (vec - n * VVecsPerRow) * VElemsPerVec;
+          const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+              tensor_layout, b, hkv, kb_base + n, d_base, v_stride_b, v_stride_n, v_stride_h);
+          const uint4 packed = *reinterpret_cast<const uint4*>(v + v_off);
+          const __half* vals = reinterpret_cast<const __half*>(&packed);
+          const int col_tile = n / BK;
+          const int k_local = n - col_tile * BK;
+          const int dst_elem = ((k_local & 8) >> 1) | (k_local & 3);
+          const int dst_lane_hi = ((k_local >> 2) & 1) << 4;
+#pragma unroll
+          for (int elem = 0; elem < VElemsPerVec; ++elem) {
+            const int d = d_base + elem;
+            const int d_tile = d >> 4;
+            const int dst_lane = (d & 15) | dst_lane_hi;
+            const int slot = ((col_tile * DTiles + d_tile) * 32 + dst_lane) * 8 + dst_elem;
+            lane_values[slot] = vals[elem];
+          }
+        }
+      }
+    } else if constexpr (StageValueInShared && ValueTransposed) {
+      constexpr int VElemsPerVec = 8;
+      constexpr int VVecsPerD = BC / VElemsPerVec;
+      for (int vec = tid; vec < HeadDim * VVecsPerD; vec += Threads) {
+        const int d = vec / VVecsPerD;
+        const int n = (vec - d * VVecsPerD) * VElemsPerVec;
+        const int64_t v_off = v_head_base + static_cast<int64_t>(d) * v_stride_n + kb_base + n;
+        *reinterpret_cast<uint4*>(&v_tile[d][n]) =
+            *reinterpret_cast<const uint4*>(v + v_off);
+      }
+    } else if constexpr (StageValueInShared && TransposeValueOnLoad) {
+      constexpr int VElemsPerVec = 8;
+      constexpr int VVecsPerRow = HeadDim / VElemsPerVec;
+      for (int vec = tid; vec < BC * VVecsPerRow; vec += Threads) {
+        const int n = vec / VVecsPerRow;
+        const int d = (vec - n * VVecsPerRow) * VElemsPerVec;
+        const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hkv, kb_base + n, d, v_stride_b, v_stride_n, v_stride_h);
+        const uint4 packed = *reinterpret_cast<const uint4*>(v + v_off);
+        const __half* vals = reinterpret_cast<const __half*>(&packed);
+#pragma unroll
+        for (int elem = 0; elem < VElemsPerVec; ++elem) {
+          v_tile[d + elem][n] = vals[elem];
+        }
+      }
+    } else if constexpr (StageValueInShared) {
+      constexpr int VElemsPerVec = 8;
+      constexpr int VVecsPerRow = HeadDim / VElemsPerVec;
+      for (int vec = tid; vec < BC * VVecsPerRow; vec += Threads) {
+        const int n = vec / VVecsPerRow;
+        const int d = (vec - n * VVecsPerRow) * VElemsPerVec;
+        const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hkv, kb_base + n, d, v_stride_b, v_stride_n, v_stride_h);
+        *reinterpret_cast<uint4*>(&v_tile[n][d]) =
+            *reinterpret_cast<const uint4*>(v + v_off);
+      }
+    }
+    };
+    stage_value_tile();
+    if constexpr (UsesKeySharedMemory || UsesValueSharedMemory) {
+      __syncthreads();
+    }
+    SAGEATTN_F16_SCHED_BARRIER(0);
+
+    auto compute_loaded_tile = [&](auto causal_mask_tag) {
+      constexpr bool ApplyCausalMask = decltype(causal_mask_tag)::value;
+    if constexpr (BlockCols <= 128) {
+      if constexpr ((QuantizeQuery || UseRawPreparedQ) && StreamColTiles) {
+        constexpr int StreamGroupCols = ColTiles >= 2 ? 2 : 1;
+#pragma unroll
+        for (int group_base = 0; group_base < ColTiles; group_base += StreamGroupCols) {
+          float8_vec scores0[StreamGroupCols];
+          float8_vec scores1[StreamGroupCols];
+          bool fully_future[QGroups][StreamGroupCols];
+          bool any_work = false;
+#pragma unroll
+          for (int gc = 0; gc < StreamGroupCols; ++gc) {
+            const int col_tile = group_base + gc;
+            const int64_t k_col_start = kb_base + col_tile * BK;
+            const bool fully_future0 =
+                ApplyCausalMask && k_col_start >= q_start[0] + RM;
+            const bool fully_future1 =
+                ApplyCausalMask && k_col_start >= q_start[1] + RM;
+            fully_future[0][gc] = fully_future0;
+            fully_future[1][gc] = fully_future1;
+            any_work = any_work || !(fully_future0 && fully_future1);
+            if (fully_future0 && fully_future1) {
+#pragma unroll
+              for (int elem = 0; elem < 8; ++elem) {
+                scores0[gc][elem] = -FLT_MAX * 0.5f;
+                scores1[gc][elem] = -FLT_MAX * 0.5f;
+              }
+              continue;
+            }
+
+            float k_scale_local = prepared_k_scale_tile;
+            if constexpr (!QuantizeKey && BC > 64) {
+              const int k_scale_idx = k_scale_col_per_warp(k_col_start);
+              k_scale_local =
+                  k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+            }
+            if constexpr (UseLaneMajorKey) {
+              compute_tqk_score_regs_raw_kq_2_lane_shared_key<DTiles>(
+                  k_lane_tile, q_regs, lane, col_tile,
+                  qs[0] * k_scale_local, qs[1] * k_scale_local,
+                  !fully_future0, !fully_future1,
+                  scores0[gc], scores1[gc]);
+            } else {
+              compute_tqk_score_regs_raw_kq_2<PvOrderedQK, DTiles, SharedQKHeadStride>(
+                  &k_tile[0][0], q_regs, lane, col_tile,
+                  qs[0] * k_scale_local, qs[1] * k_scale_local,
+                  !fully_future0, !fully_future1,
+                  scores0[gc], scores1[gc]);
+            }
+            if constexpr (ApplyCausalMask) {
+              if (fully_future0) {
+#pragma unroll
+                for (int elem = 0; elem < 8; ++elem) {
+                  scores0[gc][elem] = -FLT_MAX * 0.5f;
+                }
+              } else if (k_col_start + BK > q_start[0]) {
+                if constexpr (PvOrderedQK) {
+                  apply_tqk_causal_mask_pv_order<true>(
+                      scores0[gc], static_cast<int>(q_start[0]),
+                      static_cast<int>(kb_base), col_tile, lane);
+                } else {
+                  apply_tqk_causal_mask<true>(
+                      scores0[gc], static_cast<int>(q_start[0]),
+                      static_cast<int>(kb_base), col_tile, lane);
+                }
+              }
+              if (fully_future1) {
+#pragma unroll
+                for (int elem = 0; elem < 8; ++elem) {
+                  scores1[gc][elem] = -FLT_MAX * 0.5f;
+                }
+              } else if (k_col_start + BK > q_start[1]) {
+                if constexpr (PvOrderedQK) {
+                  apply_tqk_causal_mask_pv_order<true>(
+                      scores1[gc], static_cast<int>(q_start[1]),
+                      static_cast<int>(kb_base), col_tile, lane);
+                } else {
+                  apply_tqk_causal_mask<true>(
+                      scores1[gc], static_cast<int>(q_start[1]),
+                      static_cast<int>(kb_base), col_tile, lane);
+                }
+              }
+            }
+            if (k_col_start + BK > kv_len) {
+              apply_tqk_kv_tail_mask<PvOrderedQK>(
+                  scores0[gc], kv_len, kb_base, col_tile, lane);
+              apply_tqk_kv_tail_mask<PvOrderedQK>(
+                  scores1[gc], kv_len, kb_base, col_tile, lane);
+            }
+          }
+          if (!any_work) {
+            continue;
+          }
+
+          half8_vec p_regs[QGroups][StreamGroupCols];
+#pragma unroll
+          for (int qg = 0; qg < QGroups; ++qg) {
+            float local_max = -FLT_MAX * 0.5f;
+#pragma unroll
+            for (int gc = 0; gc < StreamGroupCols; ++gc) {
+#pragma unroll
+              for (int elem = 0; elem < 8; ++elem) {
+                const float score = qg == 0 ? scores0[gc][elem] : scores1[gc][elem];
+                local_max = fmaxf(local_max, score);
+              }
+            }
+            const float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
+            const float old_m = m[qg];
+            const float new_m = fmaxf(old_m, tile_max);
+            const float alpha = l[qg] == 0.0f ? 0.0f : fast_exp2(old_m - new_m);
+            m[qg] = new_m;
+            l[qg] *= alpha;
+
+            float8_vec alpha_rows;
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              alpha_rows[elem] = __shfl(alpha, row_base + elem, 32);
+            }
+
+#pragma unroll
+            for (int dt = 0; dt < DTiles; ++dt) {
+#pragma unroll
+              for (int elem = 0; elem < 8; ++elem) {
+                out_frag[qg][dt][elem] *= alpha_rows[elem];
+              }
+            }
+
+            float local_sum = 0.0f;
+#pragma unroll
+            for (int gc = 0; gc < StreamGroupCols; ++gc) {
+              half8_vec prob_values;
+#pragma unroll
+              for (int elem = 0; elem < 8; ++elem) {
+                const float score = qg == 0 ? scores0[gc][elem] : scores1[gc][elem];
+                float prob = 0.0f;
+                if (!fully_future[qg][gc]) {
+                  prob = fast_exp2(score - m[qg] + kF16SoftmaxOffset);
+                  local_sum += prob;
+                }
+                prob_values[elem] = static_cast<_Float16>(prob);
+              }
+              if constexpr (PvOrderedQK) {
+                p_regs[qg][gc] = prob_values;
+              } else {
+                p_regs[qg][gc] = make_p_regs_from_tqk_prob_regs(prob_values, lane);
+              }
+            }
+            l[qg] += local_sum + __shfl_xor(local_sum, 16, 32);
+          }
+
+#pragma unroll
+          for (int gc = 0; gc < StreamGroupCols; ++gc) {
+            if (fully_future[0][gc] && fully_future[1][gc]) {
+              continue;
+            }
+            const int col_tile = group_base + gc;
+#pragma unroll
+            for (int dt = 0; dt < DTiles; ++dt) {
+              half8_vec v_regs;
+              if constexpr (UseLaneMajorValue) {
+                v_regs = make_v_regs_from_lane_major_shared<DTiles>(
+                    v_lane_tile, col_tile, dt, lane);
+              } else if constexpr (UseTransposedValueLayout) {
+                v_regs = make_v_regs_from_transposed_shared<SharedValueStride>(
+                    &v_tile[0][0], col_tile, dt, lane);
+              } else {
+                v_regs = make_v_regs_from_shared<SharedValueStride>(
+                    &v_tile[0][0], col_tile, dt, lane);
+              }
+#pragma unroll
+              for (int qg = 0; qg < QGroups; ++qg) {
+                if (fully_future[qg][gc]) {
+                  continue;
+                }
+                PvAccumVec acc;
+#pragma unroll
+                for (int elem = 0; elem < 8; ++elem) {
+                  acc[elem] = out_frag[qg][dt][elem];
+                }
+                PvAccumVec pv_acc;
+                if constexpr (F16PvAccum) {
+                  pv_acc =
+                      __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(p_regs[qg][gc], v_regs, acc);
+                } else {
+                  pv_acc =
+                      __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_regs[qg][gc], v_regs, acc);
+                }
+#pragma unroll
+                for (int elem = 0; elem < 8; ++elem) {
+                  out_frag[qg][dt][elem] = pv_acc[elem];
+                }
+              }
+            }
+          }
+        }
+        return;
+      }
+      half8_vec prob_cache[QGroups][ColTiles];
+      if constexpr (QuantizeQuery || UseRawPreparedQ) {
+        float8_vec score_cache[QGroups][ColTiles];
+        float local_max[QGroups];
+#pragma unroll
+        for (int qg = 0; qg < QGroups; ++qg) {
+          local_max[qg] = -FLT_MAX * 0.5f;
+        }
+#pragma unroll
+        for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+          const int64_t k_col_start = kb_base + col_tile * BK;
+          const bool fully_future0 =
+              ApplyCausalMask && k_col_start >= q_start[0] + RM;
+          const bool fully_future1 =
+              ApplyCausalMask && k_col_start >= q_start[1] + RM;
+          float8_vec scores0;
+          float8_vec scores1;
+          if (fully_future0 && fully_future1) {
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              scores0[elem] = -FLT_MAX * 0.5f;
+              scores1[elem] = -FLT_MAX * 0.5f;
+            }
+          } else {
+            float k_scale_local = prepared_k_scale_tile;
+            if constexpr (!QuantizeKey && BC > 64) {
+              const int k_scale_idx = k_scale_col_per_warp(k_col_start);
+              k_scale_local =
+                  k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+            }
+            if constexpr (UseLaneMajorKey) {
+              compute_tqk_score_regs_raw_kq_2_lane_shared_key<DTiles>(
+                  k_lane_tile, q_regs, lane, col_tile,
+                  qs[0] * k_scale_local, qs[1] * k_scale_local,
+                  !fully_future0, !fully_future1, scores0, scores1);
+            } else {
+              compute_tqk_score_regs_raw_kq_2<PvOrderedQK, DTiles, SharedQKHeadStride>(
+                  &k_tile[0][0], q_regs, lane, col_tile,
+                  qs[0] * k_scale_local, qs[1] * k_scale_local,
+                  !fully_future0, !fully_future1, scores0, scores1);
+            }
+            if constexpr (ApplyCausalMask) {
+              if (fully_future0) {
+#pragma unroll
+                for (int elem = 0; elem < 8; ++elem) {
+                  scores0[elem] = -FLT_MAX * 0.5f;
+                }
+              } else if (k_col_start + BK > q_start[0]) {
+                if constexpr (PvOrderedQK) {
+                  apply_tqk_causal_mask_pv_order<true>(
+                      scores0, static_cast<int>(q_start[0]), static_cast<int>(kb_base),
+                      col_tile, lane);
+                } else {
+                  apply_tqk_causal_mask<true>(
+                      scores0, static_cast<int>(q_start[0]), static_cast<int>(kb_base),
+                      col_tile, lane);
+                }
+              }
+              if (fully_future1) {
+#pragma unroll
+                for (int elem = 0; elem < 8; ++elem) {
+                  scores1[elem] = -FLT_MAX * 0.5f;
+                }
+              } else if (k_col_start + BK > q_start[1]) {
+                if constexpr (PvOrderedQK) {
+                  apply_tqk_causal_mask_pv_order<true>(
+                      scores1, static_cast<int>(q_start[1]), static_cast<int>(kb_base),
+                      col_tile, lane);
+                } else {
+                  apply_tqk_causal_mask<true>(
+                      scores1, static_cast<int>(q_start[1]), static_cast<int>(kb_base),
+                      col_tile, lane);
+                }
+              }
+            }
+          }
+          if (k_col_start + BK > kv_len) {
+            apply_tqk_kv_tail_mask<PvOrderedQK>(
+                scores0, kv_len, kb_base, col_tile, lane);
+            apply_tqk_kv_tail_mask<PvOrderedQK>(
+                scores1, kv_len, kb_base, col_tile, lane);
+          }
+          score_cache[0][col_tile] = scores0;
+          score_cache[1][col_tile] = scores1;
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            local_max[0] = fmaxf(local_max[0], scores0[elem]);
+            local_max[1] = fmaxf(local_max[1], scores1[elem]);
+          }
+        }
+#pragma unroll
+        for (int qg = 0; qg < QGroups; ++qg) {
+          const float tile_max = fmaxf(local_max[qg], __shfl_xor(local_max[qg], 16, 32));
+          const float old_m = m[qg];
+          const float new_m = fmaxf(old_m, tile_max);
+          const float alpha = l[qg] == 0.0f ? 0.0f : fast_exp2(old_m - new_m);
+          m[qg] = new_m;
+          l[qg] *= alpha;
+
+          float8_vec alpha_rows;
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            alpha_rows[elem] = __shfl(alpha, row_base + elem, 32);
+          }
+
+#pragma unroll
+          for (int dt = 0; dt < DTiles; ++dt) {
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              out_frag[qg][dt][elem] *= alpha_rows[elem];
+            }
+          }
+
+          float local_sum = 0.0f;
+#pragma unroll
+        for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+          half8_vec prob_values;
+          const int64_t k_col_start = kb_base + col_tile * BK;
+          const bool fully_future =
+                ApplyCausalMask && k_col_start >= q_start[qg] + RM;
+          const float8_vec scores = score_cache[qg][col_tile];
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              float prob = 0.0f;
+              if (!fully_future) {
+                prob = fast_exp2(scores[elem] - m[qg] + kF16SoftmaxOffset);
+                local_sum += prob;
+              }
+              prob_values[elem] = static_cast<_Float16>(prob);
+            }
+            if constexpr (PvOrderedQK) {
+              prob_cache[qg][col_tile] = prob_values;
+            } else {
+              prob_cache[qg][col_tile] = make_p_regs_from_tqk_prob_regs(prob_values, lane);
+            }
+          }
+          l[qg] += local_sum + __shfl_xor(local_sum, 16, 32);
+        }
+      } else {
+#pragma unroll
+        for (int qg = 0; qg < QGroups; ++qg) {
+          float8_vec score_cache[ColTiles];
+          float local_max = -FLT_MAX * 0.5f;
+#pragma unroll
+          for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+            const int64_t k_col_start = kb_base + col_tile * BK;
+            const bool fully_future =
+                ApplyCausalMask && k_col_start >= q_start[qg] + RM;
+            float8_vec scores;
+            if (fully_future) {
+#pragma unroll
+              for (int elem = 0; elem < 8; ++elem) {
+                scores[elem] = -FLT_MAX * 0.5f;
+              }
+            } else {
+              float k_scale_local = prepared_k_scale_tile;
+              if constexpr (!QuantizeKey && BC > 64) {
+                const int k_scale_idx = k_scale_col_per_warp(k_col_start);
+                k_scale_local =
+                    k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+              }
+              const float score_scale = qs[qg] * k_scale_local;
+              scores =
+                  compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
+                      &k_tile[0][0], q_frag[qg], col_tile, score_scale);
+              if constexpr (ApplyCausalMask) {
+                const bool needs_causal_mask = k_col_start + BK > q_start[qg];
+                if (needs_causal_mask) {
+                  apply_tqk_causal_mask<true>(
+                      scores, static_cast<int>(q_start[qg]), static_cast<int>(kb_base),
+                      col_tile, lane);
+                }
+              }
+            }
+            if (k_col_start + BK > kv_len) {
+              apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
+            }
+            score_cache[col_tile] = scores;
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              local_max = fmaxf(local_max, scores[elem]);
+            }
+          }
+          const float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
+          const float old_m = m[qg];
+          const float new_m = fmaxf(old_m, tile_max);
+          const float alpha = l[qg] == 0.0f ? 0.0f : fast_exp2(old_m - new_m);
+          m[qg] = new_m;
+          l[qg] *= alpha;
+
+          float8_vec alpha_rows;
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            alpha_rows[elem] = __shfl(alpha, row_base + elem, 32);
+          }
+
+#pragma unroll
+          for (int dt = 0; dt < DTiles; ++dt) {
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              out_frag[qg][dt][elem] *= alpha_rows[elem];
+            }
+          }
+
+          float local_sum = 0.0f;
+#pragma unroll
+          for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+            half8_vec prob_values;
+            const int64_t k_col_start = kb_base + col_tile * BK;
+            const bool fully_future =
+                ApplyCausalMask && k_col_start >= q_start[qg] + RM;
+            const float8_vec scores = score_cache[col_tile];
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              float prob = 0.0f;
+              if (!fully_future) {
+                prob = fast_exp2(scores[elem] - m[qg] + kF16SoftmaxOffset);
+                local_sum += prob;
+              }
+              prob_values[elem] = static_cast<_Float16>(prob);
+            }
+            prob_cache[qg][col_tile] = make_p_regs_from_tqk_prob_regs(prob_values, lane);
+          }
+          l[qg] += local_sum + __shfl_xor(local_sum, 16, 32);
+        }
+      }
+
+      SAGEATTN_F16_SCHED_BARRIER(0);
+#pragma unroll
+      for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+        if constexpr (ApplyCausalMask) {
+          if (kb_base + col_tile * BK >= q_start[QGroups - 1] + RM) {
+            continue;
+          }
+        }
+#pragma unroll
+        for (int dt = 0; dt < DTiles; ++dt) {
+          half8_vec v_regs;
+          if constexpr (UseLaneMajorValue) {
+            v_regs = make_v_regs_from_lane_major_shared<DTiles>(
+                v_lane_tile, col_tile, dt, lane);
+          } else if constexpr (UseTransposedValueLayout) {
+            v_regs = make_v_regs_from_transposed_shared<SharedValueStride>(
+                &v_tile[0][0], col_tile, dt, lane);
+          } else {
+            v_regs = make_v_regs_from_shared<SharedValueStride>(
+                &v_tile[0][0], col_tile, dt, lane);
+          }
+          const bool fully_future0 =
+              ApplyCausalMask && kb_base + col_tile * BK >= q_start[0] + RM;
+          const half8_vec p_regs0 = prob_cache[0][col_tile];
+          if (!fully_future0) {
+          PvAccumVec acc0;
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            acc0[elem] = out_frag[0][dt][elem];
+          }
+          PvAccumVec pv_acc0;
+          if constexpr (F16PvAccum) {
+            pv_acc0 =
+                __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(p_regs0, v_regs, acc0);
+          } else {
+            pv_acc0 =
+                __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_regs0, v_regs, acc0);
+          }
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            out_frag[0][dt][elem] = pv_acc0[elem];
+          }
+          }
+          const bool fully_future1 =
+              ApplyCausalMask && kb_base + col_tile * BK >= q_start[1] + RM;
+          const half8_vec p_regs1 = prob_cache[1][col_tile];
+          if (!fully_future1) {
+          PvAccumVec acc1;
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            acc1[elem] = out_frag[1][dt][elem];
+          }
+          PvAccumVec pv_acc1;
+          if constexpr (F16PvAccum) {
+            pv_acc1 =
+                __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(p_regs1, v_regs, acc1);
+          } else {
+            pv_acc1 =
+                __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_regs1, v_regs, acc1);
+          }
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            out_frag[1][dt][elem] = pv_acc1[elem];
+          }
+          }
+        }
+      }
+    } else {
+      const bool needs_causal_mask = ApplyCausalMask && (kb_base + BC > q_base);
+#pragma unroll
+      for (int qg = 0; qg < QGroups; ++qg) {
+        float local_max = -FLT_MAX * 0.5f;
+#pragma unroll
+        for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+          float k_scale_local = prepared_k_scale_tile;
+          if constexpr (!QuantizeKey && BC > 64) {
+            const int k_scale_idx = k_scale_col_per_warp(kb_base + col_tile * BK);
+            k_scale_local =
+                k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+          }
+          const float score_scale = qs[qg] * k_scale_local;
+          float8_vec scores;
+          if constexpr (QuantizeQuery || UseRawPreparedQ) {
+            scores = compute_tqk_score_regs_raw_kq<DTiles, SharedHeadStride>(
+                &k_tile[0][0], q_regs[qg], lane, col_tile, score_scale);
+          } else {
+            scores =
+                compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
+                    &k_tile[0][0], q_frag[qg], col_tile, score_scale);
+          }
+          if constexpr (ApplyCausalMask) {
+            if (needs_causal_mask) {
+              apply_tqk_causal_mask<true>(
+                  scores, static_cast<int>(q_start[qg]), static_cast<int>(kb_base), col_tile, lane);
+            }
+          }
+          if (kb_base + static_cast<int64_t>(col_tile) * BK + BK > kv_len) {
+            apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
+          }
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            local_max = fmaxf(local_max, scores[elem]);
+          }
+        }
+        const float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
+        const float old_m = m[qg];
+        const float new_m = fmaxf(old_m, tile_max);
+        const float alpha = l[qg] == 0.0f ? 0.0f : fast_exp2(old_m - new_m);
+        m[qg] = new_m;
+        l[qg] *= alpha;
+
+        float8_vec alpha_rows;
+#pragma unroll
+        for (int elem = 0; elem < 8; ++elem) {
+          alpha_rows[elem] = __shfl(alpha, row_base + elem, 32);
+        }
+
+#pragma unroll
+        for (int dt = 0; dt < DTiles; ++dt) {
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            out_frag[qg][dt][elem] *= alpha_rows[elem];
+          }
+        }
+
+        float local_sum = 0.0f;
+#pragma unroll
+        for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+          float k_scale_local = prepared_k_scale_tile;
+          if constexpr (!QuantizeKey && BC > 64) {
+            const int k_scale_idx = k_scale_col_per_warp(kb_base + col_tile * BK);
+            k_scale_local =
+                k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+          }
+          const float score_scale = qs[qg] * k_scale_local;
+          float8_vec scores;
+          if constexpr (QuantizeQuery || UseRawPreparedQ) {
+            scores = compute_tqk_score_regs_raw_kq<DTiles, SharedHeadStride>(
+                &k_tile[0][0], q_regs[qg], lane, col_tile, score_scale);
+          } else {
+            scores =
+                compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
+                    &k_tile[0][0], q_frag[qg], col_tile, score_scale);
+          }
+          if constexpr (ApplyCausalMask) {
+            if (needs_causal_mask) {
+              apply_tqk_causal_mask<true>(
+                  scores, static_cast<int>(q_start[qg]), static_cast<int>(kb_base), col_tile, lane);
+            }
+          }
+          if (kb_base + static_cast<int64_t>(col_tile) * BK + BK > kv_len) {
+            apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
+          }
+          half8_vec prob_values;
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            const float prob = fast_exp2(scores[elem] - m[qg] + kF16SoftmaxOffset);
+            local_sum += prob;
+            prob_values[elem] = static_cast<_Float16>(prob);
+          }
+
+          const half8_vec p_regs = make_p_regs_from_tqk_prob_regs(prob_values, lane);
+#pragma unroll
+          for (int dt = 0; dt < DTiles; ++dt) {
+            half8_vec v_regs;
+            if constexpr (UseLaneMajorValue) {
+              v_regs = make_v_regs_from_lane_major_shared<DTiles>(
+                  v_lane_tile, col_tile, dt, lane);
+            } else if constexpr (UseTransposedValueLayout) {
+              v_regs = make_v_regs_from_transposed_shared<SharedValueStride>(
+                  &v_tile[0][0], col_tile, dt, lane);
+          } else {
+            v_regs = make_v_regs_from_shared<SharedValueStride>(
+                &v_tile[0][0], col_tile, dt, lane);
+          }
+            PvAccumVec acc;
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              acc[elem] = out_frag[qg][dt][elem];
+            }
+            PvAccumVec pv_acc;
+            if constexpr (F16PvAccum) {
+              pv_acc =
+                  __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(p_regs, v_regs, acc);
+            } else {
+              pv_acc =
+                  __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_regs, v_regs, acc);
+            }
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              out_frag[qg][dt][elem] = pv_acc[elem];
+            }
+          }
+        }
+        l[qg] += local_sum + __shfl_xor(local_sum, 16, 32);
+      }
+    }
+    };
+    compute_loaded_tile(apply_causal_mask_tag);
+    if constexpr (UsesTileSharedMemory) {
+      __syncthreads();
+    }
+  };
+
+  if constexpr (IsCausal) {
+    const int64_t prefix_limit = q_base < kv_limit ? q_base : kv_limit;
+#pragma unroll 2
+    for (int64_t kb_base = 0; kb_base < prefix_limit; kb_base += BC) {
+      process_kv_tile(kb_base, std::false_type{});
+    }
+#pragma unroll 2
+    for (int64_t kb_base = prefix_limit; kb_base < kv_limit; kb_base += BC) {
+      process_kv_tile(kb_base, std::true_type{});
+    }
+  } else {
+#pragma unroll 2
+    for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BC) {
+      process_kv_tile(kb_base, std::false_type{});
+    }
+  }
+
+#pragma unroll
+  for (int qg = 0; qg < QGroups; ++qg) {
+    float8_vec inv_l_rows;
+#pragma unroll
+    for (int elem = 0; elem < 8; ++elem) {
+      const float l_sum = __shfl(l[qg], row_base + elem, 32);
+      inv_l_rows[elem] = l_sum == 0.0f ? 0.0f : 1.0f / l_sum;
+    }
+#pragma unroll
+    for (int dt = 0; dt < DTiles; ++dt) {
+      const int d = dt * BK + col;
+#pragma unroll
+      for (int pair = 0; pair < PackedRows; ++pair) {
+        const int elem = pair * 2;
+        const int64_t q_idx0 = q_start[qg] + row_base + elem;
+        const int64_t q_idx1 = q_idx0 + 1;
+        const float value0 = static_cast<float>(out_frag[qg][dt][elem]) * inv_l_rows[elem];
+        const float value1 = static_cast<float>(out_frag[qg][dt][elem + 1]) * inv_l_rows[elem + 1];
+        int64_t o_off0;
+        int64_t o_off1;
+        if constexpr (HndContiguous) {
+          o_off0 = o_head_base + q_idx0 * HeadDim + d;
+          o_off1 = o_head_base + q_idx1 * HeadDim + d;
+        } else {
+          o_off0 = qkv_offset(
+              tensor_layout, b, hq, q_idx0, d, o_stride_b, o_stride_n, o_stride_h);
+          o_off1 = qkv_offset(
+              tensor_layout, b, hq, q_idx1, d, o_stride_b, o_stride_n, o_stride_h);
+        }
+        store_half(output, o_off0, value0);
+        store_half(output, o_off1, value1);
+      }
+    }
+  }
+    return;
+  }
+}
+
+template <int BlockCols,
+          int HeadDim,
+          int ValueTileBase,
+          int ValueTiles,
+          bool HndContiguous = false,
+          int BlockRows = 128,
+          bool ValueTransposed = false,
+          bool IsCausal = false,
+          typename OutputT = __half,
+          typename QueryT = int8_t,
+          bool QuantizeQuery = false,
+          typename KeyT = int8_t,
+          typename ValueT = uint8_t,
+          bool QuantizeKeyValue = false,
+          bool PrepackedLaneMajorKV = false,
+          int StreamColsOverride = 0,
+          bool PrepackedLaneMajorKeyOnly = false,
+          bool PrepackedLaneMajorValueOnly = false,
+          int QGroupsParam = 2,
+          bool LowPressureQGroups = false>
+SAGEATTN_NATIVE_2Q_WAVES_PER_EU(HeadDim, IsCausal)
+__global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_f8_native_2q_kernel(
+    const QueryT* __restrict__ q,
+    const KeyT* __restrict__ k,
+    const ValueT* __restrict__ v,
+    OutputT* __restrict__ output,
+    const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale,
+    const float* __restrict__ v_scale,
+    const int64_t batch_size,
+    const int64_t qo_len,
+    const int64_t kv_len,
+    const int64_t num_qo_heads,
+    const int64_t num_kv_heads,
+    const int64_t q_stride_b,
+    const int64_t q_stride_n,
+    const int64_t q_stride_h,
+    const int64_t k_stride_b,
+    const int64_t k_stride_n,
+    const int64_t k_stride_h,
+    const int64_t v_stride_b,
+    const int64_t v_stride_n,
+    const int64_t v_stride_h,
+    const int64_t o_stride_b,
+    const int64_t o_stride_n,
+    const int64_t o_stride_h,
+    const int64_t qs_stride_b,
+    const int64_t qs_stride_h,
+    const int64_t ks_stride_b,
+    const int64_t ks_stride_h,
+    const int tensor_layout,
+    const float sm_scale) {
+  static_assert(HeadDim == 16 || HeadDim == 64 || HeadDim == 128,
+                "native gfx12 fp8 2q kernel supports D16/D64/D128.");
+  static_assert(BlockCols == 16 || BlockCols == 32 || BlockCols == 64 ||
+                    BlockCols == 128,
+                "native gfx12 fp8 2q kernel supports BC16/BC32/BC64/BC128.");
+  static_assert(BlockRows == 32 || BlockRows == 64 || BlockRows == 128 ||
+                    BlockRows == 256 || BlockRows == 512,
+                "native fp8 2q supports 32, 64, 128, 256, or 512 query rows per CTA.");
+  static_assert(QGroupsParam == 1 || QGroupsParam == 2,
+                "native fp8 kernel supports one or two query groups per wave.");
+  static_assert(!LowPressureQGroups ||
+                    (HeadDim == 128 && BlockCols == 64 && BlockRows == 128 &&
+                     IsCausal && ValueTransposed && QGroupsParam == 2),
+                "low-pressure fp8 path is specialized for D128 BC64 BR128 causal.");
+  constexpr int BR = BlockRows;
+  constexpr int RM = 16;
+  constexpr int QGroups = QGroupsParam;
+  constexpr int RowsPerWave = RM * QGroups;
+  constexpr int BK = 16;
+  constexpr int BC = BlockCols;
+  constexpr int Threads = BlockRows * (2 / QGroups);
+  constexpr int DTiles = HeadDim / BK;
+  constexpr int ColTiles = BC / BK;
+  constexpr int SharedHeadStride = HeadDim + 16;
+  constexpr bool PackedTransposedValue = ValueTransposed && HeadDim == 64;
+  constexpr int SharedValueRows = ValueTransposed && !PackedTransposedValue ? HeadDim : (ValueTransposed ? 1 : BC);
+  constexpr int SharedValueStride = ValueTransposed && !PackedTransposedValue ? (BC + 16) : (ValueTransposed ? 1 : SharedHeadStride);
+  constexpr int SharedValueRowsT = PackedTransposedValue ? HeadDim : 1;
+  constexpr int SharedValueStrideT = PackedTransposedValue ? (BC / 4 + 1) : 1;
+  constexpr int PackedRows = 4;
+  constexpr bool UseLowPressureQGroups =
+      LowPressureQGroups && HeadDim == 128 && BlockCols == 64 &&
+      BlockRows == 128 && IsCausal && ValueTransposed &&
+      !QuantizeQuery && !QuantizeKeyValue && QGroups == 2;
+  constexpr bool UsePrepackedLaneMajorKV =
+      PrepackedLaneMajorKV && HeadDim == 64 &&
+      BlockCols == 64 && HndContiguous &&
+      ValueTransposed && !QuantizeKeyValue;
+  constexpr bool UsePrepackedLaneMajorKey =
+      PrepackedLaneMajorKeyOnly && (HeadDim == 64 || HeadDim == 128) &&
+      BlockCols == 64 && HndContiguous &&
+      ValueTransposed && !QuantizeKeyValue;
+  constexpr bool UsePrepackedLaneMajorK =
+      UsePrepackedLaneMajorKV || UsePrepackedLaneMajorKey;
+  constexpr bool UsePrepackedLaneMajorValue =
+      UsePrepackedLaneMajorKV ||
+      (PrepackedLaneMajorValueOnly && (HeadDim == 64 || HeadDim == 128) &&
+       BlockCols == 64 && HndContiguous &&
+       ValueTransposed && !QuantizeKeyValue);
+  constexpr bool UsesTileSharedMemory =
+      !UsePrepackedLaneMajorK || !UsePrepackedLaneMajorValue;
+  constexpr bool PreloadQFragments =
+      !UseLowPressureQGroups && !UsePrepackedLaneMajorK && (HeadDim == 64 ||
+      (HeadDim == 128 && IsCausal && BlockRows == 128 &&
+       (BlockCols == 64 || BlockCols == 128) &&
+       ValueTransposed));
+  constexpr bool UseStreamedFp8Pv =
+      StreamColsOverride >= 0 &&
+      (BlockCols == 64 || (BlockCols == 128 && HeadDim == 128)) &&
+      ValueTransposed &&
+      (QuantizeQuery || (HeadDim == 128 && BlockCols == 128 &&
+                         PreloadQFragments)) &&
+      (HeadDim == 128 ||
+       (HeadDim == 64 && IsCausal &&
+        (UsePrepackedLaneMajorK || UsePrepackedLaneMajorValue)));
+  static_assert(!QuantizeKeyValue ||
+                    ((HeadDim == 64 || HeadDim == 128) &&
+                     BlockCols == 64 && HndContiguous && !ValueTransposed),
+                "raw K/V fp8 staging currently supports contiguous HND D64/D128 BC64 tensors.");
+  static_assert(!UsePrepackedLaneMajorKV ||
+                    (HeadDim == 64 && HndContiguous && ValueTransposed &&
+                     !QuantizeKeyValue),
+                "lane-major prepared fp8 K/V requires prepared transposed D64 HND tensors.");
+  static_assert(!UsePrepackedLaneMajorKey ||
+                    ((HeadDim == 64 || HeadDim == 128) &&
+                     HndContiguous && ValueTransposed &&
+                      !QuantizeKeyValue),
+                "lane-major prepared fp8 K requires prepared transposed D64/D128 HND tensors.");
+  static_assert(!UsePrepackedLaneMajorValue ||
+                    (HndContiguous && ValueTransposed && !QuantizeKeyValue),
+                "lane-major prepared fp8 V requires prepared transposed HND tensors.");
+  static_assert(ValueTiles == 1 || ValueTiles == 4 || ValueTiles == 8,
+                "native fp8 2q stores one D16, D64, or D128 value slice per launch.");
+  static_assert(ValueTileBase + ValueTiles <= DTiles, "invalid fp8 value tile slice.");
+
+  __shared__ int8_t k_tile[UsePrepackedLaneMajorK ? 1 : BC][SharedHeadStride];
+  __shared__ uint8_t v_tile[UsePrepackedLaneMajorValue ? 1 : SharedValueRows]
+                           [UsePrepackedLaneMajorValue ? 1 : SharedValueStride];
+  __shared__ uint32_t v_tile_t[UsePrepackedLaneMajorValue ? 1 : SharedValueRowsT]
+                               [UsePrepackedLaneMajorValue ? 1 : SharedValueStrideT];
+  __shared__ float raw_k_amax_shared;
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int wave = tid >> 5;
+  const int row_base = (lane >> 4) << 3;
+  const int col = lane & 15;
+  const int64_t q_base =
+      q_block_base_for_launch<IsCausal, BR>(static_cast<int64_t>(blockIdx.x), qo_len);
+  const int64_t hq = blockIdx.y;
+  const int64_t b = blockIdx.z;
+  if (b >= batch_size || hq >= num_qo_heads || q_base >= qo_len) {
+    return;
+  }
+
+  const int64_t hkv = hq / (num_qo_heads / num_kv_heads);
+  const int64_t k_head_base = b * k_stride_b + hkv * k_stride_h;
+  const int64_t v_head_base = b * v_stride_b + hkv * v_stride_h;
+  int64_t q_start[QGroups];
+  float qs[QGroups];
+  const int64_t wave_q_start = q_base + static_cast<int64_t>(wave) * RowsPerWave;
+#pragma unroll
+  for (int qg = 0; qg < QGroups; ++qg) {
+    q_start[qg] = wave_q_start + qg * RM;
+  }
+
+  i32x2_vec q_regs[QGroups][DTiles];
+  if constexpr (QuantizeQuery) {
+    constexpr int QPackElems = 8;
+    constexpr int QPacksPerWave = (RowsPerWave * HeadDim) / QPackElems;
+    const int local_q_row_base = wave * RowsPerWave;
+    float local_q_amax = 0.0000001f;
+    for (int pack = lane; pack < QPacksPerWave; pack += 32) {
+      const int elem_base = pack * QPackElems;
+      const int row = elem_base / HeadDim;
+      const int d = elem_base - row * HeadDim;
+      const int64_t q_idx = q_base + local_q_row_base + row;
+      if (q_idx < qo_len) {
+        const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hq, q_idx, d, q_stride_b, q_stride_n, q_stride_h);
+        const uint4 raw = *reinterpret_cast<const uint4*>(q + q_off);
+        const QueryT* values = reinterpret_cast<const QueryT*>(&raw);
+#pragma unroll
+        for (int i = 0; i < QPackElems; ++i) {
+          local_q_amax = fmaxf(local_q_amax, fabsf(value_to_float(values[i])));
+        }
+      }
+    }
+    local_q_amax = vllm::warpReduceMax(local_q_amax);
+    float q_amax_for_scale = __shfl(local_q_amax, 0, 32);
+    if constexpr (QGroups == 1) {
+      __shared__ float q_amax_shared[Threads / 32];
+      if (lane == 0) {
+        q_amax_shared[wave] = q_amax_for_scale;
+      }
+      __syncthreads();
+      const int pair_wave = wave & ~1;
+      q_amax_for_scale =
+          fmaxf(q_amax_shared[pair_wave], q_amax_shared[pair_wave + 1]);
+      __syncthreads();
+    }
+    const float q_scale_local = q_amax_for_scale / 127.0f;
+    const float inv_q_scale = 127.0f / q_amax_for_scale;
+#pragma unroll
+    for (int qg = 0; qg < QGroups; ++qg) {
+      qs[qg] = q_scale_local * sm_scale * kLog2e;
+      const int64_t qg_start = q_start[qg];
+#pragma unroll
+      for (int dt = 0; dt < DTiles; ++dt) {
+        q_regs[qg][dt] = pack_quant_q_i8_wmma_b_regs<QueryT, HeadDim, HndContiguous>(
+            q, tensor_layout, lane, b, hq, qg_start, qo_len, dt * BK,
+            q_stride_b, q_stride_n, q_stride_h, inv_q_scale);
+      }
+    }
+  } else {
+#pragma unroll
+    for (int qg = 0; qg < QGroups; ++qg) {
+      const int q_scale_idx = q_scale_col_per_warp(q_start[qg]);
+      qs[qg] = q_scale[b * qs_stride_b + hq * qs_stride_h + q_scale_idx] *
+          sm_scale * kLog2e;
+    }
+    if constexpr (UsePrepackedLaneMajorK) {
+#pragma unroll
+      for (int qg = 0; qg < QGroups; ++qg) {
+#pragma unroll
+        for (int dt = 0; dt < DTiles; ++dt) {
+          q_regs[qg][dt] = pack_q_i8_wmma_b_regs<HeadDim, HndContiguous>(
+              q, tensor_layout, lane, b, hq, q_start[qg], qo_len, dt * BK,
+              q_stride_b, q_stride_n, q_stride_h);
+        }
+      }
+    }
+  }
+
+  using FragK = rocwmma::fragment<rocwmma::matrix_a, RM, BK, BK, int8_t, rocwmma::row_major>;
+  using FragQ = rocwmma::fragment<rocwmma::matrix_b, RM, BK, BK, int8_t, rocwmma::col_major>;
+  using FragScoreT = rocwmma::fragment<rocwmma::accumulator, RM, BK, BK, int32_t>;
+
+  FragQ q_frag[QGroups][DTiles];
+  if constexpr (PreloadQFragments && !QuantizeQuery) {
+#pragma unroll
+    for (int qg = 0; qg < QGroups; ++qg) {
+#pragma unroll
+      for (int dt = 0; dt < DTiles; ++dt) {
+        const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hq, q_start[qg], dt * BK, q_stride_b, q_stride_n, q_stride_h);
+        rocwmma::load_matrix_sync(q_frag[qg][dt], q + q_off, static_cast<uint32_t>(q_stride_n));
+      }
+    }
+  }
+
+  float out_frag[QGroups][ValueTiles][8];
+  float m[QGroups];
+  float l[QGroups];
+#pragma unroll
+  for (int qg = 0; qg < QGroups; ++qg) {
+    m[qg] = -FLT_MAX * 0.5f;
+    l[qg] = 0.0f;
+#pragma unroll
+    for (int vdt = 0; vdt < ValueTiles; ++vdt) {
+#pragma unroll
+      for (int elem = 0; elem < 8; ++elem) {
+        out_frag[qg][vdt][elem] = 0.0f;
+      }
+    }
+  }
+
+  const int64_t kv_limit = IsCausal && (q_base + BR) < kv_len ? q_base + BR : kv_len;
+  auto process_kv_tile = [&](const int64_t kb_base, auto causal_mask_tag) {
+    constexpr bool ApplyCausalMask = decltype(causal_mask_tag)::value;
+    constexpr int VecBytes = 16;
+    constexpr int VecsPerRow = HeadDim / VecBytes;
+    constexpr bool UseActiveCausalColSkip = false;
+    if constexpr (UsePrepackedLaneMajorK) {
+      if constexpr (ApplyCausalMask) {
+        if (kb_base >= q_start[QGroups - 1] + RM) {
+          return;
+        }
+      }
+    }
+    float k_scale_tile = 1.0f;
+    if constexpr (QuantizeKeyValue) {
+      constexpr int PackElems = 8;
+      constexpr int Packs = (BC * HeadDim) / PackElems;
+      float local_k_amax = 0.0000001f;
+      for (int pack = tid; pack < Packs; pack += Threads) {
+        const int elem_base = pack * PackElems;
+        const int n = elem_base / HeadDim;
+        const int d = elem_base - n * HeadDim;
+        const int64_t k_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hkv, kb_base + n, d, k_stride_b, k_stride_n, k_stride_h);
+        const uint4 raw = *reinterpret_cast<const uint4*>(k + k_off);
+        const KeyT* values = reinterpret_cast<const KeyT*>(&raw);
+#pragma unroll
+        for (int i = 0; i < PackElems; ++i) {
+          local_k_amax = fmaxf(local_k_amax, fabsf(value_to_float(values[i])));
+        }
+      }
+      const float block_k_amax = vllm::blockReduceMax(local_k_amax);
+      if (tid == 0) {
+        raw_k_amax_shared = block_k_amax;
+      }
+      __syncthreads();
+      const float raw_k_amax = raw_k_amax_shared;
+      k_scale_tile = raw_k_amax / 127.0f;
+      const float inv_k_scale = 127.0f / raw_k_amax;
+
+      for (int pack = tid; pack < Packs; pack += Threads) {
+        const int elem_base = pack * PackElems;
+        const int n = elem_base / HeadDim;
+        const int d = elem_base - n * HeadDim;
+        const int64_t k_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hkv, kb_base + n, d, k_stride_b, k_stride_n, k_stride_h);
+        const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hkv, kb_base + n, d, v_stride_b, v_stride_n, v_stride_h);
+        const uint4 raw_k = *reinterpret_cast<const uint4*>(k + k_off);
+        const uint4 raw_v = *reinterpret_cast<const uint4*>(v + v_off);
+        const KeyT* k_values = reinterpret_cast<const KeyT*>(&raw_k);
+        const ValueT* v_values = reinterpret_cast<const ValueT*>(&raw_v);
+        char4 out0;
+        char4 out1;
+        out0.x = float_to_int8_rn_gfx12(value_to_float(k_values[0]) * inv_k_scale);
+        out0.y = float_to_int8_rn_gfx12(value_to_float(k_values[1]) * inv_k_scale);
+        out0.z = float_to_int8_rn_gfx12(value_to_float(k_values[2]) * inv_k_scale);
+        out0.w = float_to_int8_rn_gfx12(value_to_float(k_values[3]) * inv_k_scale);
+        out1.x = float_to_int8_rn_gfx12(value_to_float(k_values[4]) * inv_k_scale);
+        out1.y = float_to_int8_rn_gfx12(value_to_float(k_values[5]) * inv_k_scale);
+        out1.z = float_to_int8_rn_gfx12(value_to_float(k_values[6]) * inv_k_scale);
+        out1.w = float_to_int8_rn_gfx12(value_to_float(k_values[7]) * inv_k_scale);
+        *reinterpret_cast<char4*>(&k_tile[n][d]) = out0;
+        *reinterpret_cast<char4*>(&k_tile[n][d + 4]) = out1;
+
+        const uint32_t v_pack0 = static_cast<uint32_t>(pack_f32x4_to_ocp_fp8(
+            value_to_float(v_values[0]), value_to_float(v_values[1]),
+            value_to_float(v_values[2]), value_to_float(v_values[3])));
+        const uint32_t v_pack1 = static_cast<uint32_t>(pack_f32x4_to_ocp_fp8(
+            value_to_float(v_values[4]), value_to_float(v_values[5]),
+            value_to_float(v_values[6]), value_to_float(v_values[7])));
+        *reinterpret_cast<uint32_t*>(&v_tile[n][d]) = v_pack0;
+        *reinterpret_cast<uint32_t*>(&v_tile[n][d + 4]) = v_pack1;
+      }
+    } else if constexpr (!UsePrepackedLaneMajorK) {
+      for (int vec = tid; vec < BC * VecsPerRow; vec += Threads) {
+        const int n = vec / VecsPerRow;
+        const int d = (vec - n * VecsPerRow) * VecBytes;
+        const int64_t k_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hkv, kb_base + n, d, k_stride_b, k_stride_n, k_stride_h);
+        *reinterpret_cast<uint4*>(&k_tile[n][d]) =
+            *reinterpret_cast<const uint4*>(k + k_off);
+        if constexpr (!ValueTransposed) {
+          const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+              tensor_layout, b, hkv, kb_base + n, d, v_stride_b, v_stride_n, v_stride_h);
+          *reinterpret_cast<uint4*>(&v_tile[n][d]) =
+              *reinterpret_cast<const uint4*>(v + v_off);
+        }
+      }
+    }
+    if constexpr (ValueTransposed && !QuantizeKeyValue && !UsePrepackedLaneMajorValue) {
+      constexpr int VVecBytes = 16;
+      constexpr int VVecsPerD = BC / VVecBytes;
+      for (int vec = tid; vec < HeadDim * VVecsPerD; vec += Threads) {
+        const int d = vec / VVecsPerD;
+        const int n = (vec - d * VVecsPerD) * VVecBytes;
+        const int64_t v_off = b * v_stride_b + hkv * v_stride_h +
+            static_cast<int64_t>(d) * v_stride_n + kb_base + n;
+        const uint4 packed = *reinterpret_cast<const uint4*>(v + v_off);
+        if constexpr (PackedTransposedValue) {
+          const int group = n >> 2;
+          v_tile_t[d][group + 0] = packed.x;
+          v_tile_t[d][group + 1] = packed.y;
+          v_tile_t[d][group + 2] = packed.z;
+          v_tile_t[d][group + 3] = packed.w;
+        } else {
+          *reinterpret_cast<uint4*>(&v_tile[d][n]) = packed;
+        }
+      }
+    }
+    if constexpr (UsesTileSharedMemory) {
+      __syncthreads();
+    }
+
+    if constexpr (!PreloadQFragments && !QuantizeQuery && !UsePrepackedLaneMajorK) {
+#pragma unroll
+      for (int qg = 0; qg < QGroups; ++qg) {
+#pragma unroll
+        for (int dt = 0; dt < DTiles; ++dt) {
+          const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+              tensor_layout, b, hq, q_start[qg], dt * BK, q_stride_b, q_stride_n, q_stride_h);
+          rocwmma::load_matrix_sync(q_frag[qg][dt], q + q_off, static_cast<uint32_t>(q_stride_n));
+        }
+      }
+    }
+
+    int active_cols0 = ColTiles;
+    int active_cols1 = ColTiles;
+    if constexpr (UseActiveCausalColSkip) {
+      active_cols0 =
+          active_causal_col_tiles<ApplyCausalMask, ColTiles>(q_start[0], kb_base);
+      active_cols1 =
+          active_causal_col_tiles<ApplyCausalMask, ColTiles>(q_start[1], kb_base);
+    }
+    const int active_cols_any = active_cols0 > active_cols1 ? active_cols0 : active_cols1;
+
+    if constexpr (BlockCols <= 64 || UseStreamedFp8Pv) {
+      i32x2_vec prob_cache[QGroups][ColTiles];
+      if constexpr (QuantizeQuery || UsePrepackedLaneMajorKV || UseStreamedFp8Pv) {
+        if constexpr (UseStreamedFp8Pv) {
+          constexpr int StreamCols = StreamColsOverride > 0 ? StreamColsOverride : 2;
+          static_assert(StreamCols == 1 || StreamCols == 2 || StreamCols == 4,
+                        "fp8 streaming supports one, two, or four col tiles per group.");
+#pragma unroll
+          for (int stream_col = 0; stream_col < ColTiles; stream_col += StreamCols) {
+            float8_vec score_cache_stream[QGroups][StreamCols];
+            i32x2_vec prob_cache_stream[QGroups][StreamCols];
+            float local_max_stream[QGroups];
+#pragma unroll
+            for (int qg = 0; qg < QGroups; ++qg) {
+              local_max_stream[qg] = -FLT_MAX * 0.5f;
+            }
+            float prepared_k_scale_tile = k_scale_tile;
+            if constexpr (!QuantizeKeyValue && BC <= 64) {
+              const int k_scale_idx = k_scale_col_per_warp(kb_base);
+              prepared_k_scale_tile =
+                  k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+            }
+#pragma unroll
+            for (int sc = 0; sc < StreamCols; ++sc) {
+              const int col_tile = stream_col + sc;
+              if constexpr (UseActiveCausalColSkip) {
+                if (col_tile >= active_cols_any) {
+                  continue;
+                }
+              }
+              const int64_t k_col_start = kb_base + col_tile * BK;
+              const bool skip_all =
+                  ApplyCausalMask && k_col_start >= q_start[QGroups - 1] + RM;
+              if (skip_all) {
+#pragma unroll
+                for (int qg = 0; qg < QGroups; ++qg) {
+                  float8_vec scores;
+#pragma unroll
+                  for (int elem = 0; elem < 8; ++elem) {
+                    scores[elem] = -FLT_MAX * 0.5f;
+                  }
+                  score_cache_stream[qg][sc] = scores;
+                }
+                continue;
+              }
+              bool fully_future[QGroups];
+#pragma unroll
+              for (int qg = 0; qg < QGroups; ++qg) {
+                if constexpr (UseActiveCausalColSkip) {
+                  const int active_cols = qg == 0 ? active_cols0 : active_cols1;
+                  fully_future[qg] = col_tile >= active_cols;
+                } else {
+                  fully_future[qg] =
+                      ApplyCausalMask && k_col_start >= q_start[qg] + RM;
+                }
+              }
+              float k_scale_local = k_scale_tile;
+              if constexpr (!QuantizeKeyValue && BC <= 64) {
+                k_scale_local = prepared_k_scale_tile;
+              } else if constexpr (!QuantizeKeyValue) {
+                const int k_scale_idx = k_scale_col_per_warp(k_col_start);
+                k_scale_local = k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+              }
+              if constexpr (QuantizeQuery || UsePrepackedLaneMajorK) {
+              i32x8_vec score_acc[QGroups];
+#pragma unroll
+              for (int qg = 0; qg < QGroups; ++qg) {
+#pragma unroll
+                for (int elem = 0; elem < 8; ++elem) {
+                  score_acc[qg][elem] = 0;
+                }
+              }
+#pragma unroll
+              for (int dt = 0; dt < DTiles; ++dt) {
+                i32x2_vec k_regs;
+                if constexpr (UsePrepackedLaneMajorK) {
+                  k_regs = pack_k_i8_wmma_b_regs_from_lane_major_global<DTiles>(
+                      k, k_head_base, k_stride_n * 64, kb_base, col_tile, dt, lane);
+                } else {
+                  k_regs = pack_k_i8_wmma_b_regs_from_shared<SharedHeadStride>(
+                      &k_tile[0][0], lane, col_tile, dt * BK);
+                }
+#pragma unroll
+                for (int qg = 0; qg < QGroups; ++qg) {
+                  if (!fully_future[qg]) {
+                    score_acc[qg] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                        true, k_regs, true, q_regs[qg][dt], score_acc[qg], true);
+                  }
+                }
+              }
+#pragma unroll
+              for (int qg = 0; qg < QGroups; ++qg) {
+                const float score_scale = qs[qg] * k_scale_local;
+                float8_vec scores;
+                if (fully_future[qg]) {
+#pragma unroll
+                  for (int elem = 0; elem < 8; ++elem) {
+                    scores[elem] = -FLT_MAX * 0.5f;
+                  }
+                } else {
+#pragma unroll
+                  for (int elem = 0; elem < 8; ++elem) {
+                    scores[elem] = static_cast<float>(score_acc[qg][elem]) * score_scale;
+                  }
+                  if constexpr (ApplyCausalMask) {
+                    const bool needs_causal_mask = k_col_start + BK > q_start[qg];
+                    if (needs_causal_mask) {
+                      apply_tqk_causal_mask<true>(
+                          scores, static_cast<int>(q_start[qg]),
+                          static_cast<int>(kb_base), col_tile, lane);
+                    }
+                  }
+                }
+                if (k_col_start + BK > kv_len) {
+                  apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
+                }
+                score_cache_stream[qg][sc] = scores;
+#pragma unroll
+                for (int elem = 0; elem < 8; ++elem) {
+                  local_max_stream[qg] = fmaxf(local_max_stream[qg], scores[elem]);
+                }
+              }
+              } else {
+                FragScoreT score_acc[QGroups];
+#pragma unroll
+                for (int qg = 0; qg < QGroups; ++qg) {
+                  rocwmma::fill_fragment(score_acc[qg], 0);
+                }
+#pragma unroll
+                for (int dt = 0; dt < DTiles; ++dt) {
+                  FragK k_frag;
+                  rocwmma::load_matrix_sync(
+                      k_frag,
+                      &k_tile[0][0] + (col_tile * BK) * SharedHeadStride + dt * BK,
+                      static_cast<uint32_t>(SharedHeadStride));
+#pragma unroll
+                  for (int qg = 0; qg < QGroups; ++qg) {
+                    if (!fully_future[qg]) {
+                      rocwmma::mma_sync(score_acc[qg], k_frag, q_frag[qg][dt], score_acc[qg]);
+                    }
+                  }
+                }
+#pragma unroll
+                for (int qg = 0; qg < QGroups; ++qg) {
+                  const float score_scale = qs[qg] * k_scale_local;
+                  float8_vec scores;
+                  if (fully_future[qg]) {
+#pragma unroll
+                    for (int elem = 0; elem < 8; ++elem) {
+                      scores[elem] = -FLT_MAX * 0.5f;
+                    }
+                  } else {
+                    const auto score_rm =
+                        rocwmma::apply_data_layout<rocwmma::row_major>(score_acc[qg]);
+#pragma unroll
+                    for (int elem = 0; elem < 8; ++elem) {
+                      scores[elem] = static_cast<float>(score_rm[elem]) * score_scale;
+                    }
+                    if constexpr (ApplyCausalMask) {
+                      const bool needs_causal_mask = k_col_start + BK > q_start[qg];
+                      if (needs_causal_mask) {
+                        apply_tqk_causal_mask<true>(
+                            scores, static_cast<int>(q_start[qg]),
+                            static_cast<int>(kb_base), col_tile, lane);
+                      }
+                    }
+                  }
+                  if (k_col_start + BK > kv_len) {
+                    apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
+                  }
+                  score_cache_stream[qg][sc] = scores;
+#pragma unroll
+                  for (int elem = 0; elem < 8; ++elem) {
+                    local_max_stream[qg] = fmaxf(local_max_stream[qg], scores[elem]);
+                  }
+                }
+              }
+            }
+
+#pragma unroll
+            for (int qg = 0; qg < QGroups; ++qg) {
+              const float tile_max =
+                  fmaxf(local_max_stream[qg], __shfl_xor(local_max_stream[qg], 16, 32));
+              const float old_m = m[qg];
+              const float new_m = fmaxf(old_m, tile_max);
+              const bool has_previous_sum = l[qg] != 0.0f;
+              const float alpha = has_previous_sum ? fast_exp2(old_m - new_m) : 0.0f;
+              m[qg] = new_m;
+              l[qg] *= alpha;
+
+              if (has_previous_sum) {
+                float alpha_rows[8];
+#pragma unroll
+                for (int elem = 0; elem < 8; ++elem) {
+                  alpha_rows[elem] = __shfl(alpha, row_base + elem, 32);
+                }
+#pragma unroll
+                for (int vdt = 0; vdt < ValueTiles; ++vdt) {
+#pragma unroll
+                  for (int elem = 0; elem < 8; ++elem) {
+                    out_frag[qg][vdt][elem] *= alpha_rows[elem];
+                  }
+                }
+              }
+
+              float local_sum = 0.0f;
+#pragma unroll
+              for (int sc = 0; sc < StreamCols; ++sc) {
+                const int col_tile = stream_col + sc;
+                if constexpr (UseActiveCausalColSkip) {
+                  const int active_cols = qg == 0 ? active_cols0 : active_cols1;
+                  if (col_tile >= active_cols) {
+                    continue;
+                  }
+                }
+                const int64_t k_col_start = kb_base + col_tile * BK;
+                bool fully_future =
+                    ApplyCausalMask && k_col_start >= q_start[qg] + RM;
+                if constexpr (UseActiveCausalColSkip) {
+                  fully_future = false;
+                }
+                const float8_vec scores = score_cache_stream[qg][sc];
+                float8_vec prob_values;
+#pragma unroll
+                for (int elem = 0; elem < 8; ++elem) {
+                  float prob = 0.0f;
+                  if (!fully_future) {
+                    prob = fast_exp2(scores[elem] - m[qg] + kFp8SoftmaxOffset);
+                    local_sum += prob;
+                  }
+                  prob_values[elem] = prob;
+                }
+                prob_cache_stream[qg][sc] = make_p_fp8_regs_from_tqk_prob_regs(
+                    prob_values, lane);
+              }
+              l[qg] += local_sum + __shfl_xor(local_sum, 16, 32);
+            }
+
+#pragma unroll
+            for (int sc = 0; sc < StreamCols; ++sc) {
+              const int col_tile = stream_col + sc;
+              if constexpr (UseActiveCausalColSkip) {
+                if (col_tile >= active_cols_any) {
+                  continue;
+                }
+              }
+              const int64_t k_col_start = kb_base + col_tile * BK;
+              bool fully_future[QGroups];
+              bool skip_all = true;
+#pragma unroll
+              for (int qg = 0; qg < QGroups; ++qg) {
+                if constexpr (UseActiveCausalColSkip) {
+                  const int active_cols = qg == 0 ? active_cols0 : active_cols1;
+                  fully_future[qg] = col_tile >= active_cols;
+                } else {
+                  fully_future[qg] =
+                      ApplyCausalMask && k_col_start >= q_start[qg] + RM;
+                }
+                skip_all = skip_all && fully_future[qg];
+              }
+              if (skip_all) {
+                continue;
+              }
+#pragma unroll
+              for (int vdt = 0; vdt < ValueTiles; ++vdt) {
+                const int dt = ValueTileBase + vdt;
+                i32x2_vec v_regs;
+                if constexpr (UsePrepackedLaneMajorValue) {
+                  v_regs = make_v_fp8_regs_from_lane_major_global<DTiles>(
+                      v, v_head_base, kb_base, col_tile, dt, lane);
+                } else if constexpr (PackedTransposedValue) {
+                  v_regs = make_v_fp8_regs_from_transposed_shared<SharedValueStrideT>(
+                      &v_tile_t[0][0], col_tile, dt, lane);
+                } else {
+                  v_regs = make_v_fp8_regs_from_transposed_shared<SharedValueStride>(
+                      &v_tile[0][0], col_tile, dt, lane);
+                }
+#pragma unroll
+                for (int qg = 0; qg < QGroups; ++qg) {
+                  if (fully_future[qg]) {
+                    continue;
+                  }
+                  float8_vec acc;
+#pragma unroll
+                  for (int elem = 0; elem < 8; ++elem) {
+                    acc[elem] = out_frag[qg][vdt][elem];
+                  }
+                  acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                      prob_cache_stream[qg][sc], v_regs, acc);
+#pragma unroll
+                  for (int elem = 0; elem < 8; ++elem) {
+                    out_frag[qg][vdt][elem] = acc[elem];
+                  }
+                }
+              }
+            }
+          }
+        } else {
+        float8_vec score_cache[QGroups][ColTiles];
+        float local_max[QGroups];
+        float prepared_k_scale_tile = k_scale_tile;
+        if constexpr (!QuantizeKeyValue && BC <= 64) {
+          const int k_scale_idx = k_scale_col_per_warp(kb_base);
+          prepared_k_scale_tile =
+              k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+        }
+#pragma unroll
+        for (int qg = 0; qg < QGroups; ++qg) {
+          local_max[qg] = -FLT_MAX * 0.5f;
+        }
+#pragma unroll
+        for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+          if constexpr (UseActiveCausalColSkip) {
+            if (col_tile >= active_cols_any) {
+              continue;
+            }
+          }
+          const int64_t k_col_start = kb_base + col_tile * BK;
+          const bool skip_all =
+              ApplyCausalMask && k_col_start >= q_start[QGroups - 1] + RM;
+          if (skip_all) {
+#pragma unroll
+            for (int qg = 0; qg < QGroups; ++qg) {
+              float8_vec scores;
+#pragma unroll
+              for (int elem = 0; elem < 8; ++elem) {
+                scores[elem] = -FLT_MAX * 0.5f;
+              }
+              score_cache[qg][col_tile] = scores;
+            }
+            continue;
+          }
+          bool q0_fully_future =
+              ApplyCausalMask && k_col_start >= q_start[0] + RM;
+          bool q1_fully_future =
+              ApplyCausalMask && k_col_start >= q_start[1] + RM;
+          if constexpr (UseActiveCausalColSkip) {
+            q0_fully_future = col_tile >= active_cols0;
+            q1_fully_future = col_tile >= active_cols1;
+          }
+          float k_scale_local = k_scale_tile;
+          if constexpr (!QuantizeKeyValue && BC <= 64) {
+            k_scale_local = prepared_k_scale_tile;
+          } else if constexpr (!QuantizeKeyValue) {
+            const int k_scale_idx = k_scale_col_per_warp(k_col_start);
+            k_scale_local = k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+          }
+          i32x8_vec score_acc[QGroups];
+#pragma unroll
+          for (int qg = 0; qg < QGroups; ++qg) {
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              score_acc[qg][elem] = 0;
+            }
+          }
+#pragma unroll
+          for (int dt = 0; dt < DTiles; ++dt) {
+            i32x2_vec k_regs;
+            if constexpr (UsePrepackedLaneMajorK) {
+              k_regs = pack_k_i8_wmma_b_regs_from_lane_major_global<DTiles>(
+                  k, k_head_base, k_stride_n * 64, kb_base, col_tile, dt, lane);
+            } else {
+              k_regs = pack_k_i8_wmma_b_regs_from_shared<SharedHeadStride>(
+                  &k_tile[0][0], lane, col_tile, dt * BK);
+            }
+            if (!q0_fully_future) {
+              score_acc[0] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                  true, k_regs, true, q_regs[0][dt], score_acc[0], true);
+            }
+            if (!q1_fully_future) {
+              score_acc[1] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                  true, k_regs, true, q_regs[1][dt], score_acc[1], true);
+            }
+          }
+#pragma unroll
+          for (int qg = 0; qg < QGroups; ++qg) {
+            const float score_scale = qs[qg] * k_scale_local;
+            float8_vec scores;
+            const bool fully_future =
+                qg == 0 ? q0_fully_future : q1_fully_future;
+            if constexpr (UseActiveCausalColSkip) {
+              if (fully_future) {
+                continue;
+              }
+            }
+            if (fully_future) {
+#pragma unroll
+              for (int elem = 0; elem < 8; ++elem) {
+                scores[elem] = -FLT_MAX * 0.5f;
+              }
+            } else {
+#pragma unroll
+              for (int elem = 0; elem < 8; ++elem) {
+                scores[elem] = static_cast<float>(score_acc[qg][elem]) * score_scale;
+              }
+              if constexpr (ApplyCausalMask) {
+                const bool needs_causal_mask = k_col_start + BK > q_start[qg];
+                if (needs_causal_mask) {
+                  apply_tqk_causal_mask<true>(
+                      scores, static_cast<int>(q_start[qg]), static_cast<int>(kb_base), col_tile, lane);
+                }
+              }
+            }
+            if (k_col_start + BK > kv_len) {
+              apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
+            }
+            score_cache[qg][col_tile] = scores;
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              local_max[qg] = fmaxf(local_max[qg], scores[elem]);
+            }
+          }
+        }
+
+#pragma unroll
+        for (int qg = 0; qg < QGroups; ++qg) {
+          const float tile_max = fmaxf(local_max[qg], __shfl_xor(local_max[qg], 16, 32));
+          const float old_m = m[qg];
+          const float new_m = fmaxf(old_m, tile_max);
+          const bool has_previous_sum = l[qg] != 0.0f;
+          const float alpha = has_previous_sum ? fast_exp2(old_m - new_m) : 0.0f;
+          m[qg] = new_m;
+          l[qg] *= alpha;
+
+          if (has_previous_sum) {
+            float alpha_rows[8];
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              alpha_rows[elem] = __shfl(alpha, row_base + elem, 32);
+            }
+
+#pragma unroll
+            for (int vdt = 0; vdt < ValueTiles; ++vdt) {
+#pragma unroll
+              for (int elem = 0; elem < 8; ++elem) {
+                out_frag[qg][vdt][elem] *= alpha_rows[elem];
+              }
+            }
+          }
+
+          float local_sum = 0.0f;
+#pragma unroll
+          for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+            if constexpr (UseActiveCausalColSkip) {
+              const int active_cols = qg == 0 ? active_cols0 : active_cols1;
+              if (col_tile >= active_cols) {
+                continue;
+              }
+            }
+            const int64_t k_col_start = kb_base + col_tile * BK;
+            bool fully_future =
+                ApplyCausalMask && k_col_start >= q_start[qg] + RM;
+            if constexpr (UseActiveCausalColSkip) {
+              fully_future = false;
+            }
+            const float8_vec scores = score_cache[qg][col_tile];
+            float8_vec prob_values;
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              float prob = 0.0f;
+              if (!fully_future) {
+                prob = fast_exp2(scores[elem] - m[qg] + kFp8SoftmaxOffset);
+                local_sum += prob;
+              }
+              prob_values[elem] = prob;
+            }
+            prob_cache[qg][col_tile] = make_p_fp8_regs_from_tqk_prob_regs(prob_values, lane);
+          }
+          l[qg] += local_sum + __shfl_xor(local_sum, 16, 32);
+        }
+        }
+      } else {
+#pragma unroll
+      for (int qg = 0; qg < QGroups; ++qg) {
+          float8_vec score_cache[ColTiles];
+          float local_max = -FLT_MAX * 0.5f;
+#pragma unroll
+        for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+          const int64_t k_col_start = kb_base + col_tile * BK;
+          const bool fully_future =
+              ApplyCausalMask && k_col_start >= q_start[qg] + RM;
+          float8_vec scores;
+          if (fully_future) {
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              scores[elem] = -FLT_MAX * 0.5f;
+            }
+          } else {
+            float k_scale_local = k_scale_tile;
+            if constexpr (!QuantizeKeyValue) {
+              const int k_scale_idx = k_scale_col_per_warp(k_col_start);
+              k_scale_local = k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+            }
+            const float score_scale = qs[qg] * k_scale_local;
+            if constexpr (QuantizeQuery) {
+              scores = compute_tqk_score_regs_raw_kq<DTiles, SharedHeadStride>(
+                  &k_tile[0][0], q_regs[qg], lane, col_tile, score_scale);
+            } else {
+              scores =
+                  compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
+                      &k_tile[0][0], q_frag[qg], col_tile, score_scale);
+            }
+            if constexpr (ApplyCausalMask) {
+              const bool needs_causal_mask = k_col_start + BK > q_start[qg];
+              if (needs_causal_mask) {
+                apply_tqk_causal_mask<true>(
+                    scores, static_cast<int>(q_start[qg]), static_cast<int>(kb_base), col_tile, lane);
+              }
+            }
+          }
+          if (k_col_start + BK > kv_len) {
+            apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
+          }
+          score_cache[col_tile] = scores;
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            local_max = fmaxf(local_max, scores[elem]);
+          }
+        }
+        const float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
+        const float old_m = m[qg];
+        const float new_m = fmaxf(old_m, tile_max);
+        const float alpha = l[qg] == 0.0f ? 0.0f : fast_exp2(old_m - new_m);
+        m[qg] = new_m;
+        l[qg] *= alpha;
+
+        float alpha_rows[8];
+#pragma unroll
+        for (int elem = 0; elem < 8; ++elem) {
+          alpha_rows[elem] = __shfl(alpha, row_base + elem, 32);
+        }
+
+#pragma unroll
+        for (int vdt = 0; vdt < ValueTiles; ++vdt) {
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            out_frag[qg][vdt][elem] *= alpha_rows[elem];
+          }
+        }
+
+        float local_sum = 0.0f;
+#pragma unroll
+        for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+          const int64_t k_col_start = kb_base + col_tile * BK;
+          const bool fully_future =
+              ApplyCausalMask && k_col_start >= q_start[qg] + RM;
+          const float8_vec scores = score_cache[col_tile];
+          float8_vec prob_values;
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            float prob = 0.0f;
+            if (!fully_future) {
+              prob = fast_exp2(scores[elem] - m[qg] + kFp8SoftmaxOffset);
+              local_sum += prob;
+            }
+            prob_values[elem] = prob;
+          }
+          prob_cache[qg][col_tile] = make_p_fp8_regs_from_tqk_prob_regs(prob_values, lane);
+        }
+        l[qg] += local_sum + __shfl_xor(local_sum, 16, 32);
+      }
+      }
+
+      if constexpr (!UseStreamedFp8Pv) {
+#pragma unroll
+      for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+        if constexpr (UseActiveCausalColSkip) {
+          if (col_tile >= active_cols_any) {
+            continue;
+          }
+        }
+        const int64_t k_col_start = kb_base + col_tile * BK;
+        bool q0_fully_future =
+            ApplyCausalMask && k_col_start >= q_start[0] + RM;
+        bool q1_fully_future =
+            ApplyCausalMask && k_col_start >= q_start[1] + RM;
+        if constexpr (UseActiveCausalColSkip) {
+          q0_fully_future = col_tile >= active_cols0;
+          q1_fully_future = col_tile >= active_cols1;
+        }
+        if (q0_fully_future && q1_fully_future) {
+          continue;
+        }
+#pragma unroll
+        for (int vdt = 0; vdt < ValueTiles; ++vdt) {
+          const int dt = ValueTileBase + vdt;
+          i32x2_vec v_regs;
+          if constexpr (UsePrepackedLaneMajorValue) {
+            v_regs = make_v_fp8_regs_from_lane_major_global<DTiles>(
+                v, v_head_base, kb_base, col_tile, dt, lane);
+          } else if constexpr (ValueTransposed) {
+            if constexpr (PackedTransposedValue) {
+              v_regs = make_v_fp8_regs_from_transposed_shared<SharedValueStrideT>(
+                  &v_tile_t[0][0], col_tile, dt, lane);
+            } else {
+              v_regs = make_v_fp8_regs_from_transposed_shared<SharedValueStride>(
+                  &v_tile[0][0], col_tile, dt, lane);
+            }
+          } else {
+            v_regs = make_v_fp8_regs_from_shared<SharedHeadStride>(
+                &v_tile[0][0], col_tile, dt, lane);
+          }
+          float8_vec acc0;
+          float8_vec acc1;
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            acc0[elem] = out_frag[0][vdt][elem];
+            acc1[elem] = out_frag[1][vdt][elem];
+          }
+          if (!q0_fully_future) {
+            const i32x2_vec p_regs0 = prob_cache[0][col_tile];
+            acc0 = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                p_regs0, v_regs, acc0);
+          }
+          if (!q1_fully_future) {
+            const i32x2_vec p_regs1 = prob_cache[1][col_tile];
+            acc1 = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                p_regs1, v_regs, acc1);
+          }
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            out_frag[0][vdt][elem] = acc0[elem];
+            out_frag[1][vdt][elem] = acc1[elem];
+          }
+        }
+      }
+      }
+    } else {
+#pragma unroll
+      for (int qg = 0; qg < QGroups; ++qg) {
+        float8_vec score_cache[ColTiles];
+        float local_max = -FLT_MAX * 0.5f;
+#pragma unroll
+        for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+          const int64_t k_col_start = kb_base + col_tile * BK;
+          const bool fully_future =
+              ApplyCausalMask && k_col_start >= q_start[qg] + RM;
+          float8_vec scores;
+          if (fully_future) {
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              scores[elem] = -FLT_MAX * 0.5f;
+            }
+          } else {
+            float k_scale_local = k_scale_tile;
+            if constexpr (!QuantizeKeyValue) {
+              const int k_scale_idx = k_scale_col_per_warp(k_col_start);
+              k_scale_local = k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+            }
+            const float score_scale = qs[qg] * k_scale_local;
+            if constexpr (QuantizeQuery) {
+              scores = compute_tqk_score_regs_raw_kq<DTiles, SharedHeadStride>(
+                  &k_tile[0][0], q_regs[qg], lane, col_tile, score_scale);
+            } else {
+              scores =
+                  compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
+                      &k_tile[0][0], q_frag[qg], col_tile, score_scale);
+            }
+            if constexpr (ApplyCausalMask) {
+              const bool needs_causal_mask = k_col_start + BK > q_start[qg];
+              if (needs_causal_mask) {
+                apply_tqk_causal_mask<true>(
+                    scores, static_cast<int>(q_start[qg]), static_cast<int>(kb_base), col_tile, lane);
+              }
+            }
+          }
+          if (k_col_start + BK > kv_len) {
+            apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
+          }
+          score_cache[col_tile] = scores;
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            local_max = fmaxf(local_max, scores[elem]);
+          }
+        }
+        const float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
+        const float old_m = m[qg];
+        const float new_m = fmaxf(old_m, tile_max);
+        const float alpha = l[qg] == 0.0f ? 0.0f : fast_exp2(old_m - new_m);
+        m[qg] = new_m;
+        l[qg] *= alpha;
+
+        float alpha_rows[8];
+#pragma unroll
+        for (int elem = 0; elem < 8; ++elem) {
+          alpha_rows[elem] = __shfl(alpha, row_base + elem, 32);
+        }
+
+#pragma unroll
+        for (int vdt = 0; vdt < ValueTiles; ++vdt) {
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            out_frag[qg][vdt][elem] *= alpha_rows[elem];
+          }
+        }
+
+        float local_sum = 0.0f;
+#pragma unroll
+        for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
+          const int64_t k_col_start = kb_base + col_tile * BK;
+          const bool fully_future =
+              ApplyCausalMask && k_col_start >= q_start[qg] + RM;
+          if (fully_future) {
+            continue;
+          }
+          const float8_vec scores = score_cache[col_tile];
+          float8_vec prob_values;
+#pragma unroll
+          for (int elem = 0; elem < 8; ++elem) {
+            const float prob = fast_exp2(scores[elem] - m[qg] + kFp8SoftmaxOffset);
+            local_sum += prob;
+            prob_values[elem] = prob;
+          }
+
+          const i32x2_vec p_regs = make_p_fp8_regs_from_tqk_prob_regs(prob_values, lane);
+#pragma unroll
+          for (int vdt = 0; vdt < ValueTiles; ++vdt) {
+            const int dt = ValueTileBase + vdt;
+            i32x2_vec v_regs;
+            if constexpr (UsePrepackedLaneMajorValue) {
+              v_regs = make_v_fp8_regs_from_lane_major_global<DTiles>(
+                  v, v_head_base, kb_base, col_tile, dt, lane);
+            } else if constexpr (ValueTransposed) {
+              if constexpr (PackedTransposedValue) {
+                v_regs = make_v_fp8_regs_from_transposed_shared<SharedValueStrideT>(
+                    &v_tile_t[0][0], col_tile, dt, lane);
+              } else {
+                v_regs = make_v_fp8_regs_from_transposed_shared<SharedValueStride>(
+                    &v_tile[0][0], col_tile, dt, lane);
+              }
+            } else {
+              v_regs = make_v_fp8_regs_from_shared<SharedHeadStride>(
+                  &v_tile[0][0], col_tile, dt, lane);
+            }
+            float8_vec acc;
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              acc[elem] = out_frag[qg][vdt][elem];
+            }
+            const float8_vec pv_acc =
+                __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(p_regs, v_regs, acc);
+#pragma unroll
+            for (int elem = 0; elem < 8; ++elem) {
+              out_frag[qg][vdt][elem] = pv_acc[elem];
+            }
+          }
+        }
+        l[qg] += local_sum + __shfl_xor(local_sum, 16, 32);
+      }
+    }
+    if constexpr (UsesTileSharedMemory) {
+      __syncthreads();
+    }
+  };
+
+  if constexpr (IsCausal) {
+    const int64_t diag_base = (q_base / BC) * BC;
+    const int64_t prefix_limit = diag_base < kv_limit ? diag_base : kv_limit;
+#pragma unroll 2
+    for (int64_t kb_base = 0; kb_base < prefix_limit; kb_base += BC) {
+      process_kv_tile(kb_base, std::false_type{});
+    }
+#pragma unroll 2
+    for (int64_t kb_base = prefix_limit; kb_base < kv_limit; kb_base += BC) {
+      process_kv_tile(kb_base, std::true_type{});
+    }
+  } else {
+#pragma unroll 2
+    for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BC) {
+      process_kv_tile(kb_base, std::false_type{});
+    }
+  }
+
+#pragma unroll
+  for (int qg = 0; qg < QGroups; ++qg) {
+    float l_rows[8];
+#pragma unroll
+    for (int elem = 0; elem < 8; ++elem) {
+      l_rows[elem] = __shfl(l[qg], row_base + elem, 32);
+    }
+#pragma unroll
+    for (int vdt = 0; vdt < ValueTiles; ++vdt) {
+      const int d = (ValueTileBase + vdt) * BK + col;
+      const float value_scale = v_scale == nullptr ?
+          1.0f : v_scale[(b * num_kv_heads + hkv) * HeadDim + d];
+#pragma unroll
+      for (int pair = 0; pair < PackedRows; ++pair) {
+        const int elem = pair * 2;
+        const int64_t q_idx0 = q_start[qg] + row_base + elem;
+        const int64_t q_idx1 = q_idx0 + 1;
+        const float l_sum0 = l_rows[elem];
+        const float l_sum1 = l_rows[elem + 1];
+        const float value0 = l_sum0 == 0.0f ?
+            0.0f : (out_frag[qg][vdt][elem] / l_sum0) * value_scale;
+        const float value1 = l_sum1 == 0.0f ?
+            0.0f : (out_frag[qg][vdt][elem + 1] / l_sum1) * value_scale;
+        store_output_value(output, qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hq, q_idx0, d, o_stride_b, o_stride_n, o_stride_h), value0);
+        store_output_value(output, qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hq, q_idx1, d, o_stride_b, o_stride_n, o_stride_h), value1);
+      }
+    }
+  }
+}
+
+template <typename T,
+          typename OutT,
+          bool ToFp8,
+          int HeadDim,
+          int Threads = 256,
+          bool TransposeValue = true,
+          bool PrepareQuery = true,
+          bool PrepackF16VLane = false,
+          bool PrepackF16KLane = false,
+          bool PrepackFp8Lane = false,
+          bool FullGroupsNoTail = false,
+          int StaticQLen = 0,
+          int StaticKvLen = 0>
+__global__ void prepare_qkv_hnd_kernel(
+    const T* __restrict__ query,
+    const T* __restrict__ key,
+    const T* __restrict__ value,
+    int8_t* __restrict__ query_out,
+    int8_t* __restrict__ key_out,
+    float* __restrict__ query_scale,
+    float* __restrict__ key_scale,
+    OutT* __restrict__ value_out,
+    const int64_t batch,
+    const int64_t q_heads,
+    const int64_t kv_heads,
+    const int64_t q_len,
+    const int64_t kv_len,
+    const int q_groups,
+    const int k_groups,
+    const bool fuse_self_qkv) {
+  constexpr int PackElems = 8;
+  constexpr int KRows = 64;
+  constexpr int QRows = 32;
+  constexpr int ValueStride = HeadDim + 16;
+  constexpr int LaneColTiles = KRows / 16;
+  constexpr int LaneDTiles = HeadDim / 16;
+  static_assert((HeadDim % PackElems) == 0, "native preparation packs eight elements");
+  static_assert(!PrepackF16VLane || (!ToFp8 && TransposeValue && HeadDim == 64),
+                "fp16 lane-major V prepack is specialized for transposed D64 fp16 values");
+  static_assert(!PrepackF16KLane || (!ToFp8 && HeadDim == 64),
+                "fp16 lane-major K prepack is specialized for D64 fp16/bf16 keys");
+  static_assert(!PrepackFp8Lane || (ToFp8 && TransposeValue && HeadDim == 64),
+                "fp8 lane-major K/V prepack is specialized for transposed D64 fp8 values");
+  static_assert(StaticQLen == 0 || (StaticQLen % (2 * QRows)) == 0,
+                "static QKV preparation Q length must cover full two-group Q tasks.");
+  static_assert(StaticKvLen == 0 || (StaticKvLen % KRows) == 0,
+                "static QKV preparation KV length must cover full K groups.");
+
+  __shared__ float shared_amax[2];
+  __shared__ float shared_pair_amax[2][32];
+  __shared__ OutT value_tile[PrepackFp8Lane ? 1 : KRows][PrepackFp8Lane ? 1 : ValueStride];
+  __shared__ int8_t key_tile[PrepackF16KLane ? KRows : 1][PrepackF16KLane ? ValueStride : 1];
+
+  const int task = blockIdx.x;
+  const int head = blockIdx.y;
+  const int b = blockIdx.z;
+  const int tid = threadIdx.x;
+  constexpr bool StaticFullQ = FullGroupsNoTail && StaticQLen != 0;
+  constexpr bool StaticFullKV = FullGroupsNoTail && StaticKvLen != 0;
+  constexpr int StaticQGroups = StaticQLen == 0 ? 0 : (StaticQLen / QRows);
+  constexpr int StaticQTaskGroups = StaticQLen == 0 ? 0 : ((StaticQGroups + 1) / 2);
+  constexpr int StaticKGroups = StaticKvLen == 0 ? 0 : (StaticKvLen / KRows);
+  const int effective_q_groups = StaticQLen == 0 ? q_groups : StaticQGroups;
+  const int effective_q_task_groups =
+      StaticQLen == 0 ? ((q_groups + 1) / 2) : StaticQTaskGroups;
+  const int effective_k_groups = StaticKvLen == 0 ? k_groups : StaticKGroups;
+  const int64_t effective_q_len = StaticQLen == 0 ? q_len : StaticQLen;
+  const int64_t effective_kv_len = StaticKvLen == 0 ? kv_len : StaticKvLen;
+
+  if constexpr (PrepareQuery) {
+  if (task < effective_q_task_groups) {
+    const int local_group_base = task * 2;
+    const int64_t base_row = static_cast<int64_t>(local_group_base) * QRows;
+    if (b >= batch || head >= q_heads ||
+        (!StaticFullQ && base_row >= effective_q_len)) {
+      return;
+    }
+
+    constexpr int packs = (QRows * HeadDim) / PackElems;
+    const bool has_q_group1 = StaticFullQ || ((local_group_base + 1) < effective_q_groups);
+    float local_amax0 = 0.0000001f;
+    float local_amax1 = 0.0000001f;
+    for (int pack = tid; pack < packs; pack += Threads) {
+      const int elem_base = pack * PackElems;
+      const int row = elem_base / HeadDim;
+      const int d = elem_base - row * HeadDim;
+      const int64_t seq0 = base_row + row;
+      if (StaticFullQ || seq0 < effective_q_len) {
+        const int64_t off =
+            ((static_cast<int64_t>(b) * q_heads + head) * effective_q_len + seq0) *
+                HeadDim + d;
+        const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
+        const T* values = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+        for (int i = 0; i < PackElems; ++i) {
+          local_amax0 = fmaxf(local_amax0, fabsf(value_to_float(values[i])));
+        }
+      }
+      if (has_q_group1) {
+        const int64_t seq1 = base_row + QRows + row;
+        if (StaticFullQ || seq1 < effective_q_len) {
+          const int64_t off =
+              ((static_cast<int64_t>(b) * q_heads + head) * effective_q_len + seq1) *
+                  HeadDim + d;
+          const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
+          const T* values = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+          for (int i = 0; i < PackElems; ++i) {
+            local_amax1 = fmaxf(local_amax1, fabsf(value_to_float(values[i])));
+          }
+        }
+      }
+    }
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+    local_amax0 = vllm::warpReduceMax(local_amax0);
+    local_amax1 = vllm::warpReduceMax(local_amax1);
+    if (lane == 0) {
+      shared_pair_amax[0][wid] = local_amax0;
+      shared_pair_amax[1][wid] = local_amax1;
+    }
+    __syncthreads();
+    const bool warp_lane_active = tid < (blockDim.x / 32);
+    local_amax0 = warp_lane_active ? shared_pair_amax[0][lane] : -1e20f;
+    local_amax1 = warp_lane_active ? shared_pair_amax[1][lane] : -1e20f;
+    local_amax0 = vllm::warpReduceMax(local_amax0);
+    local_amax1 = vllm::warpReduceMax(local_amax1);
+    if (tid == 0) {
+      shared_amax[0] = local_amax0;
+      query_scale[(static_cast<int64_t>(b) * q_heads + head) * effective_q_groups +
+                  local_group_base] = local_amax0 / 127.0f;
+      if (has_q_group1) {
+        shared_amax[1] = local_amax1;
+        query_scale[(static_cast<int64_t>(b) * q_heads + head) * effective_q_groups +
+                    local_group_base + 1] = local_amax1 / 127.0f;
+      }
+    }
+    __syncthreads();
+    const float inv_scale0 = 127.0f / shared_amax[0];
+    const float inv_scale1 = has_q_group1 ? (127.0f / shared_amax[1]) : 0.0f;
+
+    for (int pack = tid; pack < packs; pack += Threads) {
+      const int elem_base = pack * PackElems;
+      const int row = elem_base / HeadDim;
+      const int d = elem_base - row * HeadDim;
+      const int64_t seq0 = base_row + row;
+      if (StaticFullQ || seq0 < effective_q_len) {
+        const int64_t off =
+            ((static_cast<int64_t>(b) * q_heads + head) * effective_q_len + seq0) *
+                HeadDim + d;
+        const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
+        const T* values = reinterpret_cast<const T*>(&raw);
+        char4 out0;
+        char4 out1;
+        out0.x = float_to_int8_rn_gfx12(value_to_float(values[0]) * inv_scale0);
+        out0.y = float_to_int8_rn_gfx12(value_to_float(values[1]) * inv_scale0);
+        out0.z = float_to_int8_rn_gfx12(value_to_float(values[2]) * inv_scale0);
+        out0.w = float_to_int8_rn_gfx12(value_to_float(values[3]) * inv_scale0);
+        out1.x = float_to_int8_rn_gfx12(value_to_float(values[4]) * inv_scale0);
+        out1.y = float_to_int8_rn_gfx12(value_to_float(values[5]) * inv_scale0);
+        out1.z = float_to_int8_rn_gfx12(value_to_float(values[6]) * inv_scale0);
+        out1.w = float_to_int8_rn_gfx12(value_to_float(values[7]) * inv_scale0);
+        *reinterpret_cast<char4*>(query_out + off) = out0;
+        *reinterpret_cast<char4*>(query_out + off + 4) = out1;
+      }
+      if (has_q_group1) {
+        const int64_t seq1 = base_row + QRows + row;
+        if (StaticFullQ || seq1 < effective_q_len) {
+          const int64_t off =
+              ((static_cast<int64_t>(b) * q_heads + head) * effective_q_len + seq1) *
+                  HeadDim + d;
+          const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
+          const T* values = reinterpret_cast<const T*>(&raw);
+          char4 out0;
+          char4 out1;
+          out0.x = float_to_int8_rn_gfx12(value_to_float(values[0]) * inv_scale1);
+          out0.y = float_to_int8_rn_gfx12(value_to_float(values[1]) * inv_scale1);
+          out0.z = float_to_int8_rn_gfx12(value_to_float(values[2]) * inv_scale1);
+          out0.w = float_to_int8_rn_gfx12(value_to_float(values[3]) * inv_scale1);
+          out1.x = float_to_int8_rn_gfx12(value_to_float(values[4]) * inv_scale1);
+          out1.y = float_to_int8_rn_gfx12(value_to_float(values[5]) * inv_scale1);
+          out1.z = float_to_int8_rn_gfx12(value_to_float(values[6]) * inv_scale1);
+          out1.w = float_to_int8_rn_gfx12(value_to_float(values[7]) * inv_scale1);
+          *reinterpret_cast<char4*>(query_out + off) = out0;
+          *reinterpret_cast<char4*>(query_out + off + 4) = out1;
+        }
+      }
+    }
+    if (!fuse_self_qkv) {
+      return;
+    }
+  }
+  }
+
+  const int local_group =
+      PrepareQuery ? (fuse_self_qkv ? task : task - effective_q_task_groups) : task;
+  const int64_t base_row = static_cast<int64_t>(local_group) * KRows;
+  if (b >= batch || head >= kv_heads || local_group >= effective_k_groups ||
+      (!StaticFullKV && base_row >= effective_kv_len)) {
+    return;
+  }
+
+  constexpr int kv_packs = (KRows * HeadDim) / PackElems;
+  float local_amax = 0.0000001f;
+  for (int pack = tid; pack < kv_packs; pack += Threads) {
+    const int elem_base = pack * PackElems;
+    const int row = elem_base / HeadDim;
+    const int d = elem_base - row * HeadDim;
+    const int64_t seq = base_row + row;
+    if (StaticFullKV || seq < effective_kv_len) {
+      const int64_t off =
+          ((static_cast<int64_t>(b) * kv_heads + head) * effective_kv_len + seq) *
+              HeadDim + d;
+      const uint4 raw = *reinterpret_cast<const uint4*>(key + off);
+      const T* values = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+      for (int i = 0; i < PackElems; ++i) {
+        local_amax = fmaxf(local_amax, fabsf(value_to_float(values[i])));
+      }
+    }
+  }
+  const float block_amax = vllm::blockReduceMax(local_amax);
+  if (tid == 0) {
+    shared_amax[0] = block_amax;
+    key_scale[(static_cast<int64_t>(b) * kv_heads + head) * effective_k_groups +
+              local_group] = shared_amax[0] / 127.0f;
+  }
+  __syncthreads();
+  const float inv_scale = 127.0f / shared_amax[0];
+
+  for (int pack = tid; pack < kv_packs; pack += Threads) {
+    const int elem_base = pack * PackElems;
+    const int row = elem_base / HeadDim;
+    const int d = elem_base - row * HeadDim;
+    const int64_t seq = base_row + row;
+    if (StaticFullKV || seq < effective_kv_len) {
+      const int64_t off =
+          ((static_cast<int64_t>(b) * kv_heads + head) * effective_kv_len + seq) *
+              HeadDim + d;
+      const uint4 raw_k = *reinterpret_cast<const uint4*>(key + off);
+      const uint4 raw_v = *reinterpret_cast<const uint4*>(value + off);
+      const T* k_values = reinterpret_cast<const T*>(&raw_k);
+      const T* v_values = reinterpret_cast<const T*>(&raw_v);
+      char4 out0;
+      char4 out1;
+      out0.x = float_to_int8_rn_gfx12(value_to_float(k_values[0]) * inv_scale);
+      out0.y = float_to_int8_rn_gfx12(value_to_float(k_values[1]) * inv_scale);
+      out0.z = float_to_int8_rn_gfx12(value_to_float(k_values[2]) * inv_scale);
+      out0.w = float_to_int8_rn_gfx12(value_to_float(k_values[3]) * inv_scale);
+      out1.x = float_to_int8_rn_gfx12(value_to_float(k_values[4]) * inv_scale);
+      out1.y = float_to_int8_rn_gfx12(value_to_float(k_values[5]) * inv_scale);
+      out1.z = float_to_int8_rn_gfx12(value_to_float(k_values[6]) * inv_scale);
+      out1.w = float_to_int8_rn_gfx12(value_to_float(k_values[7]) * inv_scale);
+      if constexpr (PrepackFp8Lane) {
+        const int row_in_group = row & 63;
+        const int col_tile = row_in_group >> 4;
+        const int col = row_in_group & 15;
+        const int d_tile = d >> 4;
+        const int lane_out = col | (((d & 8) != 0) ? 16 : 0);
+        const int64_t lane_off =
+            ((((static_cast<int64_t>(b) * kv_heads + head) * k_groups + local_group) *
+              LaneColTiles + col_tile) * LaneDTiles + d_tile) * 32 * 8 +
+            static_cast<int64_t>(lane_out) * 8;
+        uint2 packed;
+        packed.x = *reinterpret_cast<const uint32_t*>(&out0);
+        packed.y = *reinterpret_cast<const uint32_t*>(&out1);
+        *reinterpret_cast<uint2*>(key_out + lane_off) = packed;
+      } else if constexpr (PrepackF16KLane) {
+        *reinterpret_cast<char4*>(&key_tile[row][d]) = out0;
+        *reinterpret_cast<char4*>(&key_tile[row][d + 4]) = out1;
+      } else {
+        *reinterpret_cast<char4*>(key_out + off) = out0;
+        *reinterpret_cast<char4*>(key_out + off + 4) = out1;
+      }
+      if constexpr (ToFp8) {
+        const uint32_t v_pack0 = static_cast<uint32_t>(pack_f32x4_to_ocp_fp8(
+            value_to_float(v_values[0]), value_to_float(v_values[1]),
+            value_to_float(v_values[2]), value_to_float(v_values[3])));
+        const uint32_t v_pack1 = static_cast<uint32_t>(pack_f32x4_to_ocp_fp8(
+            value_to_float(v_values[4]), value_to_float(v_values[5]),
+            value_to_float(v_values[6]), value_to_float(v_values[7])));
+        if constexpr (PrepackFp8Lane) {
+          const int row_in_group = row & 63;
+          const int col_tile = row_in_group >> 4;
+          const int row_local = row_in_group & 15;
+          const int lane_hi = row_local >> 3;
+          const int gpr = (row_local & 7) >> 2;
+          const int byte = row_local & 3;
+          uint8_t* value_bytes = reinterpret_cast<uint8_t*>(value_out);
+#pragma unroll
+          for (int elem = 0; elem < PackElems; ++elem) {
+        const int d_elem = d + elem;
+        const int d_tile = d_elem >> 4;
+        const int lane_local = (d_elem & 15) | (lane_hi << 4);
+        const int64_t byte_off =
+            (((((static_cast<int64_t>(b) * kv_heads + head) * k_groups +
+                    local_group) * LaneColTiles + col_tile) * LaneDTiles + d_tile) * 32 +
+                 lane_local) * 8 +
+                gpr * 4 + byte;
+            const uint32_t packed = elem < 4 ? v_pack0 : v_pack1;
+            value_bytes[byte_off] =
+                static_cast<uint8_t>((packed >> (8 * (elem & 3))) & 0xff);
+          }
+        } else if constexpr (TransposeValue) {
+          *reinterpret_cast<uint32_t*>(&value_tile[row][d]) = v_pack0;
+          *reinterpret_cast<uint32_t*>(&value_tile[row][d + 4]) = v_pack1;
+        } else {
+          *reinterpret_cast<uint32_t*>(value_out + off) = v_pack0;
+          *reinterpret_cast<uint32_t*>(value_out + off + 4) = v_pack1;
+        }
+      } else {
+#pragma unroll
+        for (int i = 0; i < PackElems; ++i) {
+          if constexpr (std::is_same<T, __half>::value && std::is_same<OutT, __half>::value) {
+            value_tile[row][d + i] = v_values[i];
+          } else {
+            const float v = value_to_float(v_values[i]);
+            value_tile[row][d + i] = __float2half_rn(v);
+          }
+        }
+      }
+    }
+  }
+  if constexpr ((!ToFp8 || TransposeValue) && !PrepackFp8Lane) {
+    __syncthreads();
+
+    if constexpr (PrepackF16KLane) {
+      constexpr int ColTiles64 = KRows / 16;
+      constexpr int DTiles = HeadDim / 16;
+      constexpr int LaneMajorElems = ColTiles64 * DTiles * 32;
+      for (int idx = tid; idx < LaneMajorElems; idx += Threads) {
+        const int lane_local = idx & 31;
+        const int d_tile = (idx >> 5) % DTiles;
+        const int col_tile = idx / (DTiles * 32);
+        const int col = lane_local & 15;
+        const int k_base = 8 * (lane_local >> 4);
+        const int row = col_tile * 16 + pv_k_order_for_acc_row(col);
+        const int d = d_tile * 16 + k_base;
+        const int64_t out_off =
+            ((((static_cast<int64_t>(b) * kv_heads + head) * k_groups + local_group) *
+              ColTiles64 * DTiles * 32) + idx) * 8;
+        uint2 packed;
+        packed.x = *reinterpret_cast<const uint32_t*>(&key_tile[row][d]);
+        packed.y = *reinterpret_cast<const uint32_t*>(&key_tile[row][d + 4]);
+        *reinterpret_cast<uint2*>(key_out + out_off) = packed;
+      }
+    }
+
+    if constexpr (PrepackF16VLane) {
+      constexpr int ColTiles64 = KRows / 16;
+      constexpr int DTiles = HeadDim / 16;
+      constexpr int LaneMajorElems = ColTiles64 * DTiles * 32;
+      for (int idx = tid; idx < LaneMajorElems; idx += Threads) {
+        const int lane_local = idx & 31;
+        const int d_tile = (idx >> 5) % DTiles;
+        const int col_tile = idx / (DTiles * 32);
+        const int d = d_tile * 16 + (lane_local & 15);
+        const int high_half = (lane_local >> 4) & 1;
+        const int n0 = col_tile * 16 + high_half * 4;
+        const int n1 = col_tile * 16 + 8 + high_half * 4;
+        uint4 packed;
+        __half* vals = reinterpret_cast<__half*>(&packed);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+        const int row = n0 + i;
+          vals[i] = (StaticFullKV || (base_row + row) < effective_kv_len) ?
+              value_tile[row][d] : __float2half_rn(0.0f);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int row = n1 + i;
+          vals[4 + i] =
+              (StaticFullKV || (base_row + row) < effective_kv_len) ?
+              value_tile[row][d] : __float2half_rn(0.0f);
+        }
+        const int64_t out_off =
+            ((((static_cast<int64_t>(b) * kv_heads + head) * k_groups + local_group) *
+              ColTiles64 * DTiles * 32) + idx) * 8;
+        *reinterpret_cast<uint4*>(value_out + out_off) = packed;
+      }
+    } else if constexpr (ToFp8) {
+      constexpr int StoreRows = 16;
+      constexpr int RowGroups = KRows / StoreRows;
+      for (int linear = tid; linear < HeadDim * RowGroups; linear += Threads) {
+        const int d = linear / RowGroups;
+        const int row = (linear - d * RowGroups) * StoreRows;
+        const int64_t seq = base_row + row;
+        if (StaticFullKV || seq + StoreRows - 1 < effective_kv_len) {
+          uint4 packed;
+          packed.x = static_cast<uint32_t>(value_tile[row + 0][d]) |
+              (static_cast<uint32_t>(value_tile[row + 1][d]) << 8) |
+              (static_cast<uint32_t>(value_tile[row + 2][d]) << 16) |
+              (static_cast<uint32_t>(value_tile[row + 3][d]) << 24);
+          packed.y = static_cast<uint32_t>(value_tile[row + 4][d]) |
+              (static_cast<uint32_t>(value_tile[row + 5][d]) << 8) |
+              (static_cast<uint32_t>(value_tile[row + 6][d]) << 16) |
+              (static_cast<uint32_t>(value_tile[row + 7][d]) << 24);
+          packed.z = static_cast<uint32_t>(value_tile[row + 8][d]) |
+              (static_cast<uint32_t>(value_tile[row + 9][d]) << 8) |
+              (static_cast<uint32_t>(value_tile[row + 10][d]) << 16) |
+              (static_cast<uint32_t>(value_tile[row + 11][d]) << 24);
+          packed.w = static_cast<uint32_t>(value_tile[row + 12][d]) |
+              (static_cast<uint32_t>(value_tile[row + 13][d]) << 8) |
+              (static_cast<uint32_t>(value_tile[row + 14][d]) << 16) |
+              (static_cast<uint32_t>(value_tile[row + 15][d]) << 24);
+          const int64_t out_off =
+              ((static_cast<int64_t>(b) * kv_heads + head) * HeadDim + d) *
+                  effective_kv_len + seq;
+          *reinterpret_cast<uint4*>(value_out + out_off) = packed;
+        } else {
+#pragma unroll
+          for (int i = 0; i < StoreRows; ++i) {
+            const int64_t tail_seq = seq + i;
+            if (tail_seq < effective_kv_len) {
+              const int64_t out_off =
+                  ((static_cast<int64_t>(b) * kv_heads + head) * HeadDim + d) *
+                      effective_kv_len +
+                  tail_seq;
+              value_out[out_off] = value_tile[row + i][d];
+            }
+          }
+        }
+      }
+    } else {
+      constexpr int StoreRows = 8;
+      constexpr int RowGroups = KRows / StoreRows;
+      for (int linear = tid; linear < HeadDim * RowGroups; linear += Threads) {
+        const int d = linear / RowGroups;
+        const int row = (linear - d * RowGroups) * StoreRows;
+        const int64_t seq = base_row + row;
+        const int64_t out_off =
+            ((static_cast<int64_t>(b) * kv_heads + head) * HeadDim + d) *
+                effective_kv_len + seq;
+        if (StaticFullKV || seq + StoreRows - 1 < effective_kv_len) {
+          uint4 packed;
+          __half* vals = reinterpret_cast<__half*>(&packed);
+#pragma unroll
+          for (int i = 0; i < StoreRows; ++i) {
+            vals[i] = value_tile[row + i][d];
+          }
+          *reinterpret_cast<uint4*>(value_out + out_off) = packed;
+        } else {
+#pragma unroll
+          for (int i = 0; i < StoreRows; ++i) {
+            const int64_t tail_seq = seq + i;
+            if (tail_seq < effective_kv_len) {
+              value_out[out_off + i] = value_tile[row + i][d];
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+template <typename T,
+          int GroupsPerBlock,
+          bool TransposedValueStaging = false,
+          bool LaneMajorKV = false,
+          int HeadDim = 64,
+          bool CacheKeyInShared = false,
+          bool LaneMajorKOnly = false,
+          bool LaneMajorVOnly = false,
+          bool FullGroupsNoTail = false,
+          int PrepThreads = 256,
+          int StaticKvLen = 0>
+__global__ void prepare_kv_hnd_fp8_kernel(
+    const T* __restrict__ key,
+    const T* __restrict__ value,
+    int8_t* __restrict__ key_out,
+    float* __restrict__ key_scale,
+    uint8_t* __restrict__ value_out,
+    const int64_t batch,
+    const int64_t kv_heads,
+    const int64_t kv_len,
+    const int k_groups) {
+  constexpr int PackElems = 8;
+  constexpr int GroupRows = 64;
+  constexpr int KRows = GroupRows * GroupsPerBlock;
+  constexpr int Threads = PrepThreads;
+  constexpr int ValueStride = HeadDim + 16;
+  constexpr int StoreRows = 16;
+  constexpr int RowGroups = KRows / StoreRows;
+  constexpr int ValueRowGroups4 = KRows / 4;
+  constexpr int ValueStride32 = ValueRowGroups4 + 4;
+  constexpr int LaneColTiles = GroupRows / 16;
+  constexpr int LaneDTiles = HeadDim / 16;
+  constexpr int Packs = (KRows * HeadDim) / PackElems;
+  constexpr bool LaneMajorK = LaneMajorKV || LaneMajorKOnly;
+  constexpr bool LaneMajorV = LaneMajorKV || LaneMajorVOnly;
+  static_assert(HeadDim == 64 || HeadDim == 128,
+                "fp8 KV preparation supports D64/D128.");
+  static_assert(GroupsPerBlock == 1 || GroupsPerBlock == 2 || GroupsPerBlock == 4,
+                "fp8 KV preparation supports 1, 2, or 4 scale groups per CTA.");
+  static_assert(PrepThreads == 128 || PrepThreads == 256 || PrepThreads == 512,
+                "fp8 KV preparation supports 128, 256, or 512 threads.");
+  static_assert(!CacheKeyInShared || GroupsPerBlock == 1,
+                "cached-key fp8 KV preparation is specialized for one scale group per CTA.");
+  static_assert(!LaneMajorKOnly || ((HeadDim == 64 || HeadDim == 128) && !LaneMajorKV),
+                "K-only lane-major fp8 preparation is specialized for D64/D128.");
+  static_assert(!LaneMajorVOnly ||
+                    ((HeadDim == 64 || HeadDim == 128) &&
+                     !LaneMajorKV && !TransposedValueStaging),
+                "V-only lane-major fp8 preparation is specialized for D64/D128.");
+  static_assert(!FullGroupsNoTail || GroupsPerBlock == 1,
+                "no-tail fp8 KV preparation is specialized for one scale group per CTA.");
+  static_assert(StaticKvLen == 0 || (StaticKvLen % GroupRows) == 0,
+                "static fp8 KV preparation length must be a whole scale group.");
+
+  __shared__ float shared_amax[GroupsPerBlock];
+  __shared__ float shared_pair_amax[GroupsPerBlock][32];
+  __shared__ uint4 key_cache[CacheKeyInShared ? Packs : 1];
+  __shared__ uint8_t value_tile[LaneMajorV ? 1 : (TransposedValueStaging ? 1 : KRows)]
+                               [LaneMajorV ? 1 : ValueStride];
+  __shared__ uint32_t value_tile_t[LaneMajorV ? 1 : (TransposedValueStaging ? HeadDim : 1)]
+                                  [LaneMajorV ? 1 : (TransposedValueStaging ? ValueStride32 : 1)];
+
+  const int block_group = blockIdx.x;
+  const int head = blockIdx.y;
+  const int b = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int wid = tid >> 5;
+  const int group_base = block_group * GroupsPerBlock;
+  constexpr int StaticKGroups = StaticKvLen == 0 ? 0 : (StaticKvLen / GroupRows);
+  const int effective_k_groups = StaticKvLen == 0 ? k_groups : StaticKGroups;
+  const int64_t effective_kv_len = StaticKvLen == 0 ? kv_len : StaticKvLen;
+  const int64_t head_seq_base =
+      (static_cast<int64_t>(b) * kv_heads + head) * effective_kv_len;
+  const int64_t transposed_value_head_base =
+      (static_cast<int64_t>(b) * kv_heads + head) * HeadDim * effective_kv_len;
+  const int64_t scale_head_base =
+      (static_cast<int64_t>(b) * kv_heads + head) * effective_k_groups;
+  const int64_t base_row = static_cast<int64_t>(group_base) * GroupRows;
+  if (b >= batch || head >= kv_heads || group_base >= effective_k_groups ||
+      base_row >= effective_kv_len) {
+    return;
+  }
+
+  float local_amax[GroupsPerBlock];
+#pragma unroll
+  for (int group = 0; group < GroupsPerBlock; ++group) {
+    local_amax[group] = 0.0000001f;
+  }
+  for (int pack = tid; pack < Packs; pack += Threads) {
+    const int elem_base = pack * PackElems;
+    const int row = elem_base / HeadDim;
+    const int d = elem_base - row * HeadDim;
+    const int64_t seq = base_row + row;
+    if (FullGroupsNoTail || seq < effective_kv_len) {
+      const int64_t off = (head_seq_base + seq) * HeadDim + d;
+      const uint4 raw = *reinterpret_cast<const uint4*>(key + off);
+      if constexpr (CacheKeyInShared) {
+        key_cache[pack] = raw;
+      }
+      const T* values = reinterpret_cast<const T*>(&raw);
+      float pack_amax = 0.0000001f;
+#pragma unroll
+      for (int i = 0; i < PackElems; ++i) {
+        pack_amax = fmaxf(pack_amax, fabsf(value_to_float(values[i])));
+      }
+      const int group = row >> 6;
+      local_amax[group] = fmaxf(local_amax[group], pack_amax);
+    }
+  }
+
+#pragma unroll
+  for (int group = 0; group < GroupsPerBlock; ++group) {
+    local_amax[group] = vllm::warpReduceMax(local_amax[group]);
+    if (lane == 0) {
+      shared_pair_amax[group][wid] = local_amax[group];
+    }
+  }
+  __syncthreads();
+  const bool warp_lane_active = tid < (blockDim.x / 32);
+#pragma unroll
+  for (int group = 0; group < GroupsPerBlock; ++group) {
+    float group_amax = warp_lane_active ? shared_pair_amax[group][lane] : -1e20f;
+    group_amax = vllm::warpReduceMax(group_amax);
+    if (tid == 0) {
+      shared_amax[group] = group_amax;
+      if (FullGroupsNoTail || group_base + group < effective_k_groups) {
+        key_scale[scale_head_base + group_base + group] = group_amax / 127.0f;
+      }
+    }
+  }
+  __syncthreads();
+  float inv_scales[GroupsPerBlock];
+#pragma unroll
+  for (int group = 0; group < GroupsPerBlock; ++group) {
+    inv_scales[group] =
+        (FullGroupsNoTail || (group_base + group) < effective_k_groups) ?
+        (127.0f / shared_amax[group]) : 0.0f;
+  }
+
+  for (int pack = tid; pack < Packs; pack += Threads) {
+    const int elem_base = pack * PackElems;
+    const int row = elem_base / HeadDim;
+    const int d = elem_base - row * HeadDim;
+    const int64_t seq = base_row + row;
+    if (FullGroupsNoTail || seq < effective_kv_len) {
+      const int64_t off = (head_seq_base + seq) * HeadDim + d;
+      const uint4 raw_k = CacheKeyInShared ? key_cache[pack] :
+          *reinterpret_cast<const uint4*>(key + off);
+      const T* k_values = reinterpret_cast<const T*>(&raw_k);
+      const float inv_scale = inv_scales[row >> 6];
+      char4 out0;
+      char4 out1;
+      out0.x = float_to_int8_rn_gfx12(value_to_float(k_values[0]) * inv_scale);
+      out0.y = float_to_int8_rn_gfx12(value_to_float(k_values[1]) * inv_scale);
+      out0.z = float_to_int8_rn_gfx12(value_to_float(k_values[2]) * inv_scale);
+      out0.w = float_to_int8_rn_gfx12(value_to_float(k_values[3]) * inv_scale);
+      out1.x = float_to_int8_rn_gfx12(value_to_float(k_values[4]) * inv_scale);
+      out1.y = float_to_int8_rn_gfx12(value_to_float(k_values[5]) * inv_scale);
+      out1.z = float_to_int8_rn_gfx12(value_to_float(k_values[6]) * inv_scale);
+      out1.w = float_to_int8_rn_gfx12(value_to_float(k_values[7]) * inv_scale);
+      if constexpr (LaneMajorK) {
+        const int group = row >> 6;
+        const int row_in_group = row & 63;
+        const int col_tile = row_in_group >> 4;
+        const int col = row_in_group & 15;
+        const int d_tile = d >> 4;
+        const int lane_out = col | (((d & 8) != 0) ? 16 : 0);
+        const int64_t lane_off =
+            ((((static_cast<int64_t>(b) * kv_heads + head) * effective_k_groups +
+               (group_base + group)) * LaneColTiles + col_tile) * LaneDTiles + d_tile) *
+                32 * 8 +
+            static_cast<int64_t>(lane_out) * 8;
+        uint2 packed;
+        packed.x = *reinterpret_cast<const uint32_t*>(&out0);
+        packed.y = *reinterpret_cast<const uint32_t*>(&out1);
+        *reinterpret_cast<uint2*>(key_out + lane_off) = packed;
+      } else {
+        *reinterpret_cast<char4*>(key_out + off) = out0;
+        *reinterpret_cast<char4*>(key_out + off + 4) = out1;
+      }
+
+      if constexpr (!TransposedValueStaging && !LaneMajorV) {
+        const uint4 raw_v = *reinterpret_cast<const uint4*>(value + off);
+        const T* v_values = reinterpret_cast<const T*>(&raw_v);
+        const uint32_t v_pack0 = static_cast<uint32_t>(pack_f32x4_to_ocp_fp8(
+            value_to_float(v_values[0]), value_to_float(v_values[1]),
+            value_to_float(v_values[2]), value_to_float(v_values[3])));
+        const uint32_t v_pack1 = static_cast<uint32_t>(pack_f32x4_to_ocp_fp8(
+            value_to_float(v_values[4]), value_to_float(v_values[5]),
+            value_to_float(v_values[6]), value_to_float(v_values[7])));
+        *reinterpret_cast<uint32_t*>(&value_tile[row][d]) = v_pack0;
+        *reinterpret_cast<uint32_t*>(&value_tile[row][d + 4]) = v_pack1;
+      }
+    }
+  }
+
+  if constexpr (LaneMajorV) {
+    constexpr int LaneMajorValueRegs =
+        GroupsPerBlock * LaneColTiles * LaneDTiles * 32;
+    for (int idx = tid; idx < LaneMajorValueRegs; idx += Threads) {
+      const int lane_out = idx & 31;
+      const int tile = idx >> 5;
+      const int d_tile = tile % LaneDTiles;
+      const int col_tile = (tile / LaneDTiles) % LaneColTiles;
+      const int group = tile / (LaneDTiles * LaneColTiles);
+      if constexpr (!FullGroupsNoTail) {
+        if ((group_base + group) >= effective_k_groups) {
+          continue;
+        }
+      }
+      const int row_base =
+          group * GroupRows + col_tile * 16 + ((lane_out >> 4) << 3);
+      const int d = d_tile * 16 + (lane_out & 15);
+      float values[8];
+#pragma unroll
+      for (int elem = 0; elem < 8; ++elem) {
+        const int64_t seq = base_row + row_base + elem;
+        if (FullGroupsNoTail || seq < effective_kv_len) {
+          const int64_t off = (head_seq_base + seq) * HeadDim + d;
+          values[elem] = value_to_float(value[off]);
+        } else {
+          values[elem] = 0.0f;
+        }
+      }
+      const uint32_t packed0 = static_cast<uint32_t>(
+          pack_f32x4_to_ocp_fp8(values[0], values[1], values[2], values[3]));
+      const uint32_t packed1 = static_cast<uint32_t>(
+          pack_f32x4_to_ocp_fp8(values[4], values[5], values[6], values[7]));
+      const int64_t out_off =
+          (((((static_cast<int64_t>(b) * kv_heads + head) * effective_k_groups +
+              (group_base + group)) * LaneColTiles + col_tile) * LaneDTiles + d_tile) *
+               32 +
+           lane_out) *
+          8;
+      uint2 packed;
+      packed.x = packed0;
+      packed.y = packed1;
+      *reinterpret_cast<uint2*>(value_out + out_off) = packed;
+    }
+  } else if constexpr (TransposedValueStaging) {
+    for (int linear = tid; linear < HeadDim * ValueRowGroups4; linear += Threads) {
+      const int d = linear / ValueRowGroups4;
+      const int row4 = linear - d * ValueRowGroups4;
+      const int row = row4 * 4;
+      const int64_t seq = base_row + row;
+      float v0 = 0.0f;
+      float v1 = 0.0f;
+      float v2 = 0.0f;
+      float v3 = 0.0f;
+      if (FullGroupsNoTail || seq < effective_kv_len) {
+        const int64_t value_base = (head_seq_base + seq) * HeadDim + d;
+        v0 = value_to_float(value[value_base + 0 * HeadDim]);
+        if (FullGroupsNoTail || seq + 1 < effective_kv_len) {
+          v1 = value_to_float(value[value_base + 1 * HeadDim]);
+        }
+        if (FullGroupsNoTail || seq + 2 < effective_kv_len) {
+          v2 = value_to_float(value[value_base + 2 * HeadDim]);
+        }
+        if (FullGroupsNoTail || seq + 3 < effective_kv_len) {
+          v3 = value_to_float(value[value_base + 3 * HeadDim]);
+        }
+      }
+      value_tile_t[d][row4] = static_cast<uint32_t>(pack_f32x4_to_ocp_fp8(v0, v1, v2, v3));
+    }
+    __syncthreads();
+
+    for (int linear = tid; linear < HeadDim * RowGroups; linear += Threads) {
+      const int d = linear / RowGroups;
+      const int row = (linear - d * RowGroups) * StoreRows;
+      const int64_t seq = base_row + row;
+      const int row4 = row >> 2;
+      if constexpr (FullGroupsNoTail) {
+        uint4 packed;
+        packed.x = value_tile_t[d][row4 + 0];
+        packed.y = value_tile_t[d][row4 + 1];
+        packed.z = value_tile_t[d][row4 + 2];
+        packed.w = value_tile_t[d][row4 + 3];
+        const int64_t out_off = transposed_value_head_base +
+            static_cast<int64_t>(d) * effective_kv_len + seq;
+        *reinterpret_cast<uint4*>(value_out + out_off) = packed;
+      } else if (seq + StoreRows - 1 < effective_kv_len) {
+        uint4 packed;
+        packed.x = value_tile_t[d][row4 + 0];
+        packed.y = value_tile_t[d][row4 + 1];
+        packed.z = value_tile_t[d][row4 + 2];
+        packed.w = value_tile_t[d][row4 + 3];
+        const int64_t out_off = transposed_value_head_base +
+            static_cast<int64_t>(d) * effective_kv_len + seq;
+        *reinterpret_cast<uint4*>(value_out + out_off) = packed;
+      } else {
+#pragma unroll
+        for (int i = 0; i < StoreRows; ++i) {
+          const int64_t tail_seq = seq + i;
+          if (tail_seq < effective_kv_len) {
+            const uint32_t packed = value_tile_t[d][row4 + (i >> 2)];
+            const int64_t out_off = transposed_value_head_base +
+                static_cast<int64_t>(d) * effective_kv_len + tail_seq;
+            value_out[out_off] = static_cast<uint8_t>((packed >> (8 * (i & 3))) & 0xffu);
+          }
+        }
+      }
+    }
+  } else {
+    __syncthreads();
+
+    for (int linear = tid; linear < HeadDim * RowGroups; linear += Threads) {
+      const int d = linear / RowGroups;
+      const int row = (linear - d * RowGroups) * StoreRows;
+      const int64_t seq = base_row + row;
+      if constexpr (FullGroupsNoTail) {
+        uint4 packed;
+        packed.x = static_cast<uint32_t>(value_tile[row + 0][d]) |
+            (static_cast<uint32_t>(value_tile[row + 1][d]) << 8) |
+            (static_cast<uint32_t>(value_tile[row + 2][d]) << 16) |
+            (static_cast<uint32_t>(value_tile[row + 3][d]) << 24);
+        packed.y = static_cast<uint32_t>(value_tile[row + 4][d]) |
+            (static_cast<uint32_t>(value_tile[row + 5][d]) << 8) |
+            (static_cast<uint32_t>(value_tile[row + 6][d]) << 16) |
+            (static_cast<uint32_t>(value_tile[row + 7][d]) << 24);
+        packed.z = static_cast<uint32_t>(value_tile[row + 8][d]) |
+            (static_cast<uint32_t>(value_tile[row + 9][d]) << 8) |
+            (static_cast<uint32_t>(value_tile[row + 10][d]) << 16) |
+            (static_cast<uint32_t>(value_tile[row + 11][d]) << 24);
+        packed.w = static_cast<uint32_t>(value_tile[row + 12][d]) |
+            (static_cast<uint32_t>(value_tile[row + 13][d]) << 8) |
+            (static_cast<uint32_t>(value_tile[row + 14][d]) << 16) |
+            (static_cast<uint32_t>(value_tile[row + 15][d]) << 24);
+        const int64_t out_off = transposed_value_head_base +
+            static_cast<int64_t>(d) * effective_kv_len + seq;
+        *reinterpret_cast<uint4*>(value_out + out_off) = packed;
+      } else if (seq + StoreRows - 1 < effective_kv_len) {
+        uint4 packed;
+        packed.x = static_cast<uint32_t>(value_tile[row + 0][d]) |
+            (static_cast<uint32_t>(value_tile[row + 1][d]) << 8) |
+            (static_cast<uint32_t>(value_tile[row + 2][d]) << 16) |
+            (static_cast<uint32_t>(value_tile[row + 3][d]) << 24);
+        packed.y = static_cast<uint32_t>(value_tile[row + 4][d]) |
+            (static_cast<uint32_t>(value_tile[row + 5][d]) << 8) |
+            (static_cast<uint32_t>(value_tile[row + 6][d]) << 16) |
+            (static_cast<uint32_t>(value_tile[row + 7][d]) << 24);
+        packed.z = static_cast<uint32_t>(value_tile[row + 8][d]) |
+            (static_cast<uint32_t>(value_tile[row + 9][d]) << 8) |
+            (static_cast<uint32_t>(value_tile[row + 10][d]) << 16) |
+            (static_cast<uint32_t>(value_tile[row + 11][d]) << 24);
+        packed.w = static_cast<uint32_t>(value_tile[row + 12][d]) |
+            (static_cast<uint32_t>(value_tile[row + 13][d]) << 8) |
+            (static_cast<uint32_t>(value_tile[row + 14][d]) << 16) |
+            (static_cast<uint32_t>(value_tile[row + 15][d]) << 24);
+        const int64_t out_off = transposed_value_head_base +
+            static_cast<int64_t>(d) * effective_kv_len + seq;
+        *reinterpret_cast<uint4*>(value_out + out_off) = packed;
+      } else {
+#pragma unroll
+        for (int i = 0; i < StoreRows; ++i) {
+          const int64_t tail_seq = seq + i;
+          if (tail_seq < effective_kv_len) {
+            const int64_t out_off = transposed_value_head_base +
+                static_cast<int64_t>(d) * effective_kv_len + tail_seq;
+            value_out[out_off] = value_tile[row + i][d];
+          }
+        }
+      }
+    }
+  }
+}
+
+} // namespace
+
+Tensor transpose_value_fp8_hnd_gfx12(Tensor value) {
+  return transpose_value_hnd_gfx12<uint8_t, true>(value);
+}
+
+Tensor transpose_value_fp8_scaled_hnd_gfx12(Tensor value, Tensor value_scale) {
+  STD_TORCH_CHECK(value.is_cuda() && value_scale.is_cuda(),
+              "gfx12 scaled value transpose expects CUDA/HIP tensors");
+  STD_TORCH_CHECK(value.dim() == 4, "gfx12 scaled value transpose expects [B, H, S, D]");
+  STD_TORCH_CHECK(value.is_contiguous(), "gfx12 scaled value transpose expects contiguous HND input");
+  STD_TORCH_CHECK(value.scalar_type() == ScalarType::Half || value.scalar_type() == ScalarType::BFloat16,
+              "gfx12 scaled value transpose supports fp16/bf16 input");
+  STD_TORCH_CHECK(value_scale.scalar_type() == ScalarType::Float,
+              "gfx12 value scale must be fp32");
+  STD_TORCH_CHECK(value_scale.dim() == 3 && value_scale.is_contiguous(),
+              "gfx12 value scale expects contiguous [B, H, D]");
+  STD_TORCH_CHECK(value_scale.size(0) == value.size(0) &&
+                  value_scale.size(1) == value.size(1) &&
+                  value_scale.size(2) == value.size(3),
+              "gfx12 value scale shape must match [B, H, D]");
+
+  const int64_t batch = value.size(0);
+  const int64_t heads = value.size(1);
+  const int64_t seq_len = value.size(2);
+  const int64_t head_dim = value.size(3);
+  Tensor output = new_empty_like(value, {batch, heads, head_dim, seq_len}, ScalarType::Byte);
+
+  dim3 block(256);
+  dim3 grid((seq_len + 127) / 128, (head_dim + 15) / 16, batch * heads);
+  if (value.scalar_type() == ScalarType::Half) {
+    transpose_value_fp8_scaled_hnd_kernel<__half><<<grid, block, 0>>>(
+        reinterpret_cast<const __half*>(value.data_ptr()),
+        reinterpret_cast<const float*>(value_scale.data_ptr()),
+        reinterpret_cast<uint8_t*>(output.data_ptr()),
+        batch * heads, seq_len, head_dim);
+  } else {
+    transpose_value_fp8_scaled_hnd_kernel<__hip_bfloat16><<<grid, block, 0>>>(
+        reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+        reinterpret_cast<const float*>(value_scale.data_ptr()),
+        reinterpret_cast<uint8_t*>(output.data_ptr()),
+        batch * heads, seq_len, head_dim);
+  }
+  hip_kernel_launch_check();
+  return output;
+}
+
+Tensor transpose_value_f16_hnd_gfx12(Tensor value) {
+  return transpose_value_hnd_gfx12<__half, false>(value);
+}
+
+template <typename OutT, bool ToFp8>
+std::vector<Tensor> prepare_qkv_hnd_gfx12(
+    Tensor query,
+    Tensor key,
+    Tensor value) {
+  STD_TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda(),
+              "gfx12 QKV preparation expects CUDA/HIP tensors");
+  STD_TORCH_CHECK(query.dim() == 4 && key.dim() == 4 && value.dim() == 4,
+              "gfx12 QKV preparation expects [B, H, S, D]");
+  STD_TORCH_CHECK(query.is_contiguous() && key.is_contiguous() && value.is_contiguous(),
+              "gfx12 QKV preparation expects contiguous HND tensors");
+  STD_TORCH_CHECK(query.scalar_type() == key.scalar_type() && query.scalar_type() == value.scalar_type(),
+              "gfx12 QKV preparation expects matching input dtypes");
+  STD_TORCH_CHECK(query.scalar_type() == ScalarType::Half || query.scalar_type() == ScalarType::BFloat16,
+              "gfx12 QKV preparation supports fp16/bf16 input");
+  STD_TORCH_CHECK(query.size(0) == key.size(0) && query.size(0) == value.size(0),
+              "Q/K/V batch size mismatch");
+  STD_TORCH_CHECK(query.size(3) == key.size(3) && query.size(3) == value.size(3),
+              "Q/K/V head_dim mismatch");
+  STD_TORCH_CHECK(key.size(1) == value.size(1) && key.size(2) == value.size(2),
+              "K/V shape mismatch");
+
+  const int64_t batch = query.size(0);
+  const int64_t q_heads = query.size(1);
+  const int64_t q_len = query.size(2);
+  const int64_t kv_heads = key.size(1);
+  const int64_t kv_len = key.size(2);
+  const int64_t head_dim = query.size(3);
+  STD_TORCH_CHECK(head_dim == 16 || head_dim == 64 || head_dim == 128,
+              "gfx12 QKV preparation supports head_dim 16, 64, or 128");
+  STD_TORCH_CHECK((q_len % 64) == 0 && (kv_len % 64) == 0,
+              "gfx12 QKV preparation requires sequence lengths divisible by 64");
+
+  const int q_groups = static_cast<int>((q_len + 31) / 32);
+  const int q_task_groups = (q_groups + 1) / 2;
+  const int k_groups = static_cast<int>((kv_len + 63) / 64);
+  const bool fuse_self_qkv =
+      q_heads == kv_heads && q_len == kv_len && q_task_groups == k_groups;
+  Tensor query_out = new_empty_like(query, query.sizes(), ScalarType::Char);
+  Tensor key_out = new_empty_like(key, key.sizes(), ScalarType::Char);
+  Tensor query_scale =
+      new_empty_like(query, {batch, q_heads, q_groups}, ScalarType::Float);
+  Tensor key_scale =
+      new_empty_like(key, {batch, kv_heads, k_groups}, ScalarType::Float);
+  const ScalarType value_dtype = ToFp8 ? ScalarType::Byte : ScalarType::Half;
+  Tensor value_out = new_empty_like(value, {batch, kv_heads, head_dim, kv_len}, value_dtype);
+
+  constexpr int D64PrepThreads = 256;
+  const dim3 block(head_dim == 64 ? D64PrepThreads : 256);
+  const dim3 grid(fuse_self_qkv ? k_groups : (q_task_groups + k_groups),
+                  std::max(q_heads, kv_heads),
+                  batch);
+  const bool use_qkv_static_1024 =
+      ToFp8 && head_dim == 128 && q_len == 1024 && kv_len == 1024 &&
+      fuse_self_qkv;
+    if (query.scalar_type() == ScalarType::Half) {
+    if (head_dim == 16) {
+      prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 16, 256><<<grid, block, 0>>>(
+                         reinterpret_cast<const __half*>(query.data_ptr()),
+                         reinterpret_cast<const __half*>(key.data_ptr()),
+                         reinterpret_cast<const __half*>(value.data_ptr()),
+                         reinterpret_cast<int8_t*>(query_out.data_ptr()), reinterpret_cast<int8_t*>(key_out.data_ptr()),
+                         reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+                         reinterpret_cast<OutT*>(value_out.data_ptr()),
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                         fuse_self_qkv);
+    } else if (head_dim == 64) {
+      prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 64, D64PrepThreads><<<grid, block, 0>>>(
+                         reinterpret_cast<const __half*>(query.data_ptr()),
+                         reinterpret_cast<const __half*>(key.data_ptr()),
+                         reinterpret_cast<const __half*>(value.data_ptr()),
+                         reinterpret_cast<int8_t*>(query_out.data_ptr()), reinterpret_cast<int8_t*>(key_out.data_ptr()),
+                         reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+                         reinterpret_cast<OutT*>(value_out.data_ptr()),
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                         fuse_self_qkv);
+    } else {
+      if (use_qkv_static_1024) {
+        prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 128, 256,
+                                                   true, true, false, false, false,
+                                                   true, 1024, 1024><<<grid, block, 0>>>(
+                           reinterpret_cast<const __half*>(query.data_ptr()),
+                           reinterpret_cast<const __half*>(key.data_ptr()),
+                           reinterpret_cast<const __half*>(value.data_ptr()),
+                           reinterpret_cast<int8_t*>(query_out.data_ptr()), reinterpret_cast<int8_t*>(key_out.data_ptr()),
+                           reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+                           reinterpret_cast<OutT*>(value_out.data_ptr()),
+                           batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                           true);
+      } else {
+        prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 128><<<grid, block, 0>>>(
+                           reinterpret_cast<const __half*>(query.data_ptr()),
+                           reinterpret_cast<const __half*>(key.data_ptr()),
+                           reinterpret_cast<const __half*>(value.data_ptr()),
+                           reinterpret_cast<int8_t*>(query_out.data_ptr()), reinterpret_cast<int8_t*>(key_out.data_ptr()),
+                           reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+                           reinterpret_cast<OutT*>(value_out.data_ptr()),
+                           batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                           fuse_self_qkv);
+      }
+    }
+  } else {
+    if (head_dim == 16) {
+      prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 16, 256><<<grid, block, 0>>>(
+                         reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+                         reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                         reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                         reinterpret_cast<int8_t*>(query_out.data_ptr()), reinterpret_cast<int8_t*>(key_out.data_ptr()),
+                         reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+                         reinterpret_cast<OutT*>(value_out.data_ptr()),
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                         fuse_self_qkv);
+    } else if (head_dim == 64) {
+      prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 64, D64PrepThreads><<<grid, block, 0>>>(
+                         reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+                         reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                         reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                         reinterpret_cast<int8_t*>(query_out.data_ptr()), reinterpret_cast<int8_t*>(key_out.data_ptr()),
+                         reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+                         reinterpret_cast<OutT*>(value_out.data_ptr()),
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                         fuse_self_qkv);
+    } else {
+      if (use_qkv_static_1024) {
+        prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 128, 256,
+                                                   true, true, false, false, false,
+                                                   true, 1024, 1024><<<grid, block, 0>>>(
+                           reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+                           reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                           reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                           reinterpret_cast<int8_t*>(query_out.data_ptr()), reinterpret_cast<int8_t*>(key_out.data_ptr()),
+                           reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+                           reinterpret_cast<OutT*>(value_out.data_ptr()),
+                           batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                           true);
+      } else {
+        prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 128><<<grid, block, 0>>>(
+                           reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+                           reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                           reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                           reinterpret_cast<int8_t*>(query_out.data_ptr()), reinterpret_cast<int8_t*>(key_out.data_ptr()),
+                           reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+                           reinterpret_cast<OutT*>(value_out.data_ptr()),
+                           batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                           fuse_self_qkv);
+      }
+    }
+  }
+  hip_kernel_launch_check();
+  return {query_out, query_scale, key_out, key_scale, value_out};
+}
+
+template <typename OutT,
+          bool ToFp8,
+          bool TransposeValue = true,
+          bool PrepackF16KLane = false,
+          bool PrepackFp8Lane = false>
+std::vector<Tensor> prepare_qkv_hnd_packed_gfx12(
+    Tensor query,
+    Tensor key,
+    Tensor value) {
+  STD_TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda(),
+              "packed gfx12 QKV preparation expects CUDA/HIP tensors");
+  STD_TORCH_CHECK(query.dim() == 4 && key.dim() == 4 && value.dim() == 4,
+              "packed gfx12 QKV preparation expects [B, H, S, D]");
+  STD_TORCH_CHECK(query.is_contiguous() && key.is_contiguous() && value.is_contiguous(),
+              "packed gfx12 QKV preparation expects contiguous HND tensors");
+  STD_TORCH_CHECK(query.scalar_type() == key.scalar_type() && query.scalar_type() == value.scalar_type(),
+              "packed gfx12 QKV preparation expects matching input dtypes");
+
+  const int64_t batch = query.size(0);
+  const int64_t q_heads = query.size(1);
+  const int64_t q_len = query.size(2);
+  const int64_t kv_heads = key.size(1);
+  const int64_t kv_len = key.size(2);
+  const int64_t head_dim = query.size(3);
+  STD_TORCH_CHECK(head_dim == 16 || head_dim == 64 || head_dim == 128,
+              "packed gfx12 QKV preparation supports head_dim 16, 64, or 128");
+  STD_TORCH_CHECK(!PrepackF16KLane || (!ToFp8 && head_dim == 64),
+              "fp16 lane-major K prepack requires D64 fp16/bf16 keys");
+  STD_TORCH_CHECK(!PrepackFp8Lane || (ToFp8 && TransposeValue && head_dim == 64),
+              "fp8 lane-major K/V prepack requires transposed D64 fp8 values");
+  STD_TORCH_CHECK(!PrepackFp8Lane || ((key.size(2) % 64) == 0),
+              "fp8 lane-major K/V prepack requires kv_len divisible by 64");
+  STD_TORCH_CHECK(key.size(0) == batch && value.size(0) == batch,
+              "Q/K/V batch size mismatch");
+  STD_TORCH_CHECK(key.size(2) == kv_len && value.size(2) == kv_len && value.size(1) == kv_heads,
+              "K/V shape mismatch");
+  STD_TORCH_CHECK(key.size(3) == head_dim && value.size(3) == head_dim,
+              "Q/K/V head_dim mismatch");
+
+  const int q_groups = static_cast<int>((q_len + 31) / 32);
+  const int q_task_groups = (q_groups + 1) / 2;
+  const int k_groups = static_cast<int>((kv_len + 63) / 64);
+  const bool fuse_self_qkv =
+      q_heads == kv_heads && q_len == kv_len && q_task_groups == k_groups;
+
+  const int64_t q_numel = query.numel();
+  const int64_t k_numel = key.numel();
+  const int64_t v_numel = batch * kv_heads * head_dim * kv_len;
+  const int64_t q_scale_numel = batch * q_heads * q_groups;
+  const int64_t k_scale_numel = batch * kv_heads * k_groups;
+  const bool pack_scales_with_bytes = ToFp8;
+  const int64_t value_byte_offset = q_numel + k_numel;
+  const int64_t scale_byte_offset = value_byte_offset + (ToFp8 ? v_numel : 0);
+  Tensor byte_workspace =
+      new_empty_like(query, {scale_byte_offset +
+                    (pack_scales_with_bytes ? (q_scale_numel + k_scale_numel) * 4 : 0)}, ScalarType::Byte);
+  uint8_t* byte_ptr = reinterpret_cast<uint8_t*>(byte_workspace.data_ptr());
+  int8_t* query_ptr = reinterpret_cast<int8_t*>(byte_ptr);
+  int8_t* key_ptr = reinterpret_cast<int8_t*>(byte_ptr + q_numel);
+  Tensor value_out;
+  OutT* value_ptr = nullptr;
+  if constexpr (ToFp8) {
+    value_ptr = reinterpret_cast<OutT*>(byte_ptr + value_byte_offset);
+    if constexpr (TransposeValue) {
+      value_out = from_blob_like(value_ptr, {batch, kv_heads, head_dim, kv_len}, value, ScalarType::Byte);
+    } else {
+      value_out = from_blob_like(value_ptr, {batch, kv_heads, kv_len, head_dim}, value, ScalarType::Byte);
+    }
+  } else {
+    value_out = new_empty_like(value, {batch, kv_heads, head_dim, kv_len}, ScalarType::Half);
+    value_ptr = reinterpret_cast<OutT*>(value_out.data_ptr());
+  }
+
+  Tensor scale_workspace;
+  float* scale_ptr = nullptr;
+  if (pack_scales_with_bytes) {
+    scale_ptr = reinterpret_cast<float*>(byte_ptr + scale_byte_offset);
+  } else {
+    scale_workspace =
+        new_empty_like(query, {q_scale_numel + k_scale_numel}, ScalarType::Float);
+    scale_ptr = reinterpret_cast<float*>(scale_workspace.data_ptr());
+  }
+
+  Tensor query_out = from_blob_like(query_ptr, {batch, q_heads, q_len, head_dim}, query, ScalarType::Char);
+  Tensor key_out = from_blob_like(key_ptr, {batch, kv_heads, kv_len, head_dim}, key, ScalarType::Char);
+  Tensor query_scale = from_blob_like(scale_ptr, {batch, q_heads, q_groups}, query, ScalarType::Float);
+  Tensor key_scale = from_blob_like(scale_ptr + q_scale_numel, {batch, kv_heads, k_groups}, key, ScalarType::Float);
+
+  constexpr int D64PrepThreads = 256;
+  const dim3 block(head_dim == 64 ? D64PrepThreads : 256);
+  const dim3 grid(fuse_self_qkv ? k_groups : (q_task_groups + k_groups),
+                  std::max(q_heads, kv_heads),
+                  batch);
+    if (query.scalar_type() == ScalarType::Half) {
+    if (head_dim == 16) {
+      prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 16, 256, TransposeValue, true><<<grid, block, 0>>>(
+                         reinterpret_cast<const __half*>(query.data_ptr()),
+                         reinterpret_cast<const __half*>(key.data_ptr()),
+                         reinterpret_cast<const __half*>(value.data_ptr()),
+                         query_ptr, key_ptr, scale_ptr, scale_ptr + q_scale_numel,
+                         value_ptr,
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                         fuse_self_qkv);
+    } else if (head_dim == 64) {
+      prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 64, D64PrepThreads, TransposeValue, true, false, PrepackF16KLane, PrepackFp8Lane><<<grid, block, 0>>>(
+                         reinterpret_cast<const __half*>(query.data_ptr()),
+                         reinterpret_cast<const __half*>(key.data_ptr()),
+                         reinterpret_cast<const __half*>(value.data_ptr()),
+                         query_ptr, key_ptr, scale_ptr, scale_ptr + q_scale_numel,
+                         value_ptr,
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                         fuse_self_qkv);
+    } else {
+      prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 128, 256, TransposeValue, true, false, false, PrepackFp8Lane><<<grid, block, 0>>>(
+                         reinterpret_cast<const __half*>(query.data_ptr()),
+                         reinterpret_cast<const __half*>(key.data_ptr()),
+                         reinterpret_cast<const __half*>(value.data_ptr()),
+                         query_ptr, key_ptr, scale_ptr, scale_ptr + q_scale_numel,
+                         value_ptr,
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                         fuse_self_qkv);
+    }
+  } else {
+    if (head_dim == 16) {
+      prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 16, 256, TransposeValue, true><<<grid, block, 0>>>(
+                         reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+                         reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                         reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                         query_ptr, key_ptr, scale_ptr, scale_ptr + q_scale_numel,
+                         value_ptr,
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                         fuse_self_qkv);
+    } else if (head_dim == 64) {
+      prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 64, D64PrepThreads, TransposeValue, true, false, PrepackF16KLane, PrepackFp8Lane><<<grid, block, 0>>>(
+                         reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+                         reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                         reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                         query_ptr, key_ptr, scale_ptr, scale_ptr + q_scale_numel,
+                         value_ptr,
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                         fuse_self_qkv);
+    } else {
+      prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 128, 256, TransposeValue, true, false, false, PrepackFp8Lane><<<grid, block, 0>>>(
+                         reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+                         reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                         reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                         query_ptr, key_ptr, scale_ptr, scale_ptr + q_scale_numel,
+                         value_ptr,
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                         fuse_self_qkv);
+    }
+  }
+  hip_kernel_launch_check();
+  if (pack_scales_with_bytes) {
+    return {query_out, query_scale, key_out, key_scale, value_out, byte_workspace};
+  }
+  return {query_out, query_scale, key_out, key_scale, value_out, byte_workspace, scale_workspace};
+}
+
+template <typename OutT,
+          bool ToFp8,
+          bool TransposeValue = true,
+          bool PrepackF16VLane = false,
+          bool PrepackF16KLane = false,
+          bool PrepackFp8Lane = false,
+          bool PrepackFp8VLane = false,
+          bool PrepackFp8KLane = false>
+std::vector<Tensor> prepare_kv_hnd_packed_gfx12(
+    Tensor query,
+    Tensor key,
+    Tensor value) {
+  STD_TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda(),
+              "packed gfx12 KV preparation expects CUDA/HIP tensors");
+  STD_TORCH_CHECK(query.dim() == 4 && key.dim() == 4 && value.dim() == 4,
+              "packed gfx12 KV preparation expects [B, H, S, D]");
+  STD_TORCH_CHECK(query.is_contiguous() && key.is_contiguous() && value.is_contiguous(),
+              "packed gfx12 KV preparation expects contiguous HND tensors");
+  STD_TORCH_CHECK(query.scalar_type() == key.scalar_type() && query.scalar_type() == value.scalar_type(),
+              "packed gfx12 KV preparation expects matching input dtypes");
+
+  const int64_t batch = query.size(0);
+  const int64_t q_heads = query.size(1);
+  const int64_t q_len = query.size(2);
+  const int64_t kv_heads = key.size(1);
+  const int64_t kv_len = key.size(2);
+  const int64_t head_dim = query.size(3);
+  STD_TORCH_CHECK(head_dim == 16 || head_dim == 64 || head_dim == 128,
+              "packed gfx12 KV preparation supports head_dim 16, 64, or 128");
+  STD_TORCH_CHECK(!PrepackF16VLane || (!ToFp8 && TransposeValue && head_dim == 64),
+              "fp16 lane-major V prepack requires transposed D64 fp16 values");
+  STD_TORCH_CHECK(!PrepackF16KLane || (!ToFp8 && head_dim == 64),
+              "fp16 lane-major K prepack requires D64 fp16/bf16 keys");
+  STD_TORCH_CHECK(!PrepackFp8Lane || (ToFp8 && TransposeValue && head_dim == 64),
+              "fp8 lane-major K/V prepack requires transposed D64 fp8 values");
+  STD_TORCH_CHECK(!PrepackFp8Lane || ((key.size(2) % 64) == 0),
+              "fp8 lane-major K/V prepack requires kv_len divisible by 64");
+  STD_TORCH_CHECK(!PrepackFp8VLane ||
+                  (ToFp8 && TransposeValue && (head_dim == 64 || head_dim == 128)),
+              "fp8 lane-major V prepack requires transposed D64/D128 fp8 values");
+  STD_TORCH_CHECK(!PrepackFp8VLane || ((key.size(2) % 64) == 0),
+              "fp8 lane-major V prepack requires kv_len divisible by 64");
+  STD_TORCH_CHECK(!PrepackFp8KLane ||
+                  (ToFp8 && TransposeValue && (head_dim == 64 || head_dim == 128)),
+              "fp8 lane-major K prepack requires transposed D64/D128 fp8 values");
+  STD_TORCH_CHECK(!PrepackFp8KLane || ((key.size(2) % 64) == 0),
+              "fp8 lane-major K prepack requires kv_len divisible by 64");
+  STD_TORCH_CHECK(key.size(0) == batch && value.size(0) == batch,
+              "Q/K/V batch size mismatch");
+  STD_TORCH_CHECK(key.size(2) == kv_len && value.size(2) == kv_len && value.size(1) == kv_heads,
+              "K/V shape mismatch");
+  STD_TORCH_CHECK(key.size(3) == head_dim && value.size(3) == head_dim,
+              "Q/K/V head_dim mismatch");
+
+  const int q_groups = static_cast<int>((q_len + 31) / 32);
+  const int k_groups = static_cast<int>((kv_len + 63) / 64);
+  const int64_t k_numel = key.numel();
+  const int64_t v_numel = batch * kv_heads * head_dim * kv_len;
+  const int64_t k_scale_numel = batch * kv_heads * k_groups;
+  const int64_t value_byte_offset = k_numel;
+  const int64_t scale_byte_offset = value_byte_offset + (ToFp8 ? v_numel : 0);
+  Tensor byte_workspace =
+      new_empty_like(query, {scale_byte_offset + (ToFp8 ? k_scale_numel * 4 : 0)}, ScalarType::Byte);
+  uint8_t* byte_ptr = reinterpret_cast<uint8_t*>(byte_workspace.data_ptr());
+  int8_t* key_ptr = reinterpret_cast<int8_t*>(byte_ptr);
+  OutT* value_ptr = nullptr;
+  Tensor value_out;
+  if constexpr (ToFp8) {
+    value_ptr = reinterpret_cast<OutT*>(byte_ptr + value_byte_offset);
+    if constexpr (TransposeValue) {
+      value_out = from_blob_like(value_ptr, {batch, kv_heads, head_dim, kv_len}, value, ScalarType::Byte);
+    } else {
+      value_out = from_blob_like(value_ptr, {batch, kv_heads, kv_len, head_dim}, value, ScalarType::Byte);
+    }
+  } else {
+    if constexpr (PrepackF16VLane) {
+      value_out = new_empty_like(value, {batch, kv_heads, k_groups, 4, 4, 32, 8}, ScalarType::Half);
+    } else {
+      value_out = new_empty_like(value, {batch, kv_heads, head_dim, kv_len}, ScalarType::Half);
+    }
+    value_ptr = reinterpret_cast<OutT*>(value_out.data_ptr());
+  }
+  Tensor scale_workspace;
+  float* key_scale_ptr = nullptr;
+  if constexpr (ToFp8) {
+    key_scale_ptr = reinterpret_cast<float*>(byte_ptr + scale_byte_offset);
+  } else {
+    scale_workspace = new_empty_like(query, {k_scale_numel}, ScalarType::Float);
+    key_scale_ptr = reinterpret_cast<float*>(scale_workspace.data_ptr());
+  }
+  Tensor key_out = from_blob_like(key_ptr, {batch, kv_heads, kv_len, head_dim}, key, ScalarType::Char);
+  Tensor key_scale = from_blob_like(key_scale_ptr, {batch, kv_heads, k_groups}, key, ScalarType::Float);
+
+  constexpr int D64PrepThreads = 256;
+  const dim3 block(head_dim == 64 ? D64PrepThreads : 256);
+  const dim3 grid(k_groups, kv_heads, batch);
+    const bool use_kv1 = q_len <= 4096;
+  const bool use_kv_static_1024 =
+      ToFp8 && TransposeValue && use_kv1 &&
+      q_len == 1024 && kv_len == 1024 &&
+      !PrepackFp8VLane && !PrepackFp8KLane;
+  if (query.scalar_type() == ScalarType::Half) {
+    if (head_dim == 16) {
+      prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 16, 256, TransposeValue, false><<<grid, block, 0>>>(
+                         reinterpret_cast<const __half*>(query.data_ptr()),
+                         reinterpret_cast<const __half*>(key.data_ptr()),
+                         reinterpret_cast<const __half*>(value.data_ptr()),
+                         nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                         false);
+    } else if (head_dim == 64) {
+      if constexpr (ToFp8 && TransposeValue) {
+        if (use_kv1) {
+          if (use_kv_static_1024) {
+            prepare_kv_hnd_fp8_kernel<__half, 1, false, PrepackFp8Lane, 64, false, false, false, true, 256, 1024><<<grid, block, 0>>>(
+                               reinterpret_cast<const __half*>(key.data_ptr()),
+                               reinterpret_cast<const __half*>(value.data_ptr()),
+                               key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
+                               batch, kv_heads, kv_len, k_groups);
+          } else {
+            prepare_kv_hnd_fp8_kernel<__half, 1, false, PrepackFp8Lane><<<grid, block, 0>>>(
+                               reinterpret_cast<const __half*>(key.data_ptr()),
+                               reinterpret_cast<const __half*>(value.data_ptr()),
+                               key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
+                               batch, kv_heads, kv_len, k_groups);
+          }
+        } else {
+          const dim3 grid_kv((k_groups + 1) / 2, kv_heads, batch);
+          prepare_kv_hnd_fp8_kernel<__half, 2, false, PrepackFp8Lane><<<grid_kv, block, 0>>>(
+                             reinterpret_cast<const __half*>(key.data_ptr()),
+                             reinterpret_cast<const __half*>(value.data_ptr()),
+                             key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
+                             batch, kv_heads, kv_len, k_groups);
+        }
+      } else {
+        prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 64, D64PrepThreads, TransposeValue, false, PrepackF16VLane, PrepackF16KLane><<<grid, block, 0>>>(
+                           reinterpret_cast<const __half*>(query.data_ptr()),
+                           reinterpret_cast<const __half*>(key.data_ptr()),
+                           reinterpret_cast<const __half*>(value.data_ptr()),
+                           nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
+                           batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                           false);
+      }
+    } else {
+      if constexpr (ToFp8 && TransposeValue) {
+        if (use_kv1) {
+          if (use_kv_static_1024) {
+            prepare_kv_hnd_fp8_kernel<__half, 1, false, false, 128, false, false, false, true, 256, 1024><<<grid, block, 0>>>(
+                               reinterpret_cast<const __half*>(key.data_ptr()),
+                               reinterpret_cast<const __half*>(value.data_ptr()),
+                               key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
+                               batch, kv_heads, kv_len, k_groups);
+          } else {
+            prepare_kv_hnd_fp8_kernel<__half, 1, false, false, 128><<<grid, block, 0>>>(
+                               reinterpret_cast<const __half*>(key.data_ptr()),
+                               reinterpret_cast<const __half*>(value.data_ptr()),
+                               key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
+                               batch, kv_heads, kv_len, k_groups);
+          }
+        } else {
+          const dim3 grid_kv((k_groups + 1) / 2, kv_heads, batch);
+          prepare_kv_hnd_fp8_kernel<__half, 2, false, false, 128><<<grid_kv, block, 0>>>(
+                             reinterpret_cast<const __half*>(key.data_ptr()),
+                             reinterpret_cast<const __half*>(value.data_ptr()),
+                             key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
+                             batch, kv_heads, kv_len, k_groups);
+        }
+      } else {
+        prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 128, 256, TransposeValue, false><<<grid, block, 0>>>(
+                           reinterpret_cast<const __half*>(query.data_ptr()),
+                           reinterpret_cast<const __half*>(key.data_ptr()),
+                           reinterpret_cast<const __half*>(value.data_ptr()),
+                           nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
+                           batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                           false);
+      }
+    }
+  } else {
+    if (head_dim == 16) {
+      prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 16, 256, TransposeValue, false><<<grid, block, 0>>>(
+                         reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+                         reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                         reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                         nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                         false);
+    } else if (head_dim == 64) {
+      if constexpr (ToFp8 && TransposeValue) {
+        if (use_kv1) {
+          if (use_kv_static_1024) {
+            prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 1, false, PrepackFp8Lane, 64, false, false, false, true, 256, 1024><<<grid, block, 0>>>(
+                               reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                               reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                               key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
+                               batch, kv_heads, kv_len, k_groups);
+          } else {
+            prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 1, false, PrepackFp8Lane><<<grid, block, 0>>>(
+                               reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                               reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                               key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
+                               batch, kv_heads, kv_len, k_groups);
+          }
+        } else {
+          const dim3 grid_kv((k_groups + 1) / 2, kv_heads, batch);
+          prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 2, false, PrepackFp8Lane><<<grid_kv, block, 0>>>(
+                             reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                             reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                             key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
+                             batch, kv_heads, kv_len, k_groups);
+        }
+      } else {
+        prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 64, D64PrepThreads, TransposeValue, false, PrepackF16VLane, PrepackF16KLane><<<grid, block, 0>>>(
+                           reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+                           reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                           reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                           nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
+                           batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                           false);
+      }
+    } else {
+      if constexpr (ToFp8 && TransposeValue) {
+        if (use_kv1) {
+          if (use_kv_static_1024) {
+            prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 1, false, false, 128, false, false, false, true, 256, 1024><<<grid, block, 0>>>(
+                               reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                               reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                               key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
+                               batch, kv_heads, kv_len, k_groups);
+          } else {
+            prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 1, false, false, 128><<<grid, block, 0>>>(
+                               reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                               reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                               key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
+                               batch, kv_heads, kv_len, k_groups);
+          }
+        } else {
+          const dim3 grid_kv((k_groups + 1) / 2, kv_heads, batch);
+          prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 2, false, false, 128><<<grid_kv, block, 0>>>(
+                             reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                             reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                             key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
+                             batch, kv_heads, kv_len, k_groups);
+        }
+      } else {
+        prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 128, 256, TransposeValue, false><<<grid, block, 0>>>(
+                           reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+                           reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                           reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+                           nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
+                           batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+                           false);
+      }
+    }
+  }
+  hip_kernel_launch_check();
+  if constexpr (ToFp8) {
+    return {key_out, key_scale, value_out, byte_workspace};
+  }
+  return {key_out, key_scale, value_out, byte_workspace, scale_workspace};
+}
+
+template <typename T, int HeadDim, int Threads = 256>
+__global__ void prepare_k_hnd_kernel(
+    const T* __restrict__ key,
+    int8_t* __restrict__ key_out,
+    float* __restrict__ key_scale,
+    const int64_t batch,
+    const int64_t kv_heads,
+    const int64_t kv_len,
+    const int k_groups) {
+  constexpr int PackElems = 8;
+  constexpr int KRows = 64;
+  const int local_group = blockIdx.x;
+  const int head = blockIdx.y;
+  const int b = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int64_t base_row = static_cast<int64_t>(local_group) * KRows;
+  if (b >= batch || head >= kv_heads || local_group >= k_groups || base_row >= kv_len) {
+    return;
+  }
+
+  __shared__ float shared_amax;
+  constexpr int kv_packs = (KRows * HeadDim) / PackElems;
+  float local_amax = 0.0000001f;
+  for (int pack = tid; pack < kv_packs; pack += Threads) {
+    const int elem_base = pack * PackElems;
+    const int row = elem_base / HeadDim;
+    const int d = elem_base - row * HeadDim;
+    const int64_t seq = base_row + row;
+    if (seq < kv_len) {
+      const int64_t off =
+          ((static_cast<int64_t>(b) * kv_heads + head) * kv_len + seq) * HeadDim + d;
+      const uint4 raw = *reinterpret_cast<const uint4*>(key + off);
+      const T* values = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+      for (int i = 0; i < PackElems; ++i) {
+        local_amax = fmaxf(local_amax, fabsf(value_to_float(values[i])));
+      }
+    }
+  }
+
+  const float block_amax = vllm::blockReduceMax(local_amax);
+  if (tid == 0) {
+    shared_amax = block_amax;
+    key_scale[(static_cast<int64_t>(b) * kv_heads + head) * k_groups + local_group] =
+        block_amax / 127.0f;
+  }
+  __syncthreads();
+  const float inv_scale = 127.0f / shared_amax;
+
+  for (int pack = tid; pack < kv_packs; pack += Threads) {
+    const int elem_base = pack * PackElems;
+    const int row = elem_base / HeadDim;
+    const int d = elem_base - row * HeadDim;
+    const int64_t seq = base_row + row;
+    if (seq < kv_len) {
+      const int64_t off =
+          ((static_cast<int64_t>(b) * kv_heads + head) * kv_len + seq) * HeadDim + d;
+      const uint4 raw = *reinterpret_cast<const uint4*>(key + off);
+      const T* values = reinterpret_cast<const T*>(&raw);
+      char4 out0;
+      char4 out1;
+      out0.x = float_to_int8_rn_gfx12(value_to_float(values[0]) * inv_scale);
+      out0.y = float_to_int8_rn_gfx12(value_to_float(values[1]) * inv_scale);
+      out0.z = float_to_int8_rn_gfx12(value_to_float(values[2]) * inv_scale);
+      out0.w = float_to_int8_rn_gfx12(value_to_float(values[3]) * inv_scale);
+      out1.x = float_to_int8_rn_gfx12(value_to_float(values[4]) * inv_scale);
+      out1.y = float_to_int8_rn_gfx12(value_to_float(values[5]) * inv_scale);
+      out1.z = float_to_int8_rn_gfx12(value_to_float(values[6]) * inv_scale);
+      out1.w = float_to_int8_rn_gfx12(value_to_float(values[7]) * inv_scale);
+      *reinterpret_cast<char4*>(key_out + off) = out0;
+      *reinterpret_cast<char4*>(key_out + off + 4) = out1;
+    }
+  }
+}
+
+std::vector<Tensor> prepare_k_hnd_packed_gfx12(Tensor key) {
+  STD_TORCH_CHECK(key.is_cuda(), "packed gfx12 K preparation expects a CUDA/HIP tensor");
+  STD_TORCH_CHECK(key.dim() == 4, "packed gfx12 K preparation expects [B, H, S, D]");
+  STD_TORCH_CHECK(key.is_contiguous(), "packed gfx12 K preparation expects contiguous HND tensors");
+  STD_TORCH_CHECK(key.scalar_type() == ScalarType::Half || key.scalar_type() == ScalarType::BFloat16,
+              "packed gfx12 K preparation supports fp16/bf16 input");
+  const int64_t batch = key.size(0);
+  const int64_t kv_heads = key.size(1);
+  const int64_t kv_len = key.size(2);
+  const int64_t head_dim = key.size(3);
+  STD_TORCH_CHECK(head_dim == 64 || head_dim == 128,
+              "packed gfx12 K preparation supports head_dim 64 or 128");
+  STD_TORCH_CHECK((kv_len % 64) == 0,
+              "packed gfx12 K preparation requires sequence length divisible by 64");
+
+  const int k_groups = static_cast<int>((kv_len + 63) / 64);
+  const int64_t k_numel = key.numel();
+  Tensor byte_workspace = new_empty_like(key, {k_numel}, ScalarType::Byte);
+  Tensor scale_workspace =
+      new_empty_like(key, {batch * kv_heads * k_groups}, ScalarType::Float);
+  int8_t* key_ptr = reinterpret_cast<int8_t*>(reinterpret_cast<uint8_t*>(byte_workspace.data_ptr()));
+  Tensor key_out = from_blob_like(key_ptr, {batch, kv_heads, kv_len, head_dim}, key, ScalarType::Char);
+  Tensor key_scale = from_blob_like(reinterpret_cast<float*>(scale_workspace.data_ptr()), {batch, kv_heads, k_groups}, key, ScalarType::Float);
+
+  constexpr int Threads = 256;
+  const dim3 block(Threads);
+  const dim3 grid(k_groups, kv_heads, batch);
+    if (key.scalar_type() == ScalarType::Half) {
+    if (head_dim == 64) {
+      prepare_k_hnd_kernel<__half, 64, Threads><<<grid, block, 0>>>(
+                         reinterpret_cast<const __half*>(key.data_ptr()),
+                         key_ptr, reinterpret_cast<float*>(scale_workspace.data_ptr()),
+                         batch, kv_heads, kv_len, k_groups);
+    } else {
+      prepare_k_hnd_kernel<__half, 128, Threads><<<grid, block, 0>>>(
+                         reinterpret_cast<const __half*>(key.data_ptr()),
+                         key_ptr, reinterpret_cast<float*>(scale_workspace.data_ptr()),
+                         batch, kv_heads, kv_len, k_groups);
+    }
+  } else {
+    if (head_dim == 64) {
+      prepare_k_hnd_kernel<__hip_bfloat16, 64, Threads><<<grid, block, 0>>>(
+                         reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                         key_ptr, reinterpret_cast<float*>(scale_workspace.data_ptr()),
+                         batch, kv_heads, kv_len, k_groups);
+    } else {
+      prepare_k_hnd_kernel<__hip_bfloat16, 128, Threads><<<grid, block, 0>>>(
+                         reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                         key_ptr, reinterpret_cast<float*>(scale_workspace.data_ptr()),
+                         batch, kv_heads, kv_len, k_groups);
+    }
+  }
+  hip_kernel_launch_check();
+  return {key_out, key_scale, byte_workspace, scale_workspace};
+}
+
+static int select_fp8_d64_block_rows_gfx12(
+    const int64_t q_len,
+    const bool is_causal,
+    const bool value_transposed_hnd) {
+  if (is_causal) {
+    if (q_len <= 64) {
+      return 64;
+    }
+    return 128;
+  }
+  if (q_len <= 64) {
+    return 64;
+  }
+  if ((q_len % 256) == 0 && (q_len >= 2048 || value_transposed_hnd)) {
+    return 256;
+  }
+  return 128;
+}
+
+__global__ void convert_f16_to_bf16_kernel(
+    const __half* __restrict__ input,
+    __hip_bfloat16* __restrict__ output,
+    const int64_t numel) {
+  const int64_t idx = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 2;
+  if (idx + 1 < numel) {
+    const __half2 h2 = *reinterpret_cast<const __half2*>(input + idx);
+    const __hip_bfloat162 b2 = __float22bfloat162_rn(__half22float2(h2));
+    *reinterpret_cast<__hip_bfloat162*>(output + idx) = b2;
+  } else if (idx < numel) {
+    output[idx] = __float2bfloat16(__half2float(input[idx]));
+  }
+}
+
+Tensor convert_f16_to_bf16_gfx12(Tensor input) {
+  STD_TORCH_CHECK(input.is_cuda(), "gfx12 f16 to bf16 conversion expects a CUDA/HIP tensor");
+  STD_TORCH_CHECK(input.scalar_type() == ScalarType::Half,
+              "gfx12 f16 to bf16 conversion expects fp16 input");
+  STD_TORCH_CHECK(input.is_contiguous(),
+              "gfx12 f16 to bf16 conversion expects contiguous input");
+  Tensor output = new_empty_like(input, input.sizes(), ScalarType::BFloat16);
+  const int64_t numel = input.numel();
+  const int threads = 256;
+  const dim3 block(threads);
+  const dim3 grid((numel + threads * 2 - 1) / (threads * 2));
+    convert_f16_to_bf16_kernel<<<grid, block, 0>>>(
+                     reinterpret_cast<const __half*>(input.data_ptr()),
+                     reinterpret_cast<__hip_bfloat16*>(output.data_ptr()),
+                     numel);
+  hip_kernel_launch_check();
+  return output;
+}
+
+std::vector<Tensor> quant_q_nhd_per_warp_gfx12(Tensor query) {
+  STD_TORCH_CHECK(query.is_cuda(), "gfx12 NHD Q quantization expects a CUDA/HIP tensor");
+  STD_TORCH_CHECK(query.dim() == 4, "gfx12 NHD Q quantization expects [B, S, H, D]");
+  STD_TORCH_CHECK(query.is_contiguous(), "gfx12 NHD Q quantization expects contiguous NHD input");
+  STD_TORCH_CHECK(query.scalar_type() == ScalarType::Half || query.scalar_type() == ScalarType::BFloat16,
+              "gfx12 NHD Q quantization supports fp16/bf16 input");
+  const int64_t batch = query.size(0);
+  const int64_t q_len = query.size(1);
+  const int64_t q_heads = query.size(2);
+  const int64_t head_dim = query.size(3);
+  STD_TORCH_CHECK(head_dim == 16 || head_dim == 64 || head_dim == 128,
+              "gfx12 NHD Q quantization supports head_dim 16, 64, or 128");
+  const int q_scale_groups = static_cast<int>(((q_len + 127) / 128) * 4);
+  Tensor query_out = new_empty_like(query, query.sizes(), ScalarType::Char);
+  Tensor query_scale = new_empty_like(query, {batch, q_heads, q_scale_groups}, ScalarType::Float);
+
+  const dim3 block(256);
+  const dim3 grid((q_scale_groups + 1) / 2, q_heads, batch);
+  if (query.scalar_type() == ScalarType::Half) {
+    if (head_dim == 16) {
+      quant_q_nhd_per_warp_kernel<__half, 16><<<grid, block, 0>>>(
+          reinterpret_cast<const __half*>(query.data_ptr()),
+          reinterpret_cast<int8_t*>(query_out.data_ptr()),
+          reinterpret_cast<float*>(query_scale.data_ptr()),
+          batch, q_len, q_heads, q_scale_groups);
+    } else if (head_dim == 64) {
+      quant_q_nhd_per_warp_kernel<__half, 64><<<grid, block, 0>>>(
+          reinterpret_cast<const __half*>(query.data_ptr()),
+          reinterpret_cast<int8_t*>(query_out.data_ptr()),
+          reinterpret_cast<float*>(query_scale.data_ptr()),
+          batch, q_len, q_heads, q_scale_groups);
+    } else {
+      quant_q_nhd_per_warp_kernel<__half, 128><<<grid, block, 0>>>(
+          reinterpret_cast<const __half*>(query.data_ptr()),
+          reinterpret_cast<int8_t*>(query_out.data_ptr()),
+          reinterpret_cast<float*>(query_scale.data_ptr()),
+          batch, q_len, q_heads, q_scale_groups);
+    }
+  } else {
+    if (head_dim == 16) {
+      quant_q_nhd_per_warp_kernel<__hip_bfloat16, 16><<<grid, block, 0>>>(
+          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+          reinterpret_cast<int8_t*>(query_out.data_ptr()),
+          reinterpret_cast<float*>(query_scale.data_ptr()),
+          batch, q_len, q_heads, q_scale_groups);
+    } else if (head_dim == 64) {
+      quant_q_nhd_per_warp_kernel<__hip_bfloat16, 64><<<grid, block, 0>>>(
+          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+          reinterpret_cast<int8_t*>(query_out.data_ptr()),
+          reinterpret_cast<float*>(query_scale.data_ptr()),
+          batch, q_len, q_heads, q_scale_groups);
+    } else {
+      quant_q_nhd_per_warp_kernel<__hip_bfloat16, 128><<<grid, block, 0>>>(
+          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+          reinterpret_cast<int8_t*>(query_out.data_ptr()),
+          reinterpret_cast<float*>(query_scale.data_ptr()),
+          batch, q_len, q_heads, q_scale_groups);
+    }
+  }
+  hip_kernel_launch_check();
+  return {query_out, query_scale};
+}
+
+std::vector<Tensor> quant_qk_int8_hnd_gfx12(Tensor query, Tensor key) {
+  STD_TORCH_CHECK(query.is_cuda() && key.is_cuda(), "gfx12 Q/K quantization expects CUDA/HIP tensors");
+  STD_TORCH_CHECK(query.dim() == 4 && key.dim() == 4, "gfx12 Q/K quantization expects [B, H, S, D]");
+  STD_TORCH_CHECK(query.is_contiguous() && key.is_contiguous(),
+              "gfx12 Q/K quantization expects contiguous HND tensors");
+  STD_TORCH_CHECK(query.scalar_type() == key.scalar_type(),
+              "gfx12 Q/K quantization expects matching Q/K dtypes");
+  STD_TORCH_CHECK(query.scalar_type() == ScalarType::Half || query.scalar_type() == ScalarType::BFloat16,
+              "gfx12 Q/K quantization supports fp16/bf16 input");
+  STD_TORCH_CHECK(query.size(0) == key.size(0), "Q/K batch size mismatch");
+  STD_TORCH_CHECK(query.size(3) == key.size(3), "Q/K head_dim mismatch");
+  const int64_t batch = query.size(0);
+  const int64_t q_heads = query.size(1);
+  const int64_t q_len = query.size(2);
+  const int64_t kv_heads = key.size(1);
+  const int64_t kv_len = key.size(2);
+  const int64_t head_dim = query.size(3);
+  STD_TORCH_CHECK(head_dim == 16 || head_dim == 64 || head_dim == 128,
+              "gfx12 native Q/K quantization supports head_dim 16, 64, or 128");
+  STD_TORCH_CHECK((q_len % 64) == 0 && (kv_len % 64) == 0,
+              "gfx12 native Q/K quantization requires sequence lengths divisible by 64");
+
+  const int q_groups = static_cast<int>((q_len + 31) / 32);
+  const int k_groups = static_cast<int>((kv_len + 63) / 64);
+  Tensor query_out = new_empty_like(query, query.sizes(), ScalarType::Char);
+  Tensor key_out = new_empty_like(key, key.sizes(), ScalarType::Char);
+  Tensor query_scale = new_empty_like(query, {batch, q_heads, q_groups}, ScalarType::Float);
+  Tensor key_scale = new_empty_like(key, {batch, kv_heads, k_groups}, ScalarType::Float);
+
+  const dim3 block(256);
+  const dim3 grid(q_groups + k_groups, std::max(q_heads, kv_heads), batch);
+    if (query.scalar_type() == ScalarType::Half) {
+    if (head_dim == 16) {
+      quant_qk_int8_hnd_kernel<__half, 16><<<grid, block, 0>>>(
+                         reinterpret_cast<const __half*>(query.data_ptr()),
+                         reinterpret_cast<const __half*>(key.data_ptr()),
+                         reinterpret_cast<int8_t*>(query_out.data_ptr()), reinterpret_cast<int8_t*>(key_out.data_ptr()),
+                         reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups);
+    } else if (head_dim == 64) {
+      quant_qk_int8_hnd_kernel<__half, 64><<<grid, block, 0>>>(
+                         reinterpret_cast<const __half*>(query.data_ptr()),
+                         reinterpret_cast<const __half*>(key.data_ptr()),
+                         reinterpret_cast<int8_t*>(query_out.data_ptr()), reinterpret_cast<int8_t*>(key_out.data_ptr()),
+                         reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups);
+    } else {
+      quant_qk_int8_hnd_kernel<__half, 128><<<grid, block, 0>>>(
+                         reinterpret_cast<const __half*>(query.data_ptr()),
+                         reinterpret_cast<const __half*>(key.data_ptr()),
+                         reinterpret_cast<int8_t*>(query_out.data_ptr()), reinterpret_cast<int8_t*>(key_out.data_ptr()),
+                         reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups);
+    }
+  } else {
+    if (head_dim == 16) {
+      quant_qk_int8_hnd_kernel<__hip_bfloat16, 16><<<grid, block, 0>>>(
+                         reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+                         reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                         reinterpret_cast<int8_t*>(query_out.data_ptr()), reinterpret_cast<int8_t*>(key_out.data_ptr()),
+                         reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups);
+    } else if (head_dim == 64) {
+      quant_qk_int8_hnd_kernel<__hip_bfloat16, 64><<<grid, block, 0>>>(
+                         reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+                         reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                         reinterpret_cast<int8_t*>(query_out.data_ptr()), reinterpret_cast<int8_t*>(key_out.data_ptr()),
+                         reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups);
+    } else {
+      quant_qk_int8_hnd_kernel<__hip_bfloat16, 128><<<grid, block, 0>>>(
+                         reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
+                         reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+                         reinterpret_cast<int8_t*>(query_out.data_ptr()), reinterpret_cast<int8_t*>(key_out.data_ptr()),
+                         reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+                         batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups);
+    }
+  }
+  hip_kernel_launch_check();
+  return {query_out, query_scale, key_out, key_scale};
+}
+
+static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
+    Tensor query,
+    Tensor key,
+    Tensor value,
+    Tensor output,
+    Tensor query_scale,
+    Tensor key_scale,
+    int tensor_layout,
+    int is_causal,
+    float sm_scale,
+    int64_t valid_kv_len,
+    const float* value_scale_ptr = nullptr);
+
+Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
+    Tensor query,
+    Tensor key,
+    Tensor value,
+    int64_t is_causal,
+    int64_t value_is_fp8,
+    int64_t use_raw_f16_value,
+    double sm_scale,
+    int64_t valid_kv_len) {
+  STD_TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda(),
+              "native gfx12 prepare+attention expects CUDA/HIP tensors");
+  STD_TORCH_CHECK(query.dim() == 4 && key.dim() == 4 && value.dim() == 4,
+              "native gfx12 prepare+attention expects HND [B, H, S, D] tensors");
+  STD_TORCH_CHECK(query.is_contiguous() && key.is_contiguous() && value.is_contiguous(),
+              "native gfx12 prepare+attention expects contiguous HND tensors");
+  STD_TORCH_CHECK(query.scalar_type() == key.scalar_type() && query.scalar_type() == value.scalar_type(),
+              "native gfx12 prepare+attention expects matching input dtypes");
+  STD_TORCH_CHECK(query.scalar_type() == ScalarType::Half || query.scalar_type() == ScalarType::BFloat16,
+              "native gfx12 prepare+attention supports fp16/bf16 input");
+
+  const int64_t head_dim = query.size(3);
+  STD_TORCH_CHECK(value_is_fp8 || head_dim == 16 || head_dim == 64,
+              "native gfx12 fp16 value prepare+attention supports head_dim 16 or 64");
+  STD_TORCH_CHECK(value_is_fp8 || !use_raw_f16_value || query.scalar_type() == ScalarType::Half,
+              "raw fp16 value path requires fp16 input");
+  const int64_t batch = query.size(0);
+  const int64_t q_heads = query.size(1);
+  const int64_t q_len = query.size(2);
+  const int64_t kv_heads = key.size(1);
+  const int64_t padded_kv_len = key.size(2);
+  const int64_t kv_len = valid_kv_len > 0 ? valid_kv_len : padded_kv_len;
+  STD_TORCH_CHECK(kv_len > 0 && kv_len <= padded_kv_len,
+              "valid_kv_len must be in (0, padded_kv_len]");
+  STD_TORCH_CHECK(key.size(0) == batch && value.size(0) == batch,
+              "Q/K/V batch size mismatch");
+  STD_TORCH_CHECK(key.size(3) == head_dim && value.size(3) == head_dim,
+              "Q/K/V head_dim mismatch");
+  STD_TORCH_CHECK(value.size(2) == padded_kv_len && value.size(1) == kv_heads,
+              "K/V shape mismatch");
+  STD_TORCH_CHECK((q_heads % kv_heads) == 0, "q_heads must be divisible by kv_heads");
+  STD_TORCH_CHECK((q_len % 64) == 0 && (padded_kv_len % 64) == 0,
+              "native gfx12 prepare+attention requires sequence lengths divisible by 64");
+  STD_TORCH_CHECK(!is_causal || q_len == padded_kv_len,
+              "native gfx12 causal prepare+attention requires q_len == kv_len");
+
+  const auto output_dtype =
+      (value_is_fp8 && query.scalar_type() == ScalarType::BFloat16) ? ScalarType::BFloat16 : ScalarType::Half;
+  Tensor output;
+  if (!value_is_fp8) {
+    output = new_empty_like(query, query.sizes(), output_dtype);
+  }
+  const bool prefer_prepared_f16_causal =
+      !value_is_fp8 && head_dim == 64 && is_causal &&
+      query.scalar_type() == ScalarType::Half && q_len >= 4096;
+  const bool auto_f16_fused_q =
+      !value_is_fp8 && (head_dim == 16 || head_dim == 64) &&
+      query.scalar_type() == ScalarType::Half &&
+      (is_causal || q_len >= 2048 || (head_dim == 64 && q_len >= 1024)) &&
+      q_len <= 8192 &&
+      !prefer_prepared_f16_causal;
+  const bool auto_f16_raw_qk =
+      !value_is_fp8 && is_causal && head_dim == 16 &&
+      query.scalar_type() == ScalarType::Half && q_len <= 2048;
+  if (!value_is_fp8 && is_causal && (head_dim == 16 || head_dim == 64) &&
+      query.scalar_type() == ScalarType::Half &&
+      auto_f16_raw_qk) {
+    int block_rows = q_len <= 64 ? 64 : 128;
+    STD_TORCH_CHECK((q_len % block_rows) == 0,
+                "native raw-QK fp16 path requires q_len to be a multiple of block rows");
+    const dim3 block(block_rows);
+    const dim3 grid((q_len + block_rows - 1) / block_rows, q_heads, batch);
+        const bool use_f16_pv_accum =
+        auto_f16_raw_qk && q_len <= 1024;
+    constexpr bool use_f16_tvload = false;
+#define SAGEATTN_LAUNCH_RAW_QK_F16_CAUSAL(BR_, TVLOAD_, PAD_, F16ACC_) \
+    if (head_dim == 16) { \
+      qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, false, PAD_, true, TVLOAD_, F16ACC_, __half, true, __half, true, false, false, false, false, 16><<<grid, block, 0>>>( \
+          reinterpret_cast<const __half*>(query.data_ptr()), \
+          reinterpret_cast<const __half*>(key.data_ptr()), \
+          reinterpret_cast<const __half*>(value.data_ptr()), \
+          reinterpret_cast<__half*>(output.data_ptr()), \
+          nullptr, nullptr, \
+          batch, q_len, kv_len, q_heads, kv_heads, \
+          query.stride(0), query.stride(2), query.stride(1), \
+          key.stride(0), key.stride(2), key.stride(1), \
+          value.stride(0), value.stride(2), value.stride(1), \
+          output.stride(0), output.stride(2), output.stride(1), \
+          0, 0, 0, 0, \
+          kHND, sm_scale); \
+    } else { \
+      qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, false, PAD_, true, TVLOAD_, F16ACC_, __half, true, __half, true><<<grid, block, 0>>>( \
+        reinterpret_cast<const __half*>(query.data_ptr()), \
+        reinterpret_cast<const __half*>(key.data_ptr()), \
+        reinterpret_cast<const __half*>(value.data_ptr()), \
+        reinterpret_cast<__half*>(output.data_ptr()), \
+        nullptr, nullptr, \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(2), query.stride(1), \
+        key.stride(0), key.stride(2), key.stride(1), \
+        value.stride(0), value.stride(2), value.stride(1), \
+        output.stride(0), output.stride(2), output.stride(1), \
+        0, 0, 0, 0, \
+        kHND, sm_scale); \
+    }
+#define SAGEATTN_DISPATCH_RAW_QK_F16_CAUSAL(BR_) \
+    if (use_f16_tvload) { \
+      if (use_f16_pv_accum) { \
+        SAGEATTN_LAUNCH_RAW_QK_F16_CAUSAL(BR_, true, 4, true); \
+      } else { \
+        SAGEATTN_LAUNCH_RAW_QK_F16_CAUSAL(BR_, true, 4, false); \
+      } \
+    } else if (use_f16_pv_accum) { \
+      SAGEATTN_LAUNCH_RAW_QK_F16_CAUSAL(BR_, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD, true); \
+    } else { \
+      SAGEATTN_LAUNCH_RAW_QK_F16_CAUSAL(BR_, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD, false); \
+    }
+    if (block_rows == 64) {
+      SAGEATTN_DISPATCH_RAW_QK_F16_CAUSAL(64);
+    } else if (block_rows == 256) {
+      SAGEATTN_DISPATCH_RAW_QK_F16_CAUSAL(256);
+    } else if (block_rows == 512) {
+      SAGEATTN_DISPATCH_RAW_QK_F16_CAUSAL(512);
+    } else if (block_rows == 1024) {
+      SAGEATTN_DISPATCH_RAW_QK_F16_CAUSAL(1024);
+    } else {
+      SAGEATTN_DISPATCH_RAW_QK_F16_CAUSAL(128);
+    }
+#undef SAGEATTN_DISPATCH_RAW_QK_F16_CAUSAL
+#undef SAGEATTN_LAUNCH_RAW_QK_F16_CAUSAL
+    hip_kernel_launch_check();
+    return output;
+  }
+  if (value_is_fp8) {
+    int block_rows = head_dim == 64 ?
+        select_fp8_d64_block_rows_gfx12(q_len, is_causal, true) :
+        (q_len <= 64 ? 64 : 128);
+    int block_cols = 64;
+    if (head_dim == 64 && !is_causal && q_len == 1024) {
+      block_rows = 128;
+    }
+    if (head_dim == 16 && is_causal && q_len <= 1024) {
+      block_rows = 64;
+    }
+    const bool transpose_fp8_value = true;
+    const bool use_fused_q =
+        (head_dim == 16 || head_dim == 64 || head_dim == 128) && transpose_fp8_value &&
+        query.scalar_type() == ScalarType::Half && output_dtype == ScalarType::Half &&
+         ((head_dim == 16 && block_cols == 64 && is_causal && q_len == 1024) ||
+          (head_dim == 64 && block_cols == 64 && is_causal &&
+            q_len >= 1024) ||
+          (head_dim == 128 && block_cols <= 64 && is_causal && q_len >= 1024) ||
+          (head_dim == 128 && block_cols <= 64 && !is_causal && q_len <= 512));
+    const bool use_fp8_kvlane =
+        use_fused_q && head_dim == 64 && block_cols == 64 && transpose_fp8_value &&
+        true;
+    const bool auto_fp8_streamcols4 =
+        use_fused_q && head_dim == 64 && is_causal && block_cols == 64;
+    const bool use_fp8_streamcols4 =
+        use_fused_q && block_cols == 64 && auto_fp8_streamcols4;
+    const dim3 block(block_rows);
+    const dim3 grid((q_len + block_rows - 1) / block_rows, q_heads, batch);
+        std::vector<Tensor> prepared;
+    int8_t* fused_key_ptr = nullptr;
+    uint8_t* fused_value_ptr = nullptr;
+    float* fused_k_scale_ptr = nullptr;
+    int64_t fused_k_stride_b = 0;
+    int64_t fused_k_stride_n = 0;
+    int64_t fused_k_stride_h = 0;
+    int64_t fused_v_stride_b = 0;
+    int64_t fused_v_stride_n = 0;
+    int64_t fused_v_stride_h = 0;
+    int64_t fused_ks_stride_b = 0;
+    int64_t fused_ks_stride_h = 0;
+    if (head_dim == 16 && !use_fused_q && transpose_fp8_value) {
+      prepared = prepare_qkv_hnd_gfx12<uint8_t, true>(query, key, value);
+    } else if (use_fused_q) {
+      if (use_fp8_kvlane) {
+        prepared = prepare_kv_hnd_packed_gfx12<uint8_t, true, true, false, false, true>(
+            query, key, value);
+      } else {
+        prepared = prepare_kv_hnd_packed_gfx12<uint8_t, true, true>(query, key, value);
+      }
+    } else if (head_dim == 128 && is_causal && q_len == 1024 && transpose_fp8_value) {
+      prepared = prepare_qkv_hnd_gfx12<uint8_t, true>(query, key, value);
+    } else if (transpose_fp8_value) {
+      prepared = prepare_qkv_hnd_packed_gfx12<uint8_t, true, true>(query, key, value);
+    } else {
+      prepared = prepare_qkv_hnd_packed_gfx12<uint8_t, true, false>(query, key, value);
+    }
+    output = new_empty_like(query, query.sizes(), output_dtype);
+    if (use_fused_q) {
+      fused_key_ptr = reinterpret_cast<int8_t*>(prepared[0].data_ptr());
+      fused_value_ptr = reinterpret_cast<uint8_t*>(prepared[2].data_ptr());
+      fused_k_scale_ptr = reinterpret_cast<float*>(prepared[1].data_ptr());
+      fused_k_stride_b = prepared[0].stride(0);
+      fused_k_stride_n = prepared[0].stride(2);
+      fused_k_stride_h = prepared[0].stride(1);
+      fused_v_stride_b = prepared[2].stride(0);
+      fused_v_stride_n = prepared[2].stride(2);
+      fused_v_stride_h = prepared[2].stride(1);
+      fused_ks_stride_b = prepared[1].stride(0);
+      fused_ks_stride_h = prepared[1].stride(1);
+    }
+#define SAGEATTN_LAUNCH_PREPARED_FP8_EX(BC_, HD_, BR_, VT_, CAUSAL_, OUT_T_, LOWP_) \
+    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), true, BR_, VT_, CAUSAL_, OUT_T_, int8_t, false, int8_t, uint8_t, false, false, 0, false, false, 2, LOWP_><<<grid, block, 0>>>( \
+        reinterpret_cast<int8_t*>(prepared[0].data_ptr()), reinterpret_cast<int8_t*>(prepared[2].data_ptr()), \
+        reinterpret_cast<uint8_t*>(prepared[4].data_ptr()), \
+        reinterpret_cast<OUT_T_*>(output.data_ptr()), \
+        reinterpret_cast<float*>(prepared[1].data_ptr()), reinterpret_cast<float*>(prepared[3].data_ptr()), \
+        nullptr, \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
+        prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
+        prepared[4].stride(0), prepared[4].stride(2), prepared[4].stride(1), \
+        output.stride(0), output.stride(2), output.stride(1), \
+        prepared[1].stride(0), prepared[1].stride(1), \
+        prepared[3].stride(0), prepared[3].stride(1), \
+        kHND, sm_scale)
+#define SAGEATTN_LAUNCH_PREPARED_FP8(BC_, HD_, BR_, VT_, CAUSAL_, OUT_T_) \
+    SAGEATTN_LAUNCH_PREPARED_FP8_EX(BC_, HD_, BR_, VT_, CAUSAL_, OUT_T_, false)
+
+#define SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SLICE(BC_, HD_, BR_, CAUSAL_, KVLANE_, SC_, KLANE_, VLANE_, VBASE_, VTILES_) \
+    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, VBASE_, VTILES_, true, BR_, true, CAUSAL_, __half, __half, true, int8_t, uint8_t, false, KVLANE_, SC_, KLANE_, VLANE_><<<grid, block, 0>>>( \
+        reinterpret_cast<const __half*>(query.data_ptr()), fused_key_ptr, \
+        fused_value_ptr, \
+        reinterpret_cast<__half*>(output.data_ptr()), \
+        nullptr, fused_k_scale_ptr, \
+        nullptr, \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(2), query.stride(1), \
+        fused_k_stride_b, fused_k_stride_n, fused_k_stride_h, \
+        fused_v_stride_b, fused_v_stride_n, fused_v_stride_h, \
+        output.stride(0), output.stride(2), output.stride(1), \
+        0, 0, \
+        fused_ks_stride_b, fused_ks_stride_h, \
+        kHND, sm_scale)
+#define SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SC(BC_, HD_, BR_, CAUSAL_, KVLANE_, SC_) \
+    SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SLICE(BC_, HD_, BR_, CAUSAL_, KVLANE_, SC_, false, false, 0, ((HD_) / 16))
+#define SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL(BC_, HD_, BR_, CAUSAL_, KVLANE_) \
+    if constexpr ((BC_) == 64) { \
+      if (use_fp8_streamcols4) { \
+        SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SC(BC_, HD_, BR_, CAUSAL_, KVLANE_, 4); \
+      } else { \
+        SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SC(BC_, HD_, BR_, CAUSAL_, KVLANE_, 0); \
+      } \
+    } else { \
+      SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SC(BC_, HD_, BR_, CAUSAL_, KVLANE_, 0); \
+    }
+#define SAGEATTN_LAUNCH_FUSED_Q_FP8(BC_, HD_, BR_, CAUSAL_) \
+    if (use_fp8_kvlane) { \
+      SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL(BC_, HD_, BR_, CAUSAL_, true); \
+    } else { \
+      SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL(BC_, HD_, BR_, CAUSAL_, false); \
+    }
+
+#define SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC(BC_, VT_, OUT_T_) \
+    if (head_dim == 16) { \
+      if (block_rows == 64) { \
+        if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 64, VT_, true, OUT_T_); } \
+        else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 64, VT_, false, OUT_T_); } \
+      } else if (block_rows == 256) { \
+        if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 256, VT_, true, OUT_T_); } \
+        else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 256, VT_, false, OUT_T_); } \
+      } else { \
+        if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 128, VT_, true, OUT_T_); } \
+        else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 128, VT_, false, OUT_T_); } \
+      } \
+    } else if (head_dim == 128) { \
+      if (block_rows == 64) { \
+        if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 128, 64, true, true, OUT_T_); } \
+        else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 128, 64, true, false, OUT_T_); } \
+      } else { \
+        if (is_causal) { \
+          if constexpr ((BC_) == 64) { \
+            if (q_len == 1024) { \
+              SAGEATTN_LAUNCH_PREPARED_FP8_EX(BC_, 128, 128, true, true, OUT_T_, true); \
+            } else { \
+              SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 128, 128, true, true, OUT_T_); \
+            } \
+          } else { \
+            SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 128, 128, true, true, OUT_T_); \
+          } \
+        } \
+        else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 128, 128, true, false, OUT_T_); } \
+      } \
+    } else if (block_rows == 256) { \
+      if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 256, VT_, true, OUT_T_); } \
+      else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 256, VT_, false, OUT_T_); } \
+    } else if (block_rows == 64) { \
+      if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 64, VT_, true, OUT_T_); } \
+      else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 64, VT_, false, OUT_T_); } \
+    } else { \
+      if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 128, VT_, true, OUT_T_); } \
+      else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 128, VT_, false, OUT_T_); } \
+    }
+
+#define SAGEATTN_DISPATCH_PREPARED_FP8_TV(OUT_T_) \
+    SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC(64, true, OUT_T_)
+
+    if (use_fused_q) {
+#define SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_CAUSAL(BC_, HD_, CAUSAL_) \
+      if (block_rows == 64) { SAGEATTN_LAUNCH_FUSED_Q_FP8(BC_, HD_, 64, CAUSAL_); } \
+      else if (block_rows == 256) { SAGEATTN_LAUNCH_FUSED_Q_FP8(BC_, HD_, 256, CAUSAL_); } \
+      else { SAGEATTN_LAUNCH_FUSED_Q_FP8(BC_, HD_, 128, CAUSAL_); }
+#define SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(BC_, HD_) \
+      if (is_causal) { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_CAUSAL(BC_, HD_, true); } \
+      else { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_CAUSAL(BC_, HD_, false); }
+      if (head_dim == 16) {
+        SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(64, 16);
+      } else if (head_dim == 128) {
+        SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(64, 128);
+      } else {
+        SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(64, 64);
+      }
+#undef SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD
+#undef SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_CAUSAL
+    } else if (output.scalar_type() == ScalarType::BFloat16) {
+      SAGEATTN_DISPATCH_PREPARED_FP8_TV(__hip_bfloat16);
+    } else {
+      SAGEATTN_DISPATCH_PREPARED_FP8_TV(__half);
+    }
+#undef SAGEATTN_DISPATCH_PREPARED_FP8_TV
+#undef SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC
+#undef SAGEATTN_LAUNCH_FUSED_Q_FP8
+#undef SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL
+#undef SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SC
+#undef SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SLICE
+#undef SAGEATTN_LAUNCH_PREPARED_FP8
+#undef SAGEATTN_LAUNCH_PREPARED_FP8_EX
+  } else if (auto_f16_fused_q) {
+    const bool auto_f16_1q_short =
+        head_dim == 64 && is_causal && q_len == 1024;
+    const bool use_f16_fused_q_1q_tv =
+        head_dim == 64 && auto_f16_1q_short;
+    const bool use_f16_fused_q_1q =
+        head_dim == 64 && auto_f16_1q_short;
+    const bool use_f16_raw_value =
+        head_dim == 64 &&
+        (use_raw_f16_value ||
+         (use_f16_fused_q_1q && !use_f16_fused_q_1q_tv));
+    int block_rows = q_len <= 64 ? 64 : 128;
+    if ((q_len % 256) == 0) {
+      if ((!is_causal && q_len >= 1024) || q_len <= 512 ||
+          q_len >= 8192) {
+        block_rows = 256;
+      }
+    }
+    if (head_dim == 64 && is_causal && !use_f16_fused_q_1q &&
+        q_len >= 2048 && (q_len % 256) == 0) {
+      block_rows = 256;
+    }
+    int block_cols = 64;
+    if (use_f16_fused_q_1q && block_rows != 128) {
+      block_rows = 64;
+    }
+    const dim3 block(use_f16_fused_q_1q ? (block_rows / 16) * 32 : block_rows);
+    const bool use_f16_flat_q_schedule =
+        head_dim == 64 && is_causal && !use_f16_fused_q_1q &&
+        q_len >= 2048;
+    const int64_t q_blocks = (q_len + block_rows - 1) / block_rows;
+    const dim3 grid(q_blocks, q_heads, batch);
+    const dim3 grid_f16_flat(q_blocks * q_heads * batch);
+        constexpr bool use_f16_pv_accum = true;
+    const bool use_f16_pv_ordered_qk =
+        use_f16_pv_accum && !use_f16_raw_value &&
+        q_len >= 1024;
+    const bool auto_f16_lane_qk =
+        head_dim == 64 && is_causal && (q_len == 2048 || q_len == 4096);
+    const bool use_f16_vlane =
+        (((q_len >= 1024 && q_len <= 2048) || q_len >= 8192) ||
+         auto_f16_lane_qk);
+    const bool use_f16_streamk =
+        head_dim == 64 && is_causal && q_len == 2048 && block_rows == 256;
+    const bool use_f16_klane =
+        !use_f16_raw_value && block_cols == 64 &&
+        use_f16_pv_ordered_qk &&
+        auto_f16_lane_qk;
+    std::vector<Tensor> prepared = use_f16_raw_value ?
+        prepare_k_hnd_packed_gfx12(key) :
+        prepare_kv_hnd_packed_gfx12<__half, false>(query, key, value);
+#define SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_) \
+    if (head_dim == 16) { \
+      qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_, 16><<<grid, block, 0>>>( \
+          reinterpret_cast<const __half*>(query.data_ptr()), reinterpret_cast<int8_t*>(prepared[0].data_ptr()), \
+          reinterpret_cast<const __half*>(prepared[2].data_ptr()), \
+          reinterpret_cast<__half*>(output.data_ptr()), \
+          nullptr, reinterpret_cast<float*>(prepared[1].data_ptr()), \
+          batch, q_len, kv_len, q_heads, kv_heads, \
+          query.stride(0), query.stride(2), query.stride(1), \
+          prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
+          prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
+          output.stride(0), output.stride(2), output.stride(1), \
+          0, 0, \
+          prepared[1].stride(0), prepared[1].stride(1), \
+          kHND, sm_scale); \
+    } else { \
+      if (use_f16_flat_q_schedule) { \
+        qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_, 64, true><<<grid_f16_flat, block, 0>>>( \
+          reinterpret_cast<const __half*>(query.data_ptr()), reinterpret_cast<int8_t*>(prepared[0].data_ptr()), \
+          reinterpret_cast<const __half*>(prepared[2].data_ptr()), \
+          reinterpret_cast<__half*>(output.data_ptr()), \
+          nullptr, reinterpret_cast<float*>(prepared[1].data_ptr()), \
+          batch, q_len, kv_len, q_heads, kv_heads, \
+          query.stride(0), query.stride(2), query.stride(1), \
+          prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
+          prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
+          output.stride(0), output.stride(2), output.stride(1), \
+          0, 0, \
+          prepared[1].stride(0), prepared[1].stride(1), \
+          kHND, sm_scale); \
+      } else { \
+        qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_><<<grid, block, 0>>>( \
+          reinterpret_cast<const __half*>(query.data_ptr()), reinterpret_cast<int8_t*>(prepared[0].data_ptr()), \
+          reinterpret_cast<const __half*>(prepared[2].data_ptr()), \
+          reinterpret_cast<__half*>(output.data_ptr()), \
+          nullptr, reinterpret_cast<float*>(prepared[1].data_ptr()), \
+          batch, q_len, kv_len, q_heads, kv_heads, \
+          query.stride(0), query.stride(2), query.stride(1), \
+          prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
+          prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
+          output.stride(0), output.stride(2), output.stride(1), \
+          0, 0, \
+          prepared[1].stride(0), prepared[1].stride(1), \
+          kHND, sm_scale); \
+      } \
+    }
+#define SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(BR_, PAD_, F16ACC_, PVORDER_, VLANE_, KLANE_) \
+    if (head_dim == 16) { \
+      qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, false, false, F16ACC_, __half, true, int8_t, false, PVORDER_, false, false, false, 16><<<grid, block, 0>>>( \
+          reinterpret_cast<const __half*>(query.data_ptr()), reinterpret_cast<int8_t*>(prepared[0].data_ptr()), \
+          reinterpret_cast<const __half*>(prepared[2].data_ptr()), \
+          reinterpret_cast<__half*>(output.data_ptr()), \
+          nullptr, reinterpret_cast<float*>(prepared[1].data_ptr()), \
+          batch, q_len, kv_len, q_heads, kv_heads, \
+          query.stride(0), query.stride(2), query.stride(1), \
+          prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
+          prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
+          output.stride(0), output.stride(2), output.stride(1), \
+        0, 0, \
+        prepared[1].stride(0), prepared[1].stride(1), \
+        kHND, sm_scale); \
+    } else { \
+      qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, false, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, false, KLANE_><<<grid, block, 0>>>( \
+        reinterpret_cast<const __half*>(query.data_ptr()), reinterpret_cast<int8_t*>(prepared[0].data_ptr()), \
+        reinterpret_cast<const __half*>(prepared[2].data_ptr()), \
+        reinterpret_cast<__half*>(output.data_ptr()), \
+        nullptr, reinterpret_cast<float*>(prepared[1].data_ptr()), \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(2), query.stride(1), \
+        prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
+        prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
+        output.stride(0), output.stride(2), output.stride(1), \
+        0, 0, \
+        prepared[1].stride(0), prepared[1].stride(1), \
+        kHND, sm_scale); \
+    }
+#define SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(BC_, BR_, PAD_, F16ACC_, VLANE_, STREAM_) \
+    qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, false, PAD_, true, true, F16ACC_, __half, true, int8_t, false, false, VLANE_, STREAM_><<<grid, block, 0>>>( \
+        reinterpret_cast<const __half*>(query.data_ptr()), reinterpret_cast<int8_t*>(prepared[0].data_ptr()), \
+        reinterpret_cast<const __half*>(value.data_ptr()), \
+        reinterpret_cast<__half*>(output.data_ptr()), \
+        nullptr, reinterpret_cast<float*>(prepared[1].data_ptr()), \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(2), query.stride(1), \
+        prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
+        value.stride(0), value.stride(2), value.stride(1), \
+        output.stride(0), output.stride(2), output.stride(1), \
+        0, 0, \
+        prepared[1].stride(0), prepared[1].stride(1), \
+        kHND, sm_scale)
+#define SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL(BR_, F16ACC_, SPLIT_) \
+    qk_int8_sv_f16_d64_native_kernel<64, BR_, true, false, 4, true, true, F16ACC_, true, __half, true, SPLIT_><<<grid, block, 0>>>( \
+        reinterpret_cast<const __half*>(query.data_ptr()), reinterpret_cast<int8_t*>(prepared[0].data_ptr()), \
+        reinterpret_cast<const __half*>(value.data_ptr()), \
+        reinterpret_cast<__half*>(output.data_ptr()), \
+        nullptr, reinterpret_cast<float*>(prepared[1].data_ptr()), \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(2), query.stride(1), \
+        prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
+        value.stride(0), value.stride(2), value.stride(1), \
+        output.stride(0), output.stride(2), output.stride(1), \
+        0, 0, \
+        prepared[1].stride(0), prepared[1].stride(1), \
+        kHND, sm_scale)
+#define SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_TV_CAUSAL(BR_, F16ACC_) \
+    qk_int8_sv_f16_d64_native_kernel<64, BR_, true, true, 4, true, false, F16ACC_, true, __half, true><<<grid, block, 0>>>( \
+        reinterpret_cast<const __half*>(query.data_ptr()), reinterpret_cast<int8_t*>(prepared[0].data_ptr()), \
+        reinterpret_cast<const __half*>(prepared[2].data_ptr()), \
+        reinterpret_cast<__half*>(output.data_ptr()), \
+        nullptr, reinterpret_cast<float*>(prepared[1].data_ptr()), \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(2), query.stride(1), \
+        prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
+        prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
+        output.stride(0), output.stride(2), output.stride(1), \
+        0, 0, \
+        prepared[1].stride(0), prepared[1].stride(1), \
+        kHND, sm_scale)
+#define SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(BR_, PAD_) \
+    if (use_f16_raw_value) { \
+      if (use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, true, true); } \
+      else if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, true, false); } \
+      else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, false, true); } \
+      else { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, false, false); } \
+    } else if (use_f16_pv_ordered_qk) { \
+      if (use_f16_klane && use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, true, true); } \
+      else if (use_f16_klane && use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, false, true); } \
+      else if (use_f16_klane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, true, true); } \
+      else if (use_f16_klane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, false, true); } \
+      else if (use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, true, false); } \
+      else if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, false, false); } \
+      else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, true, false); } \
+      else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, false, false); } \
+    } else { \
+      if (use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, true, true, false); } \
+      else if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, true, false, false); } \
+      else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, false, true, false); } \
+      else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, false, false, false); } \
+    }
+    if (!is_causal) {
+      STD_TORCH_CHECK(block_cols == 64,
+                  "native fp16 fused-Q non-causal path currently supports BC64");
+      STD_TORCH_CHECK(!use_f16_raw_value,
+                  "native fp16 fused-Q non-causal path requires transposed prepared values");
+      if (use_f16_pv_ordered_qk) {
+        if (block_rows == 64) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(64, 4, true, true, false, false); }
+        else if (block_rows == 256) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(256, 4, true, true, false, false); }
+        else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(128, 4, true, true, false, false); }
+      } else {
+        if (block_rows == 64) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(64, 4, true, false, false, false); }
+        else if (block_rows == 256) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(256, 4, true, false, false, false); }
+        else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(128, 4, true, false, false, false); }
+      }
+    } else if (use_f16_fused_q_1q) {
+      if (use_f16_fused_q_1q_tv && block_rows == 128) {
+        SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_TV_CAUSAL(128, true);
+      } else if (use_f16_fused_q_1q_tv) {
+        SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_TV_CAUSAL(64, true);
+      } else if (block_rows == 128) {
+        SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL(128, true, false);
+      } else {
+        SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL(64, true, false);
+      }
+    } else if (block_rows == 64) {
+      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(64, 4);
+    } else if (block_rows == 256) {
+      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(256, 4);
+    } else if (block_rows == 512) {
+      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(512, 4);
+    } else if (block_rows == 1024) {
+      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(1024, 4);
+    } else if (q_len >= 8192) {
+      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(128, 8);
+    } else if (q_len >= 1024) {
+      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(128, 4);
+    } else {
+      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(128, 16);
+    }
+#undef SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL
+#undef SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_TV_CAUSAL
+#undef SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL
+#undef SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL
+#undef SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL
+#undef SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL
+    hip_kernel_launch_check();
+  } else if (use_raw_f16_value) {
+    std::vector<Tensor> prepared = quant_qk_int8_hnd_gfx12(query, key);
+    qk_int8_sv_f16_d64_native_attn_gfx12_impl(
+        prepared[0], prepared[2], value, output, prepared[1], prepared[3],
+        kHND, is_causal, sm_scale, kv_len);
+  } else {
+    const bool use_f16_separate_prepared =
+        is_causal && head_dim == 64 && q_len == 4096 &&
+        query.scalar_type() == ScalarType::Half;
+    std::vector<Tensor> prepared =
+        use_f16_separate_prepared ?
+             prepare_qkv_hnd_gfx12<__half, false>(query, key, value) :
+             prepare_qkv_hnd_packed_gfx12<__half, false>(query, key, value);
+    qk_int8_sv_f16_d64_native_attn_gfx12_impl(
+        prepared[0], prepared[2], prepared[4], output, prepared[1], prepared[3],
+        kHND, is_causal, sm_scale, kv_len);
+  }
+  return output;
+}
+
+static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
+    Tensor query,
+    Tensor key,
+    Tensor value,
+    Tensor output,
+    Tensor query_scale,
+    Tensor key_scale,
+    int tensor_layout,
+    int is_causal,
+    float sm_scale,
+    int64_t valid_kv_len,
+    const float* value_scale_ptr) {
+  STD_TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && output.is_cuda(),
+              "native gfx12 tensors must be CUDA/HIP tensors");
+  STD_TORCH_CHECK(query.scalar_type() == ScalarType::Char, "query must be int8");
+  STD_TORCH_CHECK(key.scalar_type() == ScalarType::Char, "key must be int8");
+  const bool value_is_fp8 = value.scalar_type() == ScalarType::Byte;
+  STD_TORCH_CHECK(value.scalar_type() == ScalarType::Half || value_is_fp8,
+              "value must be fp16 or raw OCP e4m3 fp8 bytes");
+  STD_TORCH_CHECK(value_scale_ptr == nullptr || value_is_fp8,
+              "value_scale is only valid for the fp8 value path");
+  const bool output_is_bf16 = output.scalar_type() == ScalarType::BFloat16;
+  STD_TORCH_CHECK(output.scalar_type() == ScalarType::Half || (value_is_fp8 && output_is_bf16),
+              "output must be fp16, or bf16 for the fp8 value path");
+  STD_TORCH_CHECK(query_scale.scalar_type() == ScalarType::Float, "query_scale must be fp32");
+  STD_TORCH_CHECK(key_scale.scalar_type() == ScalarType::Float, "key_scale must be fp32");
+  STD_TORCH_CHECK(tensor_layout == kHND || tensor_layout == kNHD, "invalid tensor_layout");
+  const int64_t head_dim = query.size(-1);
+  const bool value_maybe_transposed_hnd =
+      tensor_layout == kHND && value.dim() == 4 && value.size(2) == head_dim;
+  STD_TORCH_CHECK(key.size(-1) == head_dim &&
+                  (value.size(-1) == head_dim || value_maybe_transposed_hnd),
+              "query, key, and value must have matching head_dim");
+  STD_TORCH_CHECK(head_dim == 16 || head_dim == 64 || (value_is_fp8 && head_dim == 128),
+              "native gfx12 path supports D16/D64, plus D128 for the fp8 2q path");
+
+  const int64_t batch = query.size(0);
+  const int64_t q_heads = tensor_layout == kNHD ? query.size(2) : query.size(1);
+  const int64_t q_len = tensor_layout == kNHD ? query.size(1) : query.size(2);
+  const int64_t kv_heads = tensor_layout == kNHD ? key.size(2) : key.size(1);
+  const int64_t padded_kv_len = tensor_layout == kNHD ? key.size(1) : key.size(2);
+  const int64_t kv_len = valid_kv_len > 0 ? valid_kv_len : padded_kv_len;
+  STD_TORCH_CHECK(kv_len > 0 && kv_len <= padded_kv_len,
+              "valid_kv_len must be in (0, padded_kv_len]");
+  const bool value_transposed_hnd = value_maybe_transposed_hnd && value.size(3) >= padded_kv_len;
+  STD_TORCH_CHECK(!value_maybe_transposed_hnd || value_transposed_hnd,
+              "transposed HND value must have shape [B, H, D, padded_kv_len]");
+  STD_TORCH_CHECK(!value_transposed_hnd || value.is_contiguous(),
+              "transposed HND value must be contiguous");
+  STD_TORCH_CHECK((q_len % 64) == 0 && (padded_kv_len % 64) == 0,
+              "native gfx12 path requires q_len and kv_len multiples of 64");
+  STD_TORCH_CHECK(!is_causal || q_len == padded_kv_len,
+              "native gfx12 causal path currently requires q_len == kv_len");
+  STD_TORCH_CHECK((q_heads % kv_heads) == 0, "q_heads must be divisible by kv_heads");
+  STD_TORCH_CHECK(query_scale.stride(-1) == 1 && key_scale.stride(-1) == 1,
+              "scale tensors must have contiguous scale columns");
+  const bool hnd_contiguous = tensor_layout == kHND &&
+      query.is_contiguous() && key.is_contiguous() &&
+      value.is_contiguous() && output.is_contiguous();
+
+  int block_cols = 64;
+  bool use_2q = !value_is_fp8;
+  bool use_f16_causal_1q = false;
+  bool use_fp8_2q = value_is_fp8;
+  if (!value_is_fp8 && !value_transposed_hnd &&
+      head_dim == 64 && q_len <= 1024) {
+    use_2q = false;
+  }
+  if (is_causal) {
+    if (value_is_fp8) {
+      use_2q = false;
+      use_f16_causal_1q = false;
+      use_fp8_2q = true;
+    } else {
+      use_fp8_2q = false;
+      use_f16_causal_1q = false;
+      use_2q = true;
+    }
+  }
+  STD_TORCH_CHECK(!(value_transposed_hnd && !value_is_fp8 && !use_2q && !use_f16_causal_1q),
+              "transposed fp16 value path currently requires tqk1/tqk2/auto mode");
+  int block_rows = q_len <= 64 ? 64 : 128;
+  if (use_2q) {
+    block_rows = q_len <= 64 ? 64 : 128;
+  } else if (use_fp8_2q && block_rows != 32 && block_rows != 64 &&
+             block_rows != 256 && block_rows != 512) {
+    block_rows = q_len <= 64 ? 64 : 128;
+  }
+  if (is_causal && head_dim == 16 && (use_2q || use_fp8_2q)) {
+    block_rows = (use_fp8_2q && q_len <= 1024) ? 64 : 128;
+  }
+  if (use_f16_causal_1q) {
+    block_cols = 64;
+    block_rows = 64;
+  }
+  if (!is_causal && use_fp8_2q && head_dim == 64 &&
+      (q_len >= 2048 || value_transposed_hnd) && (q_len % 256) == 0) {
+    block_rows = select_fp8_d64_block_rows_gfx12(q_len, is_causal, value_transposed_hnd);
+  }
+  if (is_causal && use_fp8_2q && head_dim == 64 &&
+      (q_len % 256) == 0) {
+    block_rows = select_fp8_d64_block_rows_gfx12(q_len, is_causal, value_transposed_hnd);
+  }
+  if (is_causal && use_fp8_2q && head_dim == 128 &&
+      value_transposed_hnd && q_len >= 2048 && q_len <= 4096) {
+    block_cols = 32;
+  }
+  if (!is_causal && use_2q && value_transposed_hnd &&
+      q_len >= 2048 && (q_len % 256) == 0) {
+    block_rows = 256;
+  }
+  if (is_causal && use_2q && head_dim == 64 && value_transposed_hnd &&
+      q_len >= 4096 && (q_len % 256) == 0) {
+    block_rows = 256;
+  }
+  STD_TORCH_CHECK(!(use_fp8_2q && block_rows == 64 && block_cols == 128),
+              "native fp8 2q BR64 is currently specialized for BC32/BC64");
+  STD_TORCH_CHECK(!(use_fp8_2q && block_rows == 256 && block_cols != 64),
+              "native fp8 2q BR256 is currently specialized for BC64");
+  STD_TORCH_CHECK(!(use_2q && value_transposed_hnd && block_cols != 64),
+              "native fp16 transposed value 2q path currently supports BC64");
+  STD_TORCH_CHECK(!(use_2q && block_rows != 32 && block_rows != 64 &&
+                    block_rows != 128 && block_rows != 256 && block_rows != 512 &&
+                    block_rows != 1024),
+              "native fp16 2q path currently supports BR32/BR64/BR128/BR256/BR512/BR1024");
+  STD_TORCH_CHECK(!(use_2q && !value_transposed_hnd && block_rows != 64 && block_rows != 128),
+              "native fp16 non-transposed 2q path currently supports BR64/BR128");
+  STD_TORCH_CHECK(!(use_f16_causal_1q &&
+                ((block_rows != 64 && block_rows != 128) || block_cols != 64)),
+              "native fp16 single-q causal path currently supports BR64/BR128/BC64");
+  STD_TORCH_CHECK((q_len % block_rows) == 0,
+              "native gfx12 path requires q_len to be a multiple of the selected block rows");
+
+  const bool use_f16_flat_q_schedule =
+      head_dim == 64 && !value_is_fp8 && is_causal && use_2q &&
+      value_transposed_hnd && q_len >= 2048;
+  const int64_t q_blocks = (q_len + block_rows - 1) / block_rows;
+  dim3 block((use_2q || use_fp8_2q) ? block_rows : (block_rows == 128 ? 256 : 128));
+  dim3 grid(q_blocks, q_heads, batch);
+  dim3 grid_f16_flat(q_blocks * q_heads * batch);
+    const bool use_f16_tvload =
+      !value_is_fp8 && is_causal && hnd_contiguous && !value_transposed_hnd &&
+      q_len >= 1024;
+  const bool use_f16_pv_accum =
+      !value_is_fp8 && is_causal && value_transposed_hnd && block_cols == 64 &&
+      q_len >= 1024;
+  const bool use_f16_pv_ordered_qk =
+      use_f16_pv_accum && q_len >= 4096;
+  const bool use_f16_vlane =
+      head_dim == 64 && !value_is_fp8 && is_causal && value_transposed_hnd &&
+      q_len == 4096 && block_rows == 256;
+  const bool use_f16_streamk =
+      head_dim == 64 && !value_is_fp8 && is_causal && value_transposed_hnd &&
+      q_len == 4096 && block_rows == 256;
+#define SAGEATTN_LAUNCH_FP8_2Q_OUT(BC_, HD_, HND_, BR_, OUT_T_) \
+  if (is_causal) { \
+    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), HND_, BR_, false, true, OUT_T_><<<grid, block, 0>>>( \
+      reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+      reinterpret_cast<uint8_t*>(value.data_ptr()), \
+      reinterpret_cast<OUT_T_*>(output.data_ptr()), \
+      reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
+      value_scale_ptr, \
+      batch, q_len, kv_len, q_heads, kv_heads, \
+      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+      value.stride(0), value.stride(tensor_layout == kNHD ? 1 : 2), value.stride(tensor_layout == kNHD ? 2 : 1), \
+      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+      query_scale.stride(0), query_scale.stride(1), \
+      key_scale.stride(0), key_scale.stride(1), \
+      tensor_layout, sm_scale); \
+  } else { \
+    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), HND_, BR_, false, false, OUT_T_><<<grid, block, 0>>>( \
+      reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+      reinterpret_cast<uint8_t*>(value.data_ptr()), \
+      reinterpret_cast<OUT_T_*>(output.data_ptr()), \
+      reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
+      value_scale_ptr, \
+      batch, q_len, kv_len, q_heads, kv_heads, \
+      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+      value.stride(0), value.stride(tensor_layout == kNHD ? 1 : 2), value.stride(tensor_layout == kNHD ? 2 : 1), \
+      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+      query_scale.stride(0), query_scale.stride(1), \
+      key_scale.stride(0), key_scale.stride(1), \
+      tensor_layout, sm_scale); \
+  }
+#define SAGEATTN_LAUNCH_FP8_2Q(BC_, HD_, HND_, BR_) \
+  if (output_is_bf16) { \
+    SAGEATTN_LAUNCH_FP8_2Q_OUT(BC_, HD_, HND_, BR_, __hip_bfloat16); \
+  } else { \
+    SAGEATTN_LAUNCH_FP8_2Q_OUT(BC_, HD_, HND_, BR_, __half); \
+  }
+#define SAGEATTN_LAUNCH_FP8_2Q_TV_OUT(BC_, HD_, BR_, OUT_T_) \
+  if (is_causal) { \
+    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), true, BR_, true, true, OUT_T_><<<grid, block, 0>>>( \
+      reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+      reinterpret_cast<uint8_t*>(value.data_ptr()), \
+      reinterpret_cast<OUT_T_*>(output.data_ptr()), \
+      reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
+      value_scale_ptr, \
+      batch, q_len, kv_len, q_heads, kv_heads, \
+      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+      value.stride(0), value.stride(2), value.stride(1), \
+      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+      query_scale.stride(0), query_scale.stride(1), \
+      key_scale.stride(0), key_scale.stride(1), \
+      tensor_layout, sm_scale); \
+  } else { \
+    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), true, BR_, true, false, OUT_T_><<<grid, block, 0>>>( \
+      reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+      reinterpret_cast<uint8_t*>(value.data_ptr()), \
+      reinterpret_cast<OUT_T_*>(output.data_ptr()), \
+      reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
+      value_scale_ptr, \
+      batch, q_len, kv_len, q_heads, kv_heads, \
+      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+      value.stride(0), value.stride(2), value.stride(1), \
+      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+      query_scale.stride(0), query_scale.stride(1), \
+      key_scale.stride(0), key_scale.stride(1), \
+      tensor_layout, sm_scale); \
+  }
+#define SAGEATTN_LAUNCH_FP8_2Q_TV(BC_, HD_, BR_) \
+  if (output_is_bf16) { \
+    SAGEATTN_LAUNCH_FP8_2Q_TV_OUT(BC_, HD_, BR_, __hip_bfloat16); \
+  } else { \
+    SAGEATTN_LAUNCH_FP8_2Q_TV_OUT(BC_, HD_, BR_, __half); \
+  }
+#define SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, GRID_, FLAT_) \
+  qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, int8_t, false, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_, 64, FLAT_><<<GRID_, block, 0>>>( \
+      reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+      reinterpret_cast<const __half*>(value.data_ptr()), \
+      reinterpret_cast<__half*>(output.data_ptr()), \
+      reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
+      batch, q_len, kv_len, q_heads, kv_heads, \
+      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+      value.stride(0), value.stride(2), value.stride(1), \
+      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+      query_scale.stride(0), query_scale.stride(1), \
+      key_scale.stride(0), key_scale.stride(1), \
+      tensor_layout, sm_scale)
+#define SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_) \
+  if (use_f16_flat_q_schedule) { \
+    SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, grid_f16_flat, true); \
+  } else { \
+    SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, grid, false); \
+  }
+#define SAGEATTN_LAUNCH_F16_D16_2Q_TV(BC_, BR_, PAD_, CAUSAL_, F16ACC_) \
+  qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, CAUSAL_, false, F16ACC_, int8_t, false, int8_t, false, false, false, false, false, 16><<<grid, block, 0>>>( \
+      reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+      reinterpret_cast<const __half*>(value.data_ptr()), \
+      reinterpret_cast<__half*>(output.data_ptr()), \
+      reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
+      batch, q_len, kv_len, q_heads, kv_heads, \
+      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+      value.stride(0), value.stride(2), value.stride(1), \
+      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+      query_scale.stride(0), query_scale.stride(1), \
+      key_scale.stride(0), key_scale.stride(1), \
+      tensor_layout, sm_scale)
+#define SAGEATTN_LAUNCH_F16_2Q_TV(BC_, BR_, PAD_) \
+  if (is_causal) { \
+    if (use_f16_pv_accum) { \
+      if (use_f16_pv_ordered_qk) { \
+        if (use_f16_vlane && (BC_) == 64 && use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, true, true, false); } \
+        else if (use_f16_vlane && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, true, false, false); } \
+        else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, true, false); } \
+        else { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, false, false); } \
+      } else { \
+        if (use_f16_vlane && (BC_) == 64 && use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, false, true, true, false); } \
+        else if (use_f16_vlane && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, false, true, false, false); } \
+        else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, false, false, true, false); } \
+        else { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, false, false, false, false); } \
+      } \
+    } else { \
+      if (use_f16_vlane && (BC_) == 64 && use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, false, false, true, true, false); } \
+      else if (use_f16_vlane && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, false, false, true, false, false); } \
+      else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, false, false, false, true, false); } \
+      else { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, false, false, false, false, false); } \
+    } \
+  } else { \
+    qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_><<<grid, block, 0>>>( \
+        reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+        reinterpret_cast<const __half*>(value.data_ptr()), \
+        reinterpret_cast<__half*>(output.data_ptr()), \
+        reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+        key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+        value.stride(0), value.stride(2), value.stride(1), \
+        output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+        query_scale.stride(0), query_scale.stride(1), \
+        key_scale.stride(0), key_scale.stride(1), \
+        tensor_layout, sm_scale); \
+  }
+#define SAGEATTN_LAUNCH_F16_2Q(BC_, HND_, BR_) \
+  if (is_causal) { \
+    qk_int8_sv_f16_d64_native_2q_kernel<BC_, HND_, BR_, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD, true><<<grid, block, 0>>>( \
+        reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+        reinterpret_cast<const __half*>(value.data_ptr()), \
+        reinterpret_cast<__half*>(output.data_ptr()), \
+        reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+        key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+        value.stride(0), value.stride(tensor_layout == kNHD ? 1 : 2), value.stride(tensor_layout == kNHD ? 2 : 1), \
+        output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+        query_scale.stride(0), query_scale.stride(1), \
+        key_scale.stride(0), key_scale.stride(1), \
+        tensor_layout, sm_scale); \
+  } else { \
+    qk_int8_sv_f16_d64_native_2q_kernel<BC_, HND_, BR_><<<grid, block, 0>>>( \
+        reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+        reinterpret_cast<const __half*>(value.data_ptr()), \
+        reinterpret_cast<__half*>(output.data_ptr()), \
+        reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+        key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+        value.stride(0), value.stride(tensor_layout == kNHD ? 1 : 2), value.stride(tensor_layout == kNHD ? 2 : 1), \
+        output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+        query_scale.stride(0), query_scale.stride(1), \
+        key_scale.stride(0), key_scale.stride(1), \
+        tensor_layout, sm_scale); \
+  }
+#define SAGEATTN_LAUNCH_F16_2Q_TVLOAD_CAUSAL(BC_, BR_, PAD_, F16ACC_) \
+    qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, false, PAD_, true, true, F16ACC_><<<grid, block, 0>>>( \
+        reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+        reinterpret_cast<const __half*>(value.data_ptr()), \
+        reinterpret_cast<__half*>(output.data_ptr()), \
+        reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+        key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+        value.stride(0), value.stride(tensor_layout == kNHD ? 1 : 2), value.stride(tensor_layout == kNHD ? 2 : 1), \
+        output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+        query_scale.stride(0), query_scale.stride(1), \
+        key_scale.stride(0), key_scale.stride(1), \
+        tensor_layout, sm_scale)
+#define SAGEATTN_LAUNCH_F16_2Q_TVLOAD(BC_, BR_, PAD_) \
+  if (is_causal) { \
+    SAGEATTN_LAUNCH_F16_2Q_TVLOAD_CAUSAL(BC_, BR_, PAD_, false); \
+  } else { \
+    qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, false, PAD_, false, true><<<grid, block, 0>>>( \
+        reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+        reinterpret_cast<const __half*>(value.data_ptr()), \
+        reinterpret_cast<__half*>(output.data_ptr()), \
+        reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+        key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+        value.stride(0), value.stride(tensor_layout == kNHD ? 1 : 2), value.stride(tensor_layout == kNHD ? 2 : 1), \
+        output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+        query_scale.stride(0), query_scale.stride(1), \
+        key_scale.stride(0), key_scale.stride(1), \
+        tensor_layout, sm_scale); \
+  }
+#define SAGEATTN_LAUNCH_F16_1Q(BC_, BR_) \
+  qk_int8_sv_f16_d64_native_kernel<BC_, BR_><<<grid, block, 0>>>( \
+      reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+      reinterpret_cast<const __half*>(value.data_ptr()), \
+      reinterpret_cast<__half*>(output.data_ptr()), \
+      reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
+      batch, q_len, kv_len, q_heads, kv_heads, \
+      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+      value.stride(0), value.stride(tensor_layout == kNHD ? 1 : 2), value.stride(tensor_layout == kNHD ? 2 : 1), \
+      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+      query_scale.stride(0), query_scale.stride(1), \
+      key_scale.stride(0), key_scale.stride(1), \
+      tensor_layout, sm_scale)
+#define SAGEATTN_LAUNCH_F16_1Q_CAUSAL(BR_, TRANSPOSED_, TVLOAD_, PAD_, F16ACC_) \
+  qk_int8_sv_f16_d64_native_kernel<64, BR_, true, TRANSPOSED_, PAD_, true, TVLOAD_, F16ACC_><<<grid, block, 0>>>( \
+      reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+      reinterpret_cast<const __half*>(value.data_ptr()), \
+      reinterpret_cast<__half*>(output.data_ptr()), \
+      reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
+      batch, q_len, kv_len, q_heads, kv_heads, \
+      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+      value.stride(0), (TRANSPOSED_ ? value.stride(2) : value.stride(tensor_layout == kNHD ? 1 : 2)), \
+      (TRANSPOSED_ ? value.stride(1) : value.stride(tensor_layout == kNHD ? 2 : 1)), \
+      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+      query_scale.stride(0), query_scale.stride(1), \
+      key_scale.stride(0), key_scale.stride(1), \
+      tensor_layout, sm_scale)
+  if (use_f16_causal_1q) {
+    STD_TORCH_CHECK(hnd_contiguous, "fp16 single-q causal path requires contiguous HND tensors");
+    const bool use_f16_1q_pv_accum = use_f16_pv_accum;
+#define SAGEATTN_DISPATCH_F16_1Q_CAUSAL(BR_, TRANSPOSED_, TVLOAD_, PAD_) \
+    if (use_f16_1q_pv_accum) { \
+      SAGEATTN_LAUNCH_F16_1Q_CAUSAL(BR_, TRANSPOSED_, TVLOAD_, PAD_, true); \
+    } else { \
+      SAGEATTN_LAUNCH_F16_1Q_CAUSAL(BR_, TRANSPOSED_, TVLOAD_, PAD_, false); \
+    }
+    if (value_transposed_hnd) {
+      if (q_len >= 4096) {
+        if (block_rows == 128) { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(128, true, false, 8); }
+        else { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(64, true, false, 8); }
+      } else if (q_len >= 1024) {
+        if (block_rows == 128) { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(128, true, false, 4); }
+        else { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(64, true, false, 4); }
+      } else {
+        if (block_rows == 128) { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(128, true, false, 16); }
+        else { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(64, true, false, 16); }
+      }
+    } else if (use_f16_tvload) {
+      if (block_rows == 128) { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(128, false, true, 4); }
+      else { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(64, false, true, 4); }
+    } else {
+      if (block_rows == 128) { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(128, false, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD); }
+      else { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(64, false, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD); }
+    }
+#undef SAGEATTN_DISPATCH_F16_1Q_CAUSAL
+  } else if (use_fp8_2q && value_transposed_hnd) {
+    STD_TORCH_CHECK(hnd_contiguous, "transposed fp8 value path requires contiguous HND Q/K/O");
+    STD_TORCH_CHECK(block_cols == 32 || block_cols == 64,
+                "transposed fp8 value path currently supports BC32/BC64");
+    STD_TORCH_CHECK(!(block_rows == 256 && block_cols != 64),
+                "transposed fp8 value BR256 path currently supports BC64");
+    if (head_dim == 16) {
+      if (block_cols == 32) {
+        if (block_rows == 32) {
+          SAGEATTN_LAUNCH_FP8_2Q_TV(32, 16, 32);
+        } else if (block_rows == 64) {
+          SAGEATTN_LAUNCH_FP8_2Q_TV(32, 16, 64);
+        } else {
+          SAGEATTN_LAUNCH_FP8_2Q_TV(32, 16, 128);
+        }
+      } else if (block_rows == 32) {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 16, 32);
+      } else if (block_rows == 64) {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 16, 64);
+      } else if (block_rows == 256) {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 16, 256);
+      } else if (block_rows == 512) {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 16, 512);
+      } else {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 16, 128);
+      }
+    } else if (block_rows == 512 && block_cols == 32 && head_dim == 128) {
+      SAGEATTN_LAUNCH_FP8_2Q_TV(32, 128, 512);
+    } else if (block_rows == 512 && block_cols == 32) {
+      SAGEATTN_LAUNCH_FP8_2Q_TV(32, 64, 512);
+    } else if (block_rows == 512 && head_dim == 128) {
+      SAGEATTN_LAUNCH_FP8_2Q_TV(64, 128, 512);
+    } else if (block_rows == 512) {
+      SAGEATTN_LAUNCH_FP8_2Q_TV(64, 64, 512);
+    } else if (block_rows == 256 && head_dim == 128) {
+      SAGEATTN_LAUNCH_FP8_2Q_TV(64, 128, 256);
+    } else if (block_rows == 256) {
+      SAGEATTN_LAUNCH_FP8_2Q_TV(64, 64, 256);
+    } else if (block_cols == 32 && head_dim == 128) {
+      if (block_rows == 32) {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(32, 128, 32);
+      } else if (block_rows == 64) {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(32, 128, 64);
+      } else {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(32, 128, 128);
+      }
+    } else if (block_cols == 32) {
+      if (block_rows == 32) {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(32, 64, 32);
+      } else if (block_rows == 64) {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(32, 64, 64);
+      } else {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(32, 64, 128);
+      }
+    } else if (head_dim == 128) {
+      if (block_rows == 32) {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 128, 32);
+      } else if (block_rows == 64) {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 128, 64);
+      } else {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 128, 128);
+      }
+    } else {
+      if (block_rows == 32) {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 64, 32);
+      } else if (block_rows == 64) {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 64, 64);
+      } else {
+        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 64, 128);
+      }
+    }
+  } else if (use_fp8_2q && block_rows == 64 && block_cols == 32 && head_dim == 128) {
+    if (hnd_contiguous) {
+      SAGEATTN_LAUNCH_FP8_2Q(32, 128, true, 64);
+    } else {
+      SAGEATTN_LAUNCH_FP8_2Q(32, 128, false, 64);
+    }
+  } else if (use_fp8_2q && block_rows == 64 && block_cols == 32) {
+    if (hnd_contiguous) {
+      SAGEATTN_LAUNCH_FP8_2Q(32, 64, true, 64);
+    } else {
+      SAGEATTN_LAUNCH_FP8_2Q(32, 64, false, 64);
+    }
+  } else if (use_fp8_2q && block_rows == 64 && head_dim == 128) {
+    if (hnd_contiguous) {
+      SAGEATTN_LAUNCH_FP8_2Q(64, 128, true, 64);
+    } else {
+      SAGEATTN_LAUNCH_FP8_2Q(64, 128, false, 64);
+    }
+  } else if (use_fp8_2q && block_rows == 64) {
+    if (hnd_contiguous) {
+      SAGEATTN_LAUNCH_FP8_2Q(64, 64, true, 64);
+    } else {
+      SAGEATTN_LAUNCH_FP8_2Q(64, 64, false, 64);
+    }
+  } else if (use_fp8_2q && block_rows == 256 && head_dim == 128) {
+    if (hnd_contiguous) {
+      SAGEATTN_LAUNCH_FP8_2Q(64, 128, true, 256);
+    } else {
+      SAGEATTN_LAUNCH_FP8_2Q(64, 128, false, 256);
+    }
+  } else if (use_fp8_2q && block_rows == 256) {
+    if (hnd_contiguous) {
+      SAGEATTN_LAUNCH_FP8_2Q(64, 64, true, 256);
+    } else {
+      SAGEATTN_LAUNCH_FP8_2Q(64, 64, false, 256);
+    }
+  } else if (use_fp8_2q && block_cols == 32 && head_dim == 128) {
+    if (hnd_contiguous) {
+      SAGEATTN_LAUNCH_FP8_2Q(32, 128, true, 128);
+    } else {
+      SAGEATTN_LAUNCH_FP8_2Q(32, 128, false, 128);
+    }
+  } else if (use_fp8_2q && block_cols == 32) {
+    if (hnd_contiguous) {
+      SAGEATTN_LAUNCH_FP8_2Q(32, 64, true, 128);
+    } else {
+      SAGEATTN_LAUNCH_FP8_2Q(32, 64, false, 128);
+    }
+  } else if (use_fp8_2q && block_cols == 128 && head_dim == 128) {
+    qk_int8_sv_f8_native_2q_kernel<128, 128, 0, 8><<<grid, block, 0>>>(
+        reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()),
+        reinterpret_cast<uint8_t*>(value.data_ptr()),
+        reinterpret_cast<__half*>(output.data_ptr()),
+        reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+        value_scale_ptr,
+        batch, q_len, kv_len, q_heads, kv_heads,
+        query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1),
+        key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1),
+        value.stride(0), value.stride(tensor_layout == kNHD ? 1 : 2), value.stride(tensor_layout == kNHD ? 2 : 1),
+        output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1),
+        query_scale.stride(0), query_scale.stride(1),
+        key_scale.stride(0), key_scale.stride(1),
+        tensor_layout, sm_scale);
+  } else if (use_fp8_2q && block_cols == 128) {
+    qk_int8_sv_f8_native_2q_kernel<128, 64, 0, 4><<<grid, block, 0>>>(
+        reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()),
+        reinterpret_cast<uint8_t*>(value.data_ptr()),
+        reinterpret_cast<__half*>(output.data_ptr()),
+        reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()),
+        value_scale_ptr,
+        batch, q_len, kv_len, q_heads, kv_heads,
+        query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1),
+        key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1),
+        value.stride(0), value.stride(tensor_layout == kNHD ? 1 : 2), value.stride(tensor_layout == kNHD ? 2 : 1),
+        output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1),
+        query_scale.stride(0), query_scale.stride(1),
+        key_scale.stride(0), key_scale.stride(1),
+        tensor_layout, sm_scale);
+  } else if (use_fp8_2q && head_dim == 128) {
+    if (hnd_contiguous) {
+      SAGEATTN_LAUNCH_FP8_2Q(64, 128, true, 128);
+    } else {
+      SAGEATTN_LAUNCH_FP8_2Q(64, 128, false, 128);
+    }
+  } else if (use_fp8_2q) {
+    if (hnd_contiguous) {
+      SAGEATTN_LAUNCH_FP8_2Q(64, 64, true, 128);
+    } else {
+      SAGEATTN_LAUNCH_FP8_2Q(64, 64, false, 128);
+    }
+  } else if (use_2q && value_transposed_hnd) {
+    STD_TORCH_CHECK(hnd_contiguous, "transposed fp16 value path requires contiguous HND Q/K/O");
+    if (head_dim == 16) {
+      if (is_causal) {
+        if (block_rows == 32) {
+          SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 32, 4, true, true);
+        } else if (block_rows == 64) {
+          SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 64, 4, true, true);
+        } else if (block_rows == 256) {
+          SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 256, 4, true, true);
+        } else {
+          SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 128, 4, true, true);
+        }
+      } else if (block_rows == 32) {
+        SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 32, 4, false, true);
+      } else if (block_rows == 64) {
+        SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 64, 4, false, true);
+      } else if (block_rows == 256) {
+        SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 256, 4, false, true);
+      } else {
+        SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 128, 4, false, true);
+      }
+    } else if (block_rows == 32) {
+      SAGEATTN_LAUNCH_F16_2Q_TV(64, 32, 4);
+    } else if (block_rows == 64) {
+      SAGEATTN_LAUNCH_F16_2Q_TV(64, 64, 4);
+    } else if (block_rows == 256) {
+      SAGEATTN_LAUNCH_F16_2Q_TV(64, 256, 4);
+    } else if (block_rows == 512) {
+      SAGEATTN_LAUNCH_F16_2Q_TV(64, 512, 4);
+    } else if (block_rows == 1024) {
+      SAGEATTN_LAUNCH_F16_2Q_TV(64, 1024, 4);
+    } else if (q_len >= 8192) {
+      SAGEATTN_LAUNCH_F16_2Q_TV(64, 128, 8);
+    } else if (q_len >= 1024) {
+      SAGEATTN_LAUNCH_F16_2Q_TV(64, 128, 4);
+    } else {
+      SAGEATTN_LAUNCH_F16_2Q_TV(64, 128, 16);
+    }
+  } else if (use_2q && block_cols == 128) {
+    if (hnd_contiguous) {
+      if (use_f16_tvload) {
+        if (block_rows == 64) {
+          SAGEATTN_LAUNCH_F16_2Q_TVLOAD(128, 64, 16);
+        } else {
+          SAGEATTN_LAUNCH_F16_2Q_TVLOAD(128, 128, 16);
+        }
+      } else {
+        if (block_rows == 64) {
+          SAGEATTN_LAUNCH_F16_2Q(128, true, 64);
+        } else {
+          SAGEATTN_LAUNCH_F16_2Q(128, true, 128);
+        }
+      }
+    } else {
+      if (block_rows == 64) {
+        SAGEATTN_LAUNCH_F16_2Q(128, false, 64);
+      } else {
+        SAGEATTN_LAUNCH_F16_2Q(128, false, 128);
+      }
+    }
+  } else if (use_2q) {
+    if (hnd_contiguous) {
+      if (use_f16_tvload) {
+        if (block_rows == 64) {
+          if (is_causal && use_f16_pv_accum) {
+            SAGEATTN_LAUNCH_F16_2Q_TVLOAD_CAUSAL(64, 64, 4, true);
+          } else {
+            SAGEATTN_LAUNCH_F16_2Q_TVLOAD(64, 64, 4);
+          }
+        } else {
+          if (is_causal && use_f16_pv_accum) {
+            SAGEATTN_LAUNCH_F16_2Q_TVLOAD_CAUSAL(64, 128, 4, true);
+          } else {
+            SAGEATTN_LAUNCH_F16_2Q_TVLOAD(64, 128, 4);
+          }
+        }
+      } else {
+        if (block_rows == 64) {
+          SAGEATTN_LAUNCH_F16_2Q(64, true, 64);
+        } else {
+          SAGEATTN_LAUNCH_F16_2Q(64, true, 128);
+        }
+      }
+    } else {
+      if (block_rows == 64) {
+        SAGEATTN_LAUNCH_F16_2Q(64, false, 64);
+      } else {
+        SAGEATTN_LAUNCH_F16_2Q(64, false, 128);
+      }
+    }
+  } else if (block_cols == 128 && block_rows == 128) {
+    SAGEATTN_LAUNCH_F16_1Q(128, 128);
+  } else if (block_cols == 128) {
+    SAGEATTN_LAUNCH_F16_1Q(128, 64);
+  } else if (block_rows == 128) {
+    SAGEATTN_LAUNCH_F16_1Q(64, 128);
+  } else {
+    SAGEATTN_LAUNCH_F16_1Q(64, 64);
+  }
+  hip_kernel_launch_check();
+  return new_empty_like(query, {0}, ScalarType::Float);
+}
+
+static const float* checked_value_scale_ptr_gfx12(
+    Tensor value_scale,
+    int64_t batch,
+    int64_t kv_heads,
+    int64_t head_dim) {
+  STD_TORCH_CHECK(value_scale.is_cuda(), "value_scale must be a CUDA/HIP tensor");
+  STD_TORCH_CHECK(value_scale.scalar_type() == ScalarType::Float,
+              "value_scale must be fp32");
+  STD_TORCH_CHECK(value_scale.dim() == 3 && value_scale.is_contiguous(),
+              "value_scale must be contiguous [B, H_kv, D]");
+  STD_TORCH_CHECK(value_scale.size(0) == batch &&
+                  value_scale.size(1) == kv_heads &&
+                  value_scale.size(2) == head_dim,
+              "value_scale shape must match [B, H_kv, D]");
+  return reinterpret_cast<const float*>(value_scale.data_ptr());
+}
+
+static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
+    Tensor query,
+    Tensor key,
+    Tensor value,
+    Tensor output,
+    Tensor key_scale,
+    const float* value_scale_ptr,
+    int tensor_layout,
+    int is_causal,
+    float sm_scale,
+    int64_t valid_kv_len) {
+  STD_TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && output.is_cuda(),
+              "raw-Q gfx12 tensors must be CUDA/HIP tensors");
+  STD_TORCH_CHECK(query.dim() == 4 && key.dim() == 4 && value.dim() == 4 && output.dim() == 4,
+              "raw-Q gfx12 attention expects 4D Q/K/V/O tensors");
+  STD_TORCH_CHECK(query.scalar_type() == ScalarType::Half ||
+                  query.scalar_type() == ScalarType::BFloat16,
+              "raw-Q gfx12 attention supports fp16/bf16 query");
+  STD_TORCH_CHECK(key.scalar_type() == ScalarType::Char,
+              "raw-Q gfx12 attention expects pre-quantized int8 key");
+  STD_TORCH_CHECK(value.scalar_type() == ScalarType::Byte,
+              "raw-Q gfx12 attention expects raw OCP e4m3 fp8 value bytes");
+  STD_TORCH_CHECK(output.scalar_type() == ScalarType::Half ||
+                  output.scalar_type() == ScalarType::BFloat16,
+              "raw-Q gfx12 attention output must be fp16 or bf16");
+  STD_TORCH_CHECK(key_scale.scalar_type() == ScalarType::Float,
+              "raw-Q gfx12 attention key_scale must be fp32");
+  STD_TORCH_CHECK(tensor_layout == kHND || tensor_layout == kNHD, "invalid tensor_layout");
+  STD_TORCH_CHECK(query.is_contiguous() && key.is_contiguous() &&
+                  value.is_contiguous() && output.is_contiguous(),
+              "raw-Q gfx12 attention expects contiguous tensors");
+
+  const int64_t head_dim = query.size(-1);
+  STD_TORCH_CHECK(head_dim == 16 || head_dim == 64 || head_dim == 128,
+              "raw-Q gfx12 fp8 path supports head_dim 16, 64, or 128");
+  const int64_t batch = query.size(0);
+  const int64_t q_heads = tensor_layout == kNHD ? query.size(2) : query.size(1);
+  const int64_t q_len = tensor_layout == kNHD ? query.size(1) : query.size(2);
+  const int64_t out_q_len = tensor_layout == kNHD ? output.size(1) : output.size(2);
+  const int64_t kv_heads = tensor_layout == kNHD ? key.size(2) : key.size(1);
+  const int64_t padded_kv_len = tensor_layout == kNHD ? key.size(1) : key.size(2);
+  const int64_t kv_len = valid_kv_len > 0 ? valid_kv_len : padded_kv_len;
+  STD_TORCH_CHECK(kv_len > 0 && kv_len <= padded_kv_len,
+              "valid_kv_len must be in (0, padded_kv_len]");
+  STD_TORCH_CHECK(key.size(0) == batch && value.size(0) == batch &&
+                  output.size(0) == batch,
+              "raw-Q gfx12 batch size mismatch");
+  const bool value_transposed_hnd =
+      value.size(1) == kv_heads && value.size(2) == head_dim &&
+      value.size(3) >= padded_kv_len;
+  STD_TORCH_CHECK(key.size(-1) == head_dim && output.size(-1) == head_dim &&
+                  (value_transposed_hnd || value.size(-1) == head_dim),
+              "raw-Q gfx12 Q/K/V/O head_dim mismatch");
+  STD_TORCH_CHECK((tensor_layout == kNHD &&
+                   ((value_transposed_hnd && output.size(1) >= q_len &&
+                     key.size(2) == kv_heads && output.size(2) == q_heads) ||
+                    (!value_transposed_hnd && value.size(1) == padded_kv_len &&
+                     output.size(1) >= q_len && key.size(2) == kv_heads &&
+                     value.size(2) == kv_heads && output.size(2) == q_heads))) ||
+                  (tensor_layout == kHND &&
+                   ((value_transposed_hnd && output.size(2) >= q_len &&
+                     key.size(1) == kv_heads && output.size(1) == q_heads) ||
+                    (!value_transposed_hnd && value.size(2) == padded_kv_len &&
+                     output.size(2) >= q_len && key.size(1) == kv_heads &&
+                     value.size(1) == kv_heads && output.size(1) == q_heads))),
+              "raw-Q gfx12 Q/K/V/O shape mismatch");
+  STD_TORCH_CHECK((q_heads % kv_heads) == 0, "q_heads must be divisible by kv_heads");
+  STD_TORCH_CHECK((padded_kv_len % 64) == 0,
+              "raw-Q gfx12 attention requires padded kv_len divisible by 64");
+  STD_TORCH_CHECK(!is_causal || (q_len % 64) == 0,
+              "raw-Q gfx12 causal attention requires q_len divisible by 64");
+  STD_TORCH_CHECK(!is_causal || q_len == padded_kv_len,
+              "raw-Q gfx12 causal attention requires q_len == padded_kv_len");
+  STD_TORCH_CHECK(key_scale.stride(-1) == 1, "key_scale must have contiguous scale columns");
+
+  int block_rows = head_dim == 64 ?
+      select_fp8_d64_block_rows_gfx12(q_len, is_causal, false) :
+      (q_len <= 64 ? 64 : 128);
+  if (head_dim == 64 && !is_causal && q_len == 1024) {
+    block_rows = 128;
+  }
+  if (head_dim == 16 && is_causal && q_len <= 1024) {
+    block_rows = 64;
+  }
+  const int64_t q_blocks = (q_len + block_rows - 1) / block_rows;
+  STD_TORCH_CHECK(out_q_len >= q_blocks * block_rows,
+              "raw-Q gfx12 attention output must cover the padded query tail");
+
+  constexpr int block_cols = 64;
+  const bool hnd_contiguous = tensor_layout == kHND;
+  const dim3 block(block_rows);
+  const dim3 grid(q_blocks, q_heads, batch);
+
+#define SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(HD_, HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_) \
+  qk_int8_sv_f8_native_2q_kernel<block_cols, HD_, 0, ((HD_) / 16), HND_, BR_, VT_, CAUSAL_, OUT_T_, QUERY_T_, true, int8_t, uint8_t, false, false, (VT_ ? -1 : 0), false, false, 2, false><<<grid, block, 0>>>( \
+      reinterpret_cast<const QUERY_T_*>(query.data_ptr()), \
+      reinterpret_cast<int8_t*>(key.data_ptr()), reinterpret_cast<uint8_t*>(value.data_ptr()), \
+      reinterpret_cast<OUT_T_*>(output.data_ptr()), \
+      nullptr, reinterpret_cast<float*>(key_scale.data_ptr()), value_scale_ptr, \
+      batch, q_len, kv_len, q_heads, kv_heads, \
+      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+      value.stride(0), (VT_ ? value.stride(2) : value.stride(tensor_layout == kNHD ? 1 : 2)), (VT_ ? value.stride(1) : value.stride(tensor_layout == kNHD ? 2 : 1)), \
+      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+      0, 0, \
+      key_scale.stride(0), key_scale.stride(1), \
+      tensor_layout, sm_scale)
+#define SAGEATTN_DISPATCH_RAWQ_FP8_OUT(HD_, HND_, BR_, VT_, CAUSAL_, QUERY_T_) \
+  if (output.scalar_type() == ScalarType::BFloat16) { \
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(HD_, HND_, BR_, VT_, CAUSAL_, QUERY_T_, __hip_bfloat16); \
+  } else { \
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(HD_, HND_, BR_, VT_, CAUSAL_, QUERY_T_, __half); \
+  }
+#define SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(HD_, HND_, BR_, VT_, CAUSAL_) \
+  if (query.scalar_type() == ScalarType::BFloat16) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_OUT(HD_, HND_, BR_, VT_, CAUSAL_, __hip_bfloat16); \
+  } else { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_OUT(HD_, HND_, BR_, VT_, CAUSAL_, __half); \
+  }
+#define SAGEATTN_DISPATCH_RAWQ_FP8_BR(HD_, HND_, VT_, CAUSAL_) \
+  if (block_rows == 64) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(HD_, HND_, 64, VT_, CAUSAL_); \
+  } else if (block_rows == 256) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(HD_, HND_, 256, VT_, CAUSAL_); \
+  } else if (block_rows == 512) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(HD_, HND_, 512, VT_, CAUSAL_); \
+  } else { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(HD_, HND_, 128, VT_, CAUSAL_); \
+  }
+#define SAGEATTN_DISPATCH_RAWQ_FP8_HD(HND_, VT_, CAUSAL_) \
+  if (head_dim == 16) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR(16, HND_, VT_, CAUSAL_); \
+  } else if (head_dim == 64) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR(64, HND_, VT_, CAUSAL_); \
+  } else { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR(128, HND_, VT_, CAUSAL_); \
+  }
+
+  if (hnd_contiguous) {
+    if (is_causal) {
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(true, true, true); }
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(true, false, true); }
+    } else {
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(true, true, false); }
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(true, false, false); }
+    }
+  } else {
+    if (is_causal) {
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(false, true, true); }
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(false, false, true); }
+    } else {
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(false, true, false); }
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(false, false, false); }
+    }
+  }
+
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_HD
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_BR
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_QUERY
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_OUT
+#undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED
+  hip_kernel_launch_check();
+  return output;
+}
+
+Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
+    Tensor query,
+    Tensor key,
+    Tensor value,
+    Tensor output,
+    Tensor key_scale,
+    int64_t tensor_layout,
+    int64_t is_causal,
+    double sm_scale,
+    int64_t valid_kv_len) {
+  return qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
+      query, key, value, output, key_scale, nullptr,
+      static_cast<int>(tensor_layout), static_cast<int>(is_causal),
+      static_cast<float>(sm_scale), valid_kv_len);
+}
+
+Tensor qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
+    Tensor query,
+    Tensor key,
+    Tensor value,
+    Tensor output,
+    Tensor key_scale,
+    Tensor value_scale,
+    int64_t tensor_layout,
+    int64_t is_causal,
+    double sm_scale,
+    int64_t valid_kv_len) {
+  const int64_t head_dim = query.size(-1);
+  const int64_t batch = query.size(0);
+  const int64_t kv_heads = tensor_layout == kNHD ? key.size(2) : key.size(1);
+  const float* value_scale_ptr =
+      checked_value_scale_ptr_gfx12(value_scale, batch, kv_heads, head_dim);
+  return qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
+      query, key, value, output, key_scale, value_scale_ptr,
+      static_cast<int>(tensor_layout), static_cast<int>(is_causal),
+      static_cast<float>(sm_scale), valid_kv_len);
+}
+
+Tensor qk_int8_sv_f8_scaled_native_attn_gfx12(
+    Tensor query,
+    Tensor key,
+    Tensor value,
+    Tensor output,
+    Tensor query_scale,
+    Tensor key_scale,
+    Tensor value_scale,
+    int64_t tensor_layout,
+    int64_t is_causal,
+    double sm_scale,
+    int64_t valid_kv_len) {
+  const int64_t head_dim = query.size(-1);
+  const int64_t batch = query.size(0);
+  const int64_t kv_heads = tensor_layout == kNHD ? key.size(2) : key.size(1);
+  const float* value_scale_ptr =
+      checked_value_scale_ptr_gfx12(value_scale, batch, kv_heads, head_dim);
+  return qk_int8_sv_f16_d64_native_attn_gfx12_impl(
+      query, key, value, output, query_scale, key_scale,
+      static_cast<int>(tensor_layout), static_cast<int>(is_causal),
+      static_cast<float>(sm_scale), valid_kv_len, value_scale_ptr);
+}
+
+Tensor qk_int8_sv_f16_d64_native_attn_gfx12(
+    Tensor query,
+    Tensor key,
+    Tensor value,
+    Tensor output,
+    Tensor query_scale,
+    Tensor key_scale,
+    int64_t tensor_layout,
+    int64_t is_causal,
+    double sm_scale,
+    int64_t valid_kv_len) {
+  return qk_int8_sv_f16_d64_native_attn_gfx12_impl(
+      query, key, value, output, query_scale, key_scale,
+      static_cast<int>(tensor_layout), static_cast<int>(is_causal),
+      static_cast<float>(sm_scale), valid_kv_len);
+}
