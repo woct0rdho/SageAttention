@@ -58,6 +58,7 @@ if not SKIP_CUDA_BUILD:
     if os.name == "nt":
         # https://github.com/pytorch/pytorch/issues/148317
         NVCC_FLAGS_COMMON += [
+            "-Xcompiler=/Zc:preprocessor",
             "-D_WIN32=1",
             "-DUSE_CUDA=1",
         ]
@@ -70,9 +71,10 @@ if not SKIP_CUDA_BUILD:
     if nvcc_append:
         NVCC_FLAGS_COMMON += nvcc_append.split()
 
-    ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0
-    CXX_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
-    NVCC_FLAGS_COMMON += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
+    if os.name != "nt":
+        ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0
+        CXX_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
+        NVCC_FLAGS_COMMON += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
 
     if CUDA_HOME is None:
         raise RuntimeError(
