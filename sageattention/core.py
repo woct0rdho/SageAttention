@@ -158,11 +158,57 @@ def _pad_gfx12_nhd_sequence(
     return q_nhd, k_nhd, v_nhd
 
 
-_GFX12_FP8_VALUE_SCALE_MAX = 2.25
+_GFX12_FP8_VALUE_SCALE_MAX_FP32_FP16 = 2.25
 
 
-def _gfx12_fp8_value_scale_hnd(v_hnd: torch.Tensor) -> torch.Tensor:
-    return v_hnd.abs().amax(dim=2).to(torch.float32).div(_GFX12_FP8_VALUE_SCALE_MAX).contiguous()
+def _gfx12_fp8_value_scale_hnd(v_hnd: torch.Tensor, scale_max: float) -> torch.Tensor:
+    return v_hnd.abs().amax(dim=2).to(torch.float32).div(scale_max).contiguous()
+
+
+def _attention_lse_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    tensor_layout: str,
+    is_causal: bool,
+    sm_scale: float,
+    block_q: int = 128,
+    max_score_elems: int = 8 * 1024 * 1024,
+) -> torch.Tensor:
+    if tensor_layout == "NHD":
+        q_hnd = q.transpose(1, 2)
+        k_hnd = k.transpose(1, 2)
+    else:
+        q_hnd = q
+        k_hnd = k
+
+    bsz, num_q_heads, q_len, _ = q_hnd.shape
+    _, num_kv_heads, kv_len, _ = k_hnd.shape
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError("num_qo_heads must be divisible by num_kv_heads.")
+
+    heads_per_kv = num_q_heads // num_kv_heads
+    block_q = max(1, min(block_q, max_score_elems // max(1, bsz * heads_per_kv * kv_len)))
+    lse = torch.empty((bsz, num_q_heads, q_len), device=q.device, dtype=torch.float32)
+    q_float = q_hnd.to(torch.float32)
+    k_float = k_hnd.to(torch.float32)
+
+    for hkv in range(num_kv_heads):
+        h_start = hkv * heads_per_kv
+        h_stop = h_start + heads_per_kv
+        k_head = k_float[:, hkv]
+        for q_start in range(0, q_len, block_q):
+            q_stop = min(q_start + block_q, q_len)
+            scores = torch.einsum(
+                "bhsd,btd->bhst",
+                q_float[:, h_start:h_stop, q_start:q_stop],
+                k_head,
+            ).mul_(sm_scale)
+            if is_causal:
+                q_idx = torch.arange(q_start, q_stop, device=q.device)[:, None]
+                k_idx = torch.arange(kv_len, device=q.device)[None, :]
+                scores.masked_fill_(k_idx > q_idx, float("-inf"))
+            lse[:, h_start:h_stop, q_start:q_stop] = torch.logsumexp(scores, dim=-1)
+    return lse
 
 
 def sageattn_qk_int8_pv_gfx12_native(
@@ -171,9 +217,12 @@ def sageattn_qk_int8_pv_gfx12_native(
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
+    qk_quant_gran: str = "per_warp",
     sm_scale: Optional[float] = None,
+    pv_accum_dtype: Optional[str] = None,
     value_dtype: str = "fp8",
     smooth_k: bool = True,
+    smooth_v: bool = False,
     return_lse: bool = False,
     **kwargs: Any,
 ) -> torch.Tensor:
@@ -187,17 +236,51 @@ def sageattn_qk_int8_pv_gfx12_native(
     Current gfx12 constraints:
     - q, k, and v must be fp16 or bf16.
     - value_dtype="fp8" supports head_dim 16, 64, or 128.
-    - value_dtype="fp16" supports head_dim 16 or 64.
+    - value_dtype="fp16" supports head_dim 16, 64, or 128.
     - Causal masking requires q_len == kv_len.
     - smooth_k is enabled by default to match the CUDA and Triton paths.
-    - return_lse is not implemented yet.
+    - return_lse uses an exact PyTorch logsumexp side computation and does
+      not affect the default return_lse=False fast path.
     """
 
-    gfx12_native = _get_gfx12_native_extension()
-    gfx12_prepare_attn_hnd = _qattn_gfx12_prepare_attn_hnd
+    if kwargs:
+        unsupported = ", ".join(sorted(key for key, value in kwargs.items() if value is not None))
+        if unsupported:
+            raise TypeError(f"Unsupported non-None gfx12 SageAttention arguments: {unsupported}")
+    if qk_quant_gran not in {"per_warp", "per_thread"}:
+        raise ValueError("qk_quant_gran must be either 'per_warp' or 'per_thread'.")
+    if qk_quant_gran != "per_warp":
+        raise NotImplementedError("gfx12 native currently supports qk_quant_gran='per_warp'.")
+    if smooth_v:
+        raise NotImplementedError("gfx12 native does not support smooth_v yet.")
     value_dtype_normalized = value_dtype.lower()
     if value_dtype_normalized == "auto":
         value_dtype_normalized = "fp8"
+    if pv_accum_dtype is None:
+        pv_accum_dtype = "fp32+fp16" if value_dtype_normalized == "fp8" else "fp32"
+    if value_dtype_normalized == "fp8" and pv_accum_dtype not in {"fp32+fp16", "fp32", "fp32+fp32"}:
+        raise ValueError("gfx12 fp8 value path supports pv_accum_dtype 'fp32+fp16', 'fp32', or 'fp32+fp32'.")
+    if value_dtype_normalized == "fp8" and pv_accum_dtype != "fp32+fp16":
+        raise NotImplementedError("gfx12 fp8 value path currently supports pv_accum_dtype='fp32+fp16'.")
+    if value_dtype_normalized == "fp16" and pv_accum_dtype not in {"fp32", "fp16", "fp16+fp32"}:
+        raise ValueError("gfx12 fp16 value path supports pv_accum_dtype 'fp32', 'fp16', or 'fp16+fp32'.")
+    if value_dtype_normalized == "fp16" and pv_accum_dtype != "fp32":
+        raise NotImplementedError("gfx12 fp16 value path currently supports pv_accum_dtype='fp32'.")
+    fp8_value_scale_max = _GFX12_FP8_VALUE_SCALE_MAX_FP32_FP16
+    gfx12_native = _get_gfx12_native_extension()
+    gfx12_prepare_attn_hnd = _qattn_gfx12_prepare_attn_hnd
+
+    lse_q = q
+    lse_k = k
+    lse_sm_scale = float(sm_scale if sm_scale is not None else q.size(-1) ** -0.5)
+
+    def _with_lse(out: torch.Tensor):
+        if not return_lse:
+            return out
+        return out, _attention_lse_reference(
+            lse_q, lse_k, tensor_layout, bool(is_causal), lse_sm_scale
+        )
+
     if (
         tensor_layout == "HND"
         and value_dtype_normalized == "fp16"
@@ -234,8 +317,6 @@ def sageattn_qk_int8_pv_gfx12_native(
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
     assert q.dtype in [torch.float16, torch.bfloat16], "gfx12 native path supports fp16/bf16 inputs."
     assert tensor_layout in ["HND", "NHD"], "tensor_layout must be either 'HND' or 'NHD'."
-    if return_lse:
-        raise ValueError("gfx12 native path does not return LSE yet.")
     torch.cuda.set_device(v.device)
 
     input_dtype = q.dtype
@@ -277,10 +358,12 @@ def sageattn_qk_int8_pv_gfx12_native(
             float(sm_scale),
         )
         if input_dtype == torch.bfloat16:
-            return out if out.dtype == torch.bfloat16 else gfx12_native.convert_f16_to_bf16(out)
-        return out
+            out = out if out.dtype == torch.bfloat16 else gfx12_native.convert_f16_to_bf16(out)
+        return _with_lse(out)
 
-    if tensor_layout == "NHD" and smooth_k:
+    if tensor_layout == "NHD" and smooth_k and not (
+        value_dtype == "fp16" and q.size(-1) > 64
+    ):
         q_nhd = q.contiguous()
         k_nhd = k.contiguous()
         v_nhd = v.contiguous()
@@ -299,15 +382,15 @@ def sageattn_qk_int8_pv_gfx12_native(
             k_nhd = F.pad(k_nhd, (0, pad))
             v_nhd = F.pad(v_nhd, (0, pad))
             head_dim = 64
-        elif value_dtype == "fp8" and 64 < head_dim < 128:
+        elif 64 < head_dim < 128:
             pad = 128 - head_dim
             q_nhd = F.pad(q_nhd, (0, pad))
             k_nhd = F.pad(k_nhd, (0, pad))
             v_nhd = F.pad(v_nhd, (0, pad))
             head_dim = 128
 
-        if value_dtype == "fp16" and head_dim not in (16, 64):
-            raise ValueError("gfx12 fp16 value path currently supports head_dim 16 or 64.")
+        if value_dtype == "fp16" and head_dim not in (16, 64, 128):
+            raise ValueError("gfx12 fp16 value path currently supports head_dim 16, 64, or 128.")
         if value_dtype == "fp8" and head_dim not in (16, 64, 128):
             raise ValueError("gfx12 fp8 value path currently supports head_dim 16, 64, or 128.")
 
@@ -338,7 +421,7 @@ def sageattn_qk_int8_pv_gfx12_native(
         value_scale = None
         if value_dtype == "fp8":
             v_hnd_for_value = v_nhd.transpose(1, 2).contiguous()
-            value_scale = _gfx12_fp8_value_scale_hnd(v_hnd_for_value)
+            value_scale = _gfx12_fp8_value_scale_hnd(v_hnd_for_value, fp8_value_scale_max)
             value_native = gfx12_native.transpose_value_fp8_scaled_hnd(
                 v_hnd_for_value, value_scale
             )
@@ -361,6 +444,7 @@ def sageattn_qk_int8_pv_gfx12_native(
                 int(is_causal),
                 float(sm_scale),
                 kv_len,
+                1,
             )
         else:
             q_int8, q_scale = gfx12_native.quant_q_nhd_per_warp(q_attn)
@@ -375,13 +459,14 @@ def sageattn_qk_int8_pv_gfx12_native(
                 int(is_causal),
                 float(sm_scale),
                 kv_len,
+                0,
             )
         out = out[:, :qo_len, :, :head_dim_og]
         if input_dtype == torch.bfloat16 and out.dtype != torch.bfloat16:
             out = gfx12_native.convert_f16_to_bf16(out.contiguous() if not out.is_contiguous() else out)
         elif input_dtype != torch.float16:
             out = out.to(input_dtype)
-        return out
+        return _with_lse(out)
 
     if tensor_layout == "NHD":
         q_hnd = q.transpose(1, 2).contiguous()
@@ -406,15 +491,15 @@ def sageattn_qk_int8_pv_gfx12_native(
         k_hnd = F.pad(k_hnd, (0, pad))
         v_hnd = F.pad(v_hnd, (0, pad))
         head_dim = 64
-    elif value_dtype == "fp8" and 64 < head_dim < 128:
+    elif 64 < head_dim < 128:
         pad = 128 - head_dim
         q_hnd = F.pad(q_hnd, (0, pad))
         k_hnd = F.pad(k_hnd, (0, pad))
         v_hnd = F.pad(v_hnd, (0, pad))
         head_dim = 128
 
-    if value_dtype == "fp16" and head_dim not in (16, 64):
-        raise ValueError("gfx12 fp16 value path currently supports head_dim 16 or 64.")
+    if value_dtype == "fp16" and head_dim not in (16, 64, 128):
+        raise ValueError("gfx12 fp16 value path currently supports head_dim 16, 64, or 128.")
     if value_dtype == "fp8" and head_dim not in (16, 64, 128):
         raise ValueError("gfx12 fp8 value path currently supports head_dim 16, 64, or 128.")
 
@@ -436,7 +521,7 @@ def sageattn_qk_int8_pv_gfx12_native(
             q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(
                 q_hnd, k_hnd, None, BLKQ=128, WARPQ=32, BLKK=64, tensor_layout="HND"
             )
-            value_scale = _gfx12_fp8_value_scale_hnd(v_hnd)
+            value_scale = _gfx12_fp8_value_scale_hnd(v_hnd, fp8_value_scale_max)
             value_native = gfx12_native.transpose_value_fp8_scaled_hnd(v_hnd, value_scale)
             out = torch.empty_like(q_hnd, dtype=torch.float16)
             gfx12_native.qk_int8_sv_f8_scaled_native_attn(
@@ -475,7 +560,7 @@ def sageattn_qk_int8_pv_gfx12_native(
             _quant_fused.quant_per_block_int8_fuse_sub_mean_cuda(
                 k_hnd, k_mean.squeeze(2), k_int8, k_scale, 64, 1
             )
-            value_scale = _gfx12_fp8_value_scale_hnd(v_hnd)
+            value_scale = _gfx12_fp8_value_scale_hnd(v_hnd, fp8_value_scale_max)
             value_native = gfx12_native.transpose_value_fp8_scaled_hnd(v_hnd, value_scale)
             out = torch.empty_like(
                 q_hnd,
@@ -483,26 +568,32 @@ def sageattn_qk_int8_pv_gfx12_native(
             )
             gfx12_native.qk_rawq_int8_sv_f8_scaled_native_attn(
                 q_hnd, k_int8, value_native, out, k_scale, value_scale,
+                1, int(is_causal), float(sm_scale), kv_len, 1
+            )
+            out = out[..., :qo_len, :head_dim_og]
+            if input_dtype != torch.float16 and out.dtype != input_dtype:
+                out = out.to(input_dtype)
+            if tensor_layout == "NHD":
+                out = out.transpose(1, 2).contiguous()
+            return _with_lse(out)
+
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(
+            q_hnd, k_hnd, k_mean, BLKQ=128, WARPQ=32, BLKK=64, tensor_layout="HND"
+        )
+        out = torch.empty_like(q_hnd, dtype=torch.float16)
+        if value_dtype == "fp8":
+            value_scale = _gfx12_fp8_value_scale_hnd(v_hnd, fp8_value_scale_max)
+            value_native = gfx12_native.transpose_value_fp8_scaled_hnd(v_hnd, value_scale)
+            gfx12_native.qk_int8_sv_f8_scaled_native_attn(
+                q_int8, k_int8, value_native, out, q_scale, k_scale, value_scale,
                 1, int(is_causal), float(sm_scale), kv_len
             )
         else:
-            q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(
-                q_hnd, k_hnd, k_mean, BLKQ=128, WARPQ=32, BLKK=64, tensor_layout="HND"
+            value_native = gfx12_native.transpose_value_f16_hnd(v_hnd)
+            gfx12_native.qk_int8_sv_f16_d64_native_attn(
+                q_int8, k_int8, value_native, out, q_scale, k_scale,
+                1, int(is_causal), float(sm_scale), kv_len, 1
             )
-            out = torch.empty_like(q_hnd, dtype=torch.float16)
-            if value_dtype == "fp8":
-                value_scale = _gfx12_fp8_value_scale_hnd(v_hnd)
-                value_native = gfx12_native.transpose_value_fp8_scaled_hnd(v_hnd, value_scale)
-                gfx12_native.qk_int8_sv_f8_scaled_native_attn(
-                    q_int8, k_int8, value_native, out, q_scale, k_scale, value_scale,
-                    1, int(is_causal), float(sm_scale), kv_len
-                )
-            else:
-                value_native = gfx12_native.transpose_value_f16_hnd(v_hnd)
-                gfx12_native.qk_int8_sv_f16_d64_native_attn(
-                    q_int8, k_int8, value_native, out, q_scale, k_scale,
-                    1, int(is_causal), float(sm_scale), kv_len
-                )
     out = out[..., :qo_len, :head_dim_og]
     if input_dtype == torch.bfloat16 and out.dtype != torch.bfloat16:
         out = gfx12_native.convert_f16_to_bf16(out.contiguous() if not out.is_contiguous() else out)
@@ -510,7 +601,7 @@ def sageattn_qk_int8_pv_gfx12_native(
         out = out.to(input_dtype)
     if tensor_layout == "NHD":
         out = out.transpose(1, 2).contiguous()
-    return out
+    return _with_lse(out)
 
 
 def sageattn(

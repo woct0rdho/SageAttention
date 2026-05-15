@@ -19,7 +19,8 @@ def qk_int8_sv_f16_d64_native_attn_fake_impl(
     tensor_layout: int,
     is_causal: int,
     sm_scale: float,
-    valid_kv_len: int,
+    valid_kv_len: int = 0,
+    value_transposed_hnd: int = -1,
 ) -> torch.Tensor:
     return _empty_lse(query)
 
@@ -34,7 +35,8 @@ def qk_rawq_int8_sv_f8_native_attn_fake_impl(
     tensor_layout: int,
     is_causal: int,
     sm_scale: float,
-    valid_kv_len: int,
+    valid_kv_len: int = 0,
+    value_transposed_hnd: int = -1,
 ) -> torch.Tensor:
     return output
 
@@ -51,7 +53,7 @@ def qk_int8_sv_f8_scaled_native_attn_fake_impl(
     tensor_layout: int,
     is_causal: int,
     sm_scale: float,
-    valid_kv_len: int,
+    valid_kv_len: int = 0,
 ) -> torch.Tensor:
     return _empty_lse(query)
 
@@ -67,7 +69,8 @@ def qk_rawq_int8_sv_f8_scaled_native_attn_fake_impl(
     tensor_layout: int,
     is_causal: int,
     sm_scale: float,
-    valid_kv_len: int,
+    valid_kv_len: int = 0,
+    value_transposed_hnd: int = -1,
 ) -> torch.Tensor:
     return output
 
@@ -81,7 +84,7 @@ def qk_int8_sv_f16_d64_prepare_attn_hnd_fake_impl(
     value_is_fp8: int,
     use_raw_f16_value: int,
     sm_scale: float,
-    valid_kv_len: int,
+    valid_kv_len: int = 0,
 ) -> torch.Tensor:
     dtype = torch.bfloat16 if value_is_fp8 and query.dtype == torch.bfloat16 else torch.float16
     return torch.empty(query.shape, dtype=dtype, device=query.device)

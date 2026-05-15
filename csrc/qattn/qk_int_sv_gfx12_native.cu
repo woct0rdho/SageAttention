@@ -1871,8 +1871,8 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
     const int64_t ks_stride_h,
     const int tensor_layout,
     const float sm_scale) {
-  static_assert(HeadDim == 16 || HeadDim == 64,
-                "native gfx12 fp16 2q kernel supports D16/D64.");
+  static_assert(HeadDim == 16 || HeadDim == 64 || HeadDim == 128,
+                "native gfx12 fp16 2q kernel supports D16/D64/D128.");
   constexpr int BR = BlockRows;
   constexpr int RM = 16;
   constexpr int RowsPerWave = 32;
@@ -5915,7 +5915,8 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     int is_causal,
     float sm_scale,
     int64_t valid_kv_len,
-    const float* value_scale_ptr = nullptr);
+    const float* value_scale_ptr = nullptr,
+    int value_transposed_hnd_hint = -1);
 
 Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     Tensor query,
@@ -5938,8 +5939,8 @@ Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
               "native gfx12 prepare+attention supports fp16/bf16 input");
 
   const int64_t head_dim = query.size(3);
-  STD_TORCH_CHECK(value_is_fp8 || head_dim == 16 || head_dim == 64,
-              "native gfx12 fp16 value prepare+attention supports head_dim 16 or 64");
+  STD_TORCH_CHECK(value_is_fp8 || head_dim == 16 || head_dim == 64 || head_dim == 128,
+              "native gfx12 fp16 value prepare+attention supports head_dim 16, 64, or 128");
   STD_TORCH_CHECK(value_is_fp8 || !use_raw_f16_value || query.scalar_type() == ScalarType::Half,
               "raw fp16 value path requires fp16 input");
   const int64_t batch = query.size(0);
@@ -6486,7 +6487,7 @@ Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     std::vector<Tensor> prepared = quant_qk_int8_hnd_gfx12(query, key);
     qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         prepared[0], prepared[2], value, output, prepared[1], prepared[3],
-        kHND, is_causal, sm_scale, kv_len);
+        kHND, is_causal, sm_scale, kv_len, nullptr, 0);
   } else {
     const bool use_f16_separate_prepared =
         is_causal && head_dim == 64 && q_len == 4096 &&
@@ -6497,7 +6498,7 @@ Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
              prepare_qkv_hnd_packed_gfx12<__half, false>(query, key, value);
     qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         prepared[0], prepared[2], prepared[4], output, prepared[1], prepared[3],
-        kHND, is_causal, sm_scale, kv_len);
+        kHND, is_causal, sm_scale, kv_len, nullptr, 1);
   }
   return output;
 }
@@ -6513,7 +6514,8 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     int is_causal,
     float sm_scale,
     int64_t valid_kv_len,
-    const float* value_scale_ptr) {
+    const float* value_scale_ptr,
+    int value_transposed_hnd_hint) {
   STD_TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && output.is_cuda(),
               "native gfx12 tensors must be CUDA/HIP tensors");
   STD_TORCH_CHECK(query.scalar_type() == ScalarType::Char, "query must be int8");
@@ -6531,12 +6533,16 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   STD_TORCH_CHECK(tensor_layout == kHND || tensor_layout == kNHD, "invalid tensor_layout");
   const int64_t head_dim = query.size(-1);
   const bool value_maybe_transposed_hnd =
-      tensor_layout == kHND && value.dim() == 4 && value.size(2) == head_dim;
+      tensor_layout == kHND && value.dim() == 4 && value.size(2) == head_dim &&
+      (value_is_fp8 || value_transposed_hnd_hint > 0 ||
+       (value_transposed_hnd_hint < 0 && (value_is_fp8 || head_dim != 128)));
   STD_TORCH_CHECK(key.size(-1) == head_dim &&
                   (value.size(-1) == head_dim || value_maybe_transposed_hnd),
               "query, key, and value must have matching head_dim");
-  STD_TORCH_CHECK(head_dim == 16 || head_dim == 64 || (value_is_fp8 && head_dim == 128),
-              "native gfx12 path supports D16/D64, plus D128 for the fp8 2q path");
+  STD_TORCH_CHECK(head_dim == 16 || head_dim == 64 || head_dim == 128,
+              "native gfx12 path supports D16/D64/D128");
+  STD_TORCH_CHECK(value_is_fp8 || head_dim != 128 || value_maybe_transposed_hnd,
+              "native gfx12 fp16 D128 path requires transposed HND values");
 
   const int64_t batch = query.size(0);
   const int64_t q_heads = tensor_layout == kNHD ? query.size(2) : query.size(1);
@@ -6732,8 +6738,8 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   } else { \
     SAGEATTN_LAUNCH_FP8_2Q_TV_OUT(BC_, HD_, BR_, __half); \
   }
-#define SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, GRID_, FLAT_) \
-  qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, int8_t, false, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_, 64, FLAT_><<<GRID_, block, 0>>>( \
+#define SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID_HD(HD_, BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, GRID_, FLAT_) \
+  qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, int8_t, false, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_, HD_, FLAT_><<<GRID_, block, 0>>>( \
       reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
       reinterpret_cast<const __half*>(value.data_ptr()), \
       reinterpret_cast<__half*>(output.data_ptr()), \
@@ -6746,6 +6752,8 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query_scale.stride(0), query_scale.stride(1), \
       key_scale.stride(0), key_scale.stride(1), \
       tensor_layout, sm_scale)
+#define SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, GRID_, FLAT_) \
+  SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID_HD(64, BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, GRID_, FLAT_)
 #define SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_) \
   if (use_f16_flat_q_schedule) { \
     SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, grid_f16_flat, true); \
@@ -6766,6 +6774,24 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query_scale.stride(0), query_scale.stride(1), \
       key_scale.stride(0), key_scale.stride(1), \
       tensor_layout, sm_scale)
+#define SAGEATTN_LAUNCH_F16_D128_2Q_TV(BC_, BR_, PAD_) \
+  if (is_causal) { \
+    SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID_HD(128, BC_, BR_, PAD_, false, false, false, false, false, grid, false); \
+  } else { \
+    qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, false, false, false, int8_t, false, int8_t, false, false, false, false, false, 128><<<grid, block, 0>>>( \
+        reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+        reinterpret_cast<const __half*>(value.data_ptr()), \
+        reinterpret_cast<__half*>(output.data_ptr()), \
+        reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+        key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+        value.stride(0), value.stride(2), value.stride(1), \
+        output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+        query_scale.stride(0), query_scale.stride(1), \
+        key_scale.stride(0), key_scale.stride(1), \
+        tensor_layout, sm_scale); \
+  }
 #define SAGEATTN_LAUNCH_F16_2Q_TV(BC_, BR_, PAD_) \
   if (is_causal) { \
     if (use_f16_pv_accum) { \
@@ -7083,7 +7109,25 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     }
   } else if (use_2q && value_transposed_hnd) {
     STD_TORCH_CHECK(hnd_contiguous, "transposed fp16 value path requires contiguous HND Q/K/O");
-    if (head_dim == 16) {
+    if (head_dim == 128) {
+      if (block_rows == 32) {
+        SAGEATTN_LAUNCH_F16_D128_2Q_TV(64, 32, 4);
+      } else if (block_rows == 64) {
+        SAGEATTN_LAUNCH_F16_D128_2Q_TV(64, 64, 4);
+      } else if (block_rows == 256) {
+        SAGEATTN_LAUNCH_F16_D128_2Q_TV(64, 256, 4);
+      } else if (block_rows == 512) {
+        SAGEATTN_LAUNCH_F16_D128_2Q_TV(64, 512, 4);
+      } else if (block_rows == 1024) {
+        SAGEATTN_LAUNCH_F16_D128_2Q_TV(64, 1024, 4);
+      } else if (q_len >= 8192) {
+        SAGEATTN_LAUNCH_F16_D128_2Q_TV(64, 128, 8);
+      } else if (q_len >= 1024) {
+        SAGEATTN_LAUNCH_F16_D128_2Q_TV(64, 128, 4);
+      } else {
+        SAGEATTN_LAUNCH_F16_D128_2Q_TV(64, 128, 16);
+      }
+    } else if (head_dim == 16) {
       if (is_causal) {
         if (block_rows == 32) {
           SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 32, 4, true, true);
@@ -7212,7 +7256,8 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
     int tensor_layout,
     int is_causal,
     float sm_scale,
-    int64_t valid_kv_len) {
+    int64_t valid_kv_len,
+    int value_transposed_hnd_hint) {
   STD_TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && output.is_cuda(),
               "raw-Q gfx12 tensors must be CUDA/HIP tensors");
   STD_TORCH_CHECK(query.dim() == 4 && key.dim() == 4 && value.dim() == 4 && output.dim() == 4,
@@ -7249,11 +7294,32 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
   STD_TORCH_CHECK(key.size(0) == batch && value.size(0) == batch &&
                   output.size(0) == batch,
               "raw-Q gfx12 batch size mismatch");
-  const bool value_transposed_hnd =
+  STD_TORCH_CHECK(value_transposed_hnd_hint >= -1 && value_transposed_hnd_hint <= 1,
+              "value_transposed_hnd must be -1, 0, or 1");
+  const bool value_shape_transposed_hnd =
       value.size(1) == kv_heads && value.size(2) == head_dim &&
       value.size(3) >= padded_kv_len;
+  const bool value_shape_normal =
+      (tensor_layout == kNHD &&
+       value.size(1) == padded_kv_len && value.size(2) == kv_heads &&
+       value.size(3) == head_dim) ||
+      (tensor_layout == kHND &&
+       value.size(1) == kv_heads && value.size(2) == padded_kv_len &&
+       value.size(3) == head_dim);
+  const bool value_layout_ambiguous =
+      value_shape_transposed_hnd && value_shape_normal;
+  STD_TORCH_CHECK(value_transposed_hnd_hint <= 0 || value_shape_transposed_hnd,
+              "value_transposed_hnd=1 requires value shape [B, H, D, padded_kv_len]");
+  STD_TORCH_CHECK(value_transposed_hnd_hint != 0 || value_shape_normal,
+              "value_transposed_hnd=0 requires normal value layout");
+  STD_TORCH_CHECK(value_transposed_hnd_hint >= 0 || !value_layout_ambiguous,
+              "raw-Q gfx12 value layout is ambiguous; pass value_transposed_hnd=0 "
+              "for normal layout or 1 for transposed HND [B, H, D, padded_kv_len]");
+  const bool value_transposed_hnd =
+      value_transposed_hnd_hint > 0 ||
+      (value_transposed_hnd_hint < 0 && value_shape_transposed_hnd);
   STD_TORCH_CHECK(key.size(-1) == head_dim && output.size(-1) == head_dim &&
-                  (value_transposed_hnd || value.size(-1) == head_dim),
+                  (value_transposed_hnd || value_shape_normal),
               "raw-Q gfx12 Q/K/V/O head_dim mismatch");
   STD_TORCH_CHECK((tensor_layout == kNHD &&
                    ((value_transposed_hnd && output.size(1) >= q_len &&
@@ -7376,11 +7442,13 @@ Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
     int64_t tensor_layout,
     int64_t is_causal,
     double sm_scale,
-    int64_t valid_kv_len) {
+    int64_t valid_kv_len,
+    int64_t value_transposed_hnd) {
   return qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
       query, key, value, output, key_scale, nullptr,
       static_cast<int>(tensor_layout), static_cast<int>(is_causal),
-      static_cast<float>(sm_scale), valid_kv_len);
+      static_cast<float>(sm_scale), valid_kv_len,
+      static_cast<int>(value_transposed_hnd));
 }
 
 Tensor qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
@@ -7393,7 +7461,8 @@ Tensor qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
     int64_t tensor_layout,
     int64_t is_causal,
     double sm_scale,
-    int64_t valid_kv_len) {
+    int64_t valid_kv_len,
+    int64_t value_transposed_hnd) {
   const int64_t head_dim = query.size(-1);
   const int64_t batch = query.size(0);
   const int64_t kv_heads = tensor_layout == kNHD ? key.size(2) : key.size(1);
@@ -7402,7 +7471,8 @@ Tensor qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
   return qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
       query, key, value, output, key_scale, value_scale_ptr,
       static_cast<int>(tensor_layout), static_cast<int>(is_causal),
-      static_cast<float>(sm_scale), valid_kv_len);
+      static_cast<float>(sm_scale), valid_kv_len,
+      static_cast<int>(value_transposed_hnd));
 }
 
 Tensor qk_int8_sv_f8_scaled_native_attn_gfx12(
@@ -7425,7 +7495,7 @@ Tensor qk_int8_sv_f8_scaled_native_attn_gfx12(
   return qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query, key, value, output, query_scale, key_scale,
       static_cast<int>(tensor_layout), static_cast<int>(is_causal),
-      static_cast<float>(sm_scale), valid_kv_len, value_scale_ptr);
+      static_cast<float>(sm_scale), valid_kv_len, value_scale_ptr, 1);
 }
 
 Tensor qk_int8_sv_f16_d64_native_attn_gfx12(
@@ -7438,9 +7508,11 @@ Tensor qk_int8_sv_f16_d64_native_attn_gfx12(
     int64_t tensor_layout,
     int64_t is_causal,
     double sm_scale,
-    int64_t valid_kv_len) {
+    int64_t valid_kv_len,
+    int64_t value_transposed_hnd) {
   return qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query, key, value, output, query_scale, key_scale,
       static_cast<int>(tensor_layout), static_cast<int>(is_causal),
-      static_cast<float>(sm_scale), valid_kv_len);
+      static_cast<float>(sm_scale), valid_kv_len, nullptr,
+      static_cast<int>(value_transposed_hnd));
 }

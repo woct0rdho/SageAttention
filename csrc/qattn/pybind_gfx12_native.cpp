@@ -32,7 +32,8 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_gfx12_native, m) {
             "int tensor_layout, "
             "int is_causal, "
             "float sm_scale, "
-            "int valid_kv_len"
+            "int valid_kv_len=0, "
+            "int value_transposed_hnd=-1"
           ") -> Tensor");
     m.def("qk_rawq_int8_sv_f8_native_attn("
             "Tensor query, "
@@ -43,7 +44,8 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_gfx12_native, m) {
             "int tensor_layout, "
             "int is_causal, "
             "float sm_scale, "
-            "int valid_kv_len"
+            "int valid_kv_len=0, "
+            "int value_transposed_hnd=-1"
           ") -> Tensor");
     m.def("qk_int8_sv_f8_scaled_native_attn("
             "Tensor query, "
@@ -56,7 +58,7 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_gfx12_native, m) {
             "int tensor_layout, "
             "int is_causal, "
             "float sm_scale, "
-            "int valid_kv_len"
+            "int valid_kv_len=0"
           ") -> Tensor");
     m.def("qk_rawq_int8_sv_f8_scaled_native_attn("
             "Tensor query, "
@@ -68,7 +70,8 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_gfx12_native, m) {
             "int tensor_layout, "
             "int is_causal, "
             "float sm_scale, "
-            "int valid_kv_len"
+            "int valid_kv_len=0, "
+            "int value_transposed_hnd=-1"
           ") -> Tensor");
     m.def("qk_int8_sv_f16_d64_prepare_attn_hnd("
             "Tensor query, "
@@ -78,7 +81,7 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_gfx12_native, m) {
             "int value_is_fp8, "
             "int use_raw_f16_value, "
             "float sm_scale, "
-            "int valid_kv_len"
+            "int valid_kv_len=0"
           ") -> Tensor");
     m.def("quant_q_nhd_per_warp(Tensor query) -> Tensor[]");
     m.def("transpose_value_fp8_hnd(Tensor value) -> Tensor");
