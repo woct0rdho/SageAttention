@@ -39,6 +39,18 @@
 using torch::stable::Tensor;
 using ScalarType = torch::headeronly::ScalarType;
 
+#if !defined(SAGEATTN_GFX12_BUILD_AUX) && \
+    !defined(SAGEATTN_GFX12_BUILD_PREPARE) && \
+    !defined(SAGEATTN_GFX12_BUILD_ATTN_F16) && \
+    !defined(SAGEATTN_GFX12_BUILD_ATTN_FP8) && \
+    !defined(SAGEATTN_GFX12_BUILD_RAWQ_FP8)
+#define SAGEATTN_GFX12_BUILD_AUX 1
+#define SAGEATTN_GFX12_BUILD_PREPARE 1
+#define SAGEATTN_GFX12_BUILD_ATTN_F16 1
+#define SAGEATTN_GFX12_BUILD_ATTN_FP8 1
+#define SAGEATTN_GFX12_BUILD_RAWQ_FP8 1
+#endif
+
 namespace {
 
 constexpr int kNHD = 0;
@@ -134,6 +146,14 @@ __device__ __forceinline__ float value_to_float(const __half value) {
 
 __device__ __forceinline__ float value_to_float(const __hip_bfloat16 value) {
   return __bfloat162float(value);
+}
+
+__device__ __forceinline__ __half value_from_float_half(const float value) {
+  return __float2half_rn(value);
+}
+
+__device__ __forceinline__ __hip_bfloat16 value_from_float_bfloat16(const float value) {
+  return __float2bfloat16(value);
 }
 
 __device__ __forceinline__ int8_t float_to_int8_rn_gfx12(const float x) {
@@ -495,6 +515,250 @@ __global__ void transpose_value_fp8_scaled_hnd_kernel(
   }
 }
 
+template <typename T>
+__global__ void fp8_value_nhd_short_kernel(
+    const T* __restrict__ value,
+    uint8_t* __restrict__ output,
+    float* __restrict__ value_scale,
+    const int64_t seq_len,
+    const int64_t heads,
+    const int64_t head_dim,
+    const float scale_max) {
+  constexpr int TileS = 128;
+  constexpr int TileD = 16;
+  __shared__ float partial_amax[256];
+  __shared__ float scale_tile[TileD];
+  __shared__ uint8_t tile[TileS][TileD];
+
+  const int tid = threadIdx.x;
+  const int d_local = tid & (TileD - 1);
+  const int s_lane = tid >> 4;
+  const int64_t d_base = static_cast<int64_t>(blockIdx.x) * TileD;
+  const int64_t h = blockIdx.y;
+  const int64_t b = blockIdx.z;
+  const int64_t d = d_base + d_local;
+
+  float local_amax = 0.0f;
+  if (d < head_dim) {
+    for (int64_t s = s_lane; s < seq_len; s += 16) {
+      const int64_t offset = ((b * seq_len + s) * heads + h) * head_dim + d;
+      local_amax = fmaxf(local_amax, fabsf(value_to_float(value[offset])));
+    }
+  }
+  partial_amax[tid] = local_amax;
+  __syncthreads();
+
+  if (tid < TileD) {
+    float amax = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+      amax = fmaxf(amax, partial_amax[i * TileD + tid]);
+    }
+    const float scale = amax / scale_max;
+    scale_tile[tid] = scale;
+    const int64_t scale_d = d_base + tid;
+    if (scale_d < head_dim) {
+      value_scale[(b * heads + h) * head_dim + scale_d] = scale;
+    }
+  }
+  __syncthreads();
+
+  for (int64_t s_base = 0; s_base < seq_len; s_base += TileS) {
+    for (int linear = tid; linear < TileS * TileD; linear += blockDim.x) {
+      const int load_s = linear / TileD;
+      const int load_d = linear - load_s * TileD;
+      const int64_t s = s_base + load_s;
+      const int64_t value_d = d_base + load_d;
+      uint8_t packed = 0;
+      if (s < seq_len && value_d < head_dim) {
+        const float scale = scale_tile[load_d];
+        const int64_t offset = ((b * seq_len + s) * heads + h) * head_dim + value_d;
+        const float v = scale == 0.0f ? 0.0f : value_to_float(value[offset]) / scale;
+        packed = __hip_cvt_float_to_fp8(v, __HIP_SATFINITE, __HIP_E4M3);
+      }
+      tile[load_s][load_d] = packed;
+    }
+    __syncthreads();
+
+    for (int linear = tid; linear < TileS * TileD; linear += blockDim.x) {
+      const int store_d_local = linear / TileS;
+      const int store_s_local = linear - store_d_local * TileS;
+      const int64_t s = s_base + store_s_local;
+      const int64_t value_d = d_base + store_d_local;
+      if (s < seq_len && value_d < head_dim) {
+        output[((b * heads + h) * head_dim + value_d) * seq_len + s] =
+            tile[store_s_local][store_d_local];
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <typename T>
+__global__ void mean_nhd_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ mean,
+    const int64_t seq_len,
+    const int64_t heads,
+    const int64_t head_dim) {
+  constexpr int TileD = 16;
+  __shared__ float partial_sum[256];
+
+  const int tid = threadIdx.x;
+  const int d_local = tid & (TileD - 1);
+  const int s_lane = tid >> 4;
+  const int64_t d_base = static_cast<int64_t>(blockIdx.x) * TileD;
+  const int64_t h = blockIdx.y;
+  const int64_t b = blockIdx.z;
+  const int64_t d = d_base + d_local;
+
+  float local_sum = 0.0f;
+  if (d < head_dim) {
+    for (int64_t s = s_lane; s < seq_len; s += 16) {
+      const int64_t offset = ((b * seq_len + s) * heads + h) * head_dim + d;
+      local_sum += value_to_float(input[offset]);
+    }
+  }
+  partial_sum[tid] = local_sum;
+  __syncthreads();
+
+  if (tid < TileD) {
+    float sum = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+      sum += partial_sum[i * TileD + tid];
+    }
+    const int64_t mean_d = d_base + tid;
+    if (mean_d < head_dim) {
+      const float value = sum / static_cast<float>(seq_len);
+      if constexpr (std::is_same<T, __half>::value) {
+        mean[(b * heads + h) * head_dim + mean_d] = value_from_float_half(value);
+      } else {
+        mean[(b * heads + h) * head_dim + mean_d] = value_from_float_bfloat16(value);
+      }
+    }
+  }
+}
+
+__device__ __forceinline__ int32_t pack_f32x4_to_ocp_fp8(
+    const float x0,
+    const float x1,
+    const float x2,
+    const float x3);
+
+template <typename T, int SeqLanes>
+__global__ void mean_and_fp8_value_nhd_short_kernel(
+    const T* __restrict__ key,
+    const T* __restrict__ value,
+    T* __restrict__ key_mean,
+    uint8_t* __restrict__ output,
+    float* __restrict__ value_scale,
+    const int64_t seq_len,
+    const int64_t heads,
+    const int64_t head_dim,
+    const float scale_max) {
+  constexpr int TileS = 128;
+  constexpr int TileD = 32;
+  __shared__ float partial_sum[TileD * SeqLanes];
+  __shared__ float partial_amax[TileD * SeqLanes];
+  __shared__ float scale_tile[TileD];
+  __shared__ uint8_t tile[TileS][TileD];
+
+  const int tid = threadIdx.x;
+  const int d_local = tid & (TileD - 1);
+  const int s_lane = tid / TileD;
+  const int64_t d_base = static_cast<int64_t>(blockIdx.x) * TileD;
+  const int64_t h = blockIdx.y;
+  const int64_t b = blockIdx.z;
+  const int64_t d = d_base + d_local;
+
+  float local_sum = 0.0f;
+  float local_amax = 0.0f;
+  if (d < head_dim) {
+    for (int64_t s = s_lane; s < seq_len; s += SeqLanes) {
+      const int64_t offset = ((b * seq_len + s) * heads + h) * head_dim + d;
+      local_sum += value_to_float(key[offset]);
+      local_amax = fmaxf(local_amax, fabsf(value_to_float(value[offset])));
+    }
+  }
+  partial_sum[tid] = local_sum;
+  partial_amax[tid] = local_amax;
+  __syncthreads();
+
+  if (tid < TileD) {
+    float sum = 0.0f;
+    float amax = 0.0f;
+    for (int i = 0; i < SeqLanes; ++i) {
+      const int partial_idx = i * TileD + tid;
+      sum += partial_sum[partial_idx];
+      amax = fmaxf(amax, partial_amax[partial_idx]);
+    }
+    const int64_t value_d = d_base + tid;
+    if (value_d < head_dim) {
+      const float mean = sum / static_cast<float>(seq_len);
+      const int64_t mean_offset = (b * heads + h) * head_dim + value_d;
+      if constexpr (std::is_same<T, __half>::value) {
+        key_mean[mean_offset] = value_from_float_half(mean);
+      } else {
+        key_mean[mean_offset] = value_from_float_bfloat16(mean);
+      }
+      const float scale = amax / scale_max;
+      scale_tile[tid] = scale;
+      value_scale[mean_offset] = scale;
+    }
+  }
+  __syncthreads();
+
+  for (int64_t s_base = 0; s_base < seq_len; s_base += TileS) {
+    constexpr int PackElems = 4;
+    constexpr int PacksPerRow = TileD / PackElems;
+    for (int pack = tid; pack < TileS * PacksPerRow; pack += blockDim.x) {
+      const int load_s = pack / PacksPerRow;
+      const int load_d = (pack - load_s * PacksPerRow) * PackElems;
+      const int64_t s = s_base + load_s;
+      const int64_t value_d = d_base + load_d;
+      if (s < seq_len && value_d + PackElems - 1 < head_dim) {
+        const int64_t offset = ((b * seq_len + s) * heads + h) * head_dim + value_d;
+        const float scale0 = scale_tile[load_d + 0];
+        const float scale1 = scale_tile[load_d + 1];
+        const float scale2 = scale_tile[load_d + 2];
+        const float scale3 = scale_tile[load_d + 3];
+        const float v0 = scale0 == 0.0f ? 0.0f : value_to_float(value[offset + 0]) / scale0;
+        const float v1 = scale1 == 0.0f ? 0.0f : value_to_float(value[offset + 1]) / scale1;
+        const float v2 = scale2 == 0.0f ? 0.0f : value_to_float(value[offset + 2]) / scale2;
+        const float v3 = scale3 == 0.0f ? 0.0f : value_to_float(value[offset + 3]) / scale3;
+        const uint32_t packed = static_cast<uint32_t>(pack_f32x4_to_ocp_fp8(v0, v1, v2, v3));
+        *reinterpret_cast<uint32_t*>(&tile[load_s][load_d]) = packed;
+      } else {
+#pragma unroll
+        for (int i = 0; i < PackElems; ++i) {
+          const int elem_d = load_d + i;
+          uint8_t packed = 0;
+          if (s < seq_len && d_base + elem_d < head_dim) {
+            const float scale = scale_tile[elem_d];
+            const int64_t offset =
+                ((b * seq_len + s) * heads + h) * head_dim + d_base + elem_d;
+            const float v = scale == 0.0f ? 0.0f : value_to_float(value[offset]) / scale;
+            packed = __hip_cvt_float_to_fp8(v, __HIP_SATFINITE, __HIP_E4M3);
+          }
+          tile[load_s][elem_d] = packed;
+        }
+      }
+    }
+    __syncthreads();
+
+    for (int linear = tid; linear < TileS * TileD; linear += blockDim.x) {
+      const int store_d_local = linear / TileS;
+      const int store_s_local = linear - store_d_local * TileS;
+      const int64_t s = s_base + store_s_local;
+      const int64_t value_d = d_base + store_d_local;
+      if (s < seq_len && value_d < head_dim) {
+        output[((b * heads + h) * head_dim + value_d) * seq_len + s] =
+            tile[store_s_local][store_d_local];
+      }
+    }
+    __syncthreads();
+  }
+}
+
 __device__ __forceinline__ int64_t qkv_offset(
     const int tensor_layout,
     const int64_t b,
@@ -509,7 +773,7 @@ __device__ __forceinline__ int64_t qkv_offset(
       : b * stride_b + h * stride_h + n * stride_n + d;
 }
 
-template <int HeadDim, bool HndContiguous>
+template <int HeadDim, bool HndContiguous, bool StaticNhd = false>
 __device__ __forceinline__ int64_t qkv_offset_dispatch(
     const int tensor_layout,
     const int64_t b,
@@ -521,6 +785,8 @@ __device__ __forceinline__ int64_t qkv_offset_dispatch(
     const int64_t stride_h) {
   if constexpr (HndContiguous) {
     return b * stride_b + h * stride_h + n * HeadDim + d;
+  } else if constexpr (StaticNhd) {
+    return b * stride_b + n * stride_n + h * stride_h + d;
   } else {
     return qkv_offset(tensor_layout, b, h, n, d, stride_b, stride_n, stride_h);
   }
@@ -668,7 +934,11 @@ __device__ __forceinline__ void apply_tqk_causal_mask_pv_order(
   }
 }
 
-template <typename QueryT, int HeadDim, bool HndContiguous>
+template <typename QueryT,
+          int HeadDim,
+          bool HndContiguous,
+          bool StaticNhd = false,
+          bool NoQueryTail = false>
 __device__ __forceinline__ i32x2_vec pack_quant_q_i8_wmma_b_regs(
     const QueryT* __restrict__ q,
     const int tensor_layout,
@@ -686,7 +956,7 @@ __device__ __forceinline__ i32x2_vec pack_quant_q_i8_wmma_b_regs(
   const int row = lane & 15;
   const int k_base = 8 * (lane >> 4);
   const int64_t q_idx = q_start + row;
-  if (q_idx >= qo_len) {
+  if constexpr (!NoQueryTail) if (q_idx >= qo_len) {
 #pragma unroll
     for (int gpr = 0; gpr < 2; ++gpr) {
       regs[gpr] = 0;
@@ -695,7 +965,7 @@ __device__ __forceinline__ i32x2_vec pack_quant_q_i8_wmma_b_regs(
   }
 
   const int d = d_base + k_base;
-  const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+  const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhd>(
       tensor_layout, b, h, q_idx, d, q_stride_b, q_stride_n, q_stride_h);
   const uint4 raw = *reinterpret_cast<const uint4*>(q + q_off);
   const QueryT* values = reinterpret_cast<const QueryT*>(&raw);
@@ -713,7 +983,10 @@ __device__ __forceinline__ i32x2_vec pack_quant_q_i8_wmma_b_regs(
   return regs;
 }
 
-template <int HeadDim, bool HndContiguous>
+template <int HeadDim,
+          bool HndContiguous,
+          bool StaticNhd = false,
+          bool NoQueryTail = false>
 __device__ __forceinline__ i32x2_vec pack_q_i8_wmma_b_regs(
     const int8_t* __restrict__ q,
     const int tensor_layout,
@@ -730,7 +1003,7 @@ __device__ __forceinline__ i32x2_vec pack_q_i8_wmma_b_regs(
   const int row = lane & 15;
   const int k_base = 8 * (lane >> 4);
   const int64_t q_idx = q_start + row;
-  if (q_idx >= qo_len) {
+  if constexpr (!NoQueryTail) if (q_idx >= qo_len) {
 #pragma unroll
     for (int gpr = 0; gpr < 2; ++gpr) {
       regs[gpr] = 0;
@@ -739,7 +1012,7 @@ __device__ __forceinline__ i32x2_vec pack_q_i8_wmma_b_regs(
   }
 
   const int d = d_base + k_base;
-  const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+  const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhd>(
       tensor_layout, b, h, q_idx, d, q_stride_b, q_stride_n, q_stride_h);
   const uint2 raw = *reinterpret_cast<const uint2*>(q + q_off);
   regs[0] = static_cast<int32_t>(raw.x);
@@ -1908,8 +2181,6 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                 "transposed fp16 value layout requires contiguous HND tensors.");
   static_assert(!F16PvAccum || BlockCols <= 64,
                 "fp16 PV accumulation currently supports the BC64 2q path.");
-  static_assert(!QuantizeQuery || HndContiguous,
-                "direct fp16 Q quantization currently requires contiguous HND tensors.");
   static_assert(!QuantizeKey || (HndContiguous && BlockCols == 64),
                 "direct fp16 K quantization currently requires contiguous HND BC64 tensors.");
   static_assert(!LaneMajorValue ||
@@ -2912,8 +3183,12 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
           o_off1 = qkv_offset(
               tensor_layout, b, hq, q_idx1, d, o_stride_b, o_stride_n, o_stride_h);
         }
-        store_half(output, o_off0, value0);
-        store_half(output, o_off1, value1);
+        if (q_idx0 < qo_len) {
+          store_half(output, o_off0, value0);
+        }
+        if (q_idx1 < qo_len) {
+          store_half(output, o_off1, value1);
+        }
       }
     }
   }
@@ -2940,7 +3215,13 @@ template <int BlockCols,
           bool PrepackedLaneMajorKeyOnly = false,
           bool PrepackedLaneMajorValueOnly = false,
           int QGroupsParam = 2,
-          bool LowPressureQGroups = false>
+          bool LowPressureQGroups = false,
+          bool PerThreadQK = false,
+          bool KeyHndContiguous = HndContiguous,
+          bool StaticNhdLayout = false,
+          bool NoKvTail = false,
+          bool SameQKHeads = false,
+          bool NoQueryTail = false>
 SAGEATTN_NATIVE_2Q_WAVES_PER_EU(HeadDim, IsCausal)
 __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_f8_native_2q_kernel(
     const QueryT* __restrict__ q,
@@ -3040,8 +3321,8 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
         (UsePrepackedLaneMajorK || UsePrepackedLaneMajorValue)));
   static_assert(!QuantizeKeyValue ||
                     ((HeadDim == 64 || HeadDim == 128) &&
-                     BlockCols == 64 && HndContiguous && !ValueTransposed),
-                "raw K/V fp8 staging currently supports contiguous HND D64/D128 BC64 tensors.");
+                     BlockCols == 64 && !ValueTransposed),
+                "raw K/V fp8 staging currently supports D64/D128 BC64 tensors.");
   static_assert(!UsePrepackedLaneMajorKV ||
                     (HeadDim == 64 && HndContiguous && ValueTransposed &&
                      !QuantizeKeyValue),
@@ -3057,6 +3338,8 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
   static_assert(ValueTiles == 1 || ValueTiles == 4 || ValueTiles == 8,
                 "native fp8 2q stores one D16, D64, or D128 value slice per launch.");
   static_assert(ValueTileBase + ValueTiles <= DTiles, "invalid fp8 value tile slice.");
+  static_assert(!NoQueryTail || (StaticNhdLayout && !IsCausal),
+                "full-query fp8 path requires a static non-causal dispatch.");
 
   __shared__ int8_t k_tile[UsePrepackedLaneMajorK ? 1 : BC][SharedHeadStride];
   __shared__ uint8_t v_tile[UsePrepackedLaneMajorValue ? 1 : SharedValueRows]
@@ -3078,7 +3361,7 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
     return;
   }
 
-  const int64_t hkv = hq / (num_qo_heads / num_kv_heads);
+  const int64_t hkv = SameQKHeads ? hq : hq / (num_qo_heads / num_kv_heads);
   const int64_t k_head_base = b * k_stride_b + hkv * k_stride_h;
   const int64_t v_head_base = b * v_stride_b + hkv * v_stride_h;
   int64_t q_start[QGroups];
@@ -3100,8 +3383,17 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
       const int row = elem_base / HeadDim;
       const int d = elem_base - row * HeadDim;
       const int64_t q_idx = q_base + local_q_row_base + row;
-      if (q_idx < qo_len) {
-        const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+      if constexpr (NoQueryTail) {
+        const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
+            tensor_layout, b, hq, q_idx, d, q_stride_b, q_stride_n, q_stride_h);
+        const uint4 raw = *reinterpret_cast<const uint4*>(q + q_off);
+        const QueryT* values = reinterpret_cast<const QueryT*>(&raw);
+#pragma unroll
+        for (int i = 0; i < QPackElems; ++i) {
+          local_q_amax = fmaxf(local_q_amax, fabsf(value_to_float(values[i])));
+        }
+      } else if (q_idx < qo_len) {
+        const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
             tensor_layout, b, hq, q_idx, d, q_stride_b, q_stride_n, q_stride_h);
         const uint4 raw = *reinterpret_cast<const uint4*>(q + q_off);
         const QueryT* values = reinterpret_cast<const QueryT*>(&raw);
@@ -3132,7 +3424,8 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
       const int64_t qg_start = q_start[qg];
 #pragma unroll
       for (int dt = 0; dt < DTiles; ++dt) {
-        q_regs[qg][dt] = pack_quant_q_i8_wmma_b_regs<QueryT, HeadDim, HndContiguous>(
+        q_regs[qg][dt] =
+            pack_quant_q_i8_wmma_b_regs<QueryT, HeadDim, HndContiguous, StaticNhdLayout, NoQueryTail>(
             q, tensor_layout, lane, b, hq, qg_start, qo_len, dt * BK,
             q_stride_b, q_stride_n, q_stride_h, inv_q_scale);
       }
@@ -3149,7 +3442,8 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
       for (int qg = 0; qg < QGroups; ++qg) {
 #pragma unroll
         for (int dt = 0; dt < DTiles; ++dt) {
-          q_regs[qg][dt] = pack_q_i8_wmma_b_regs<HeadDim, HndContiguous>(
+          q_regs[qg][dt] =
+              pack_q_i8_wmma_b_regs<HeadDim, HndContiguous, StaticNhdLayout, NoQueryTail>(
               q, tensor_layout, lane, b, hq, q_start[qg], qo_len, dt * BK,
               q_stride_b, q_stride_n, q_stride_h);
         }
@@ -3167,7 +3461,7 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
     for (int qg = 0; qg < QGroups; ++qg) {
 #pragma unroll
       for (int dt = 0; dt < DTiles; ++dt) {
-        const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+        const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
             tensor_layout, b, hq, q_start[qg], dt * BK, q_stride_b, q_stride_n, q_stride_h);
         rocwmma::load_matrix_sync(q_frag[qg][dt], q + q_off, static_cast<uint32_t>(q_stride_n));
       }
@@ -3212,7 +3506,7 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
         const int elem_base = pack * PackElems;
         const int n = elem_base / HeadDim;
         const int d = elem_base - n * HeadDim;
-        const int64_t k_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+        const int64_t k_off = qkv_offset_dispatch<HeadDim, KeyHndContiguous, StaticNhdLayout>(
             tensor_layout, b, hkv, kb_base + n, d, k_stride_b, k_stride_n, k_stride_h);
         const uint4 raw = *reinterpret_cast<const uint4*>(k + k_off);
         const KeyT* values = reinterpret_cast<const KeyT*>(&raw);
@@ -3234,9 +3528,9 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
         const int elem_base = pack * PackElems;
         const int n = elem_base / HeadDim;
         const int d = elem_base - n * HeadDim;
-        const int64_t k_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+        const int64_t k_off = qkv_offset_dispatch<HeadDim, KeyHndContiguous, StaticNhdLayout>(
             tensor_layout, b, hkv, kb_base + n, d, k_stride_b, k_stride_n, k_stride_h);
-        const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+        const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
             tensor_layout, b, hkv, kb_base + n, d, v_stride_b, v_stride_n, v_stride_h);
         const uint4 raw_k = *reinterpret_cast<const uint4*>(k + k_off);
         const uint4 raw_v = *reinterpret_cast<const uint4*>(v + v_off);
@@ -3268,12 +3562,12 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
       for (int vec = tid; vec < BC * VecsPerRow; vec += Threads) {
         const int n = vec / VecsPerRow;
         const int d = (vec - n * VecsPerRow) * VecBytes;
-        const int64_t k_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+        const int64_t k_off = qkv_offset_dispatch<HeadDim, KeyHndContiguous, StaticNhdLayout>(
             tensor_layout, b, hkv, kb_base + n, d, k_stride_b, k_stride_n, k_stride_h);
         *reinterpret_cast<uint4*>(&k_tile[n][d]) =
             *reinterpret_cast<const uint4*>(k + k_off);
         if constexpr (!ValueTransposed) {
-          const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+          const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
               tensor_layout, b, hkv, kb_base + n, d, v_stride_b, v_stride_n, v_stride_h);
           *reinterpret_cast<uint4*>(&v_tile[n][d]) =
               *reinterpret_cast<const uint4*>(v + v_off);
@@ -3309,7 +3603,7 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
       for (int qg = 0; qg < QGroups; ++qg) {
 #pragma unroll
         for (int dt = 0; dt < DTiles; ++dt) {
-          const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+          const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
               tensor_layout, b, hq, q_start[qg], dt * BK, q_stride_b, q_stride_n, q_stride_h);
           rocwmma::load_matrix_sync(q_frag[qg][dt], q + q_off, static_cast<uint32_t>(q_stride_n));
         }
@@ -3384,7 +3678,9 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
               }
               float k_scale_local = k_scale_tile;
               if constexpr (!QuantizeKeyValue && BC <= 64) {
-                k_scale_local = prepared_k_scale_tile;
+                if constexpr (!PerThreadQK) {
+                  k_scale_local = prepared_k_scale_tile;
+                }
               } else if constexpr (!QuantizeKeyValue) {
                 const int k_scale_idx = k_scale_col_per_warp(k_col_start);
                 k_scale_local = k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
@@ -3439,7 +3735,7 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
                     }
                   }
                 }
-                if (k_col_start + BK > kv_len) {
+                if constexpr (!NoKvTail) if (k_col_start + BK > kv_len) {
                   apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
                 }
                 score_cache_stream[qg][sc] = scores;
@@ -3493,7 +3789,7 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
                       }
                     }
                   }
-                  if (k_col_start + BK > kv_len) {
+                  if constexpr (!NoKvTail) if (k_col_start + BK > kv_len) {
                     apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
                   }
                   score_cache_stream[qg][sc] = scores;
@@ -3729,7 +4025,7 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
                 }
               }
             }
-            if (k_col_start + BK > kv_len) {
+            if constexpr (!NoKvTail) if (k_col_start + BK > kv_len) {
               apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
             }
             score_cache[qg][col_tile] = scores;
@@ -3836,7 +4132,7 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
               }
             }
           }
-          if (k_col_start + BK > kv_len) {
+          if constexpr (!NoKvTail) if (k_col_start + BK > kv_len) {
             apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
           }
           score_cache[col_tile] = scores;
@@ -3992,7 +4288,7 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
               }
             }
           }
-          if (k_col_start + BK > kv_len) {
+          if constexpr (!NoKvTail) if (k_col_start + BK > kv_len) {
             apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
           }
           score_cache[col_tile] = scores;
@@ -4099,6 +4395,14 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
     }
   }
 
+  float value_scale_tile[ValueTiles];
+#pragma unroll
+  for (int vdt = 0; vdt < ValueTiles; ++vdt) {
+    const int d = (ValueTileBase + vdt) * BK + col;
+    value_scale_tile[vdt] = v_scale == nullptr ?
+        1.0f : v_scale[(b * num_kv_heads + hkv) * HeadDim + d];
+  }
+
 #pragma unroll
   for (int qg = 0; qg < QGroups; ++qg) {
     float l_rows[8];
@@ -4109,8 +4413,7 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
 #pragma unroll
     for (int vdt = 0; vdt < ValueTiles; ++vdt) {
       const int d = (ValueTileBase + vdt) * BK + col;
-      const float value_scale = v_scale == nullptr ?
-          1.0f : v_scale[(b * num_kv_heads + hkv) * HeadDim + d];
+      const float value_scale = value_scale_tile[vdt];
 #pragma unroll
       for (int pair = 0; pair < PackedRows; ++pair) {
         const int elem = pair * 2;
@@ -4122,9 +4425,9 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
             0.0f : (out_frag[qg][vdt][elem] / l_sum0) * value_scale;
         const float value1 = l_sum1 == 0.0f ?
             0.0f : (out_frag[qg][vdt][elem + 1] / l_sum1) * value_scale;
-        store_output_value(output, qkv_offset_dispatch<HeadDim, HndContiguous>(
+        store_output_value(output, qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
             tensor_layout, b, hq, q_idx0, d, o_stride_b, o_stride_n, o_stride_h), value0);
-        store_output_value(output, qkv_offset_dispatch<HeadDim, HndContiguous>(
+        store_output_value(output, qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
             tensor_layout, b, hq, q_idx1, d, o_stride_b, o_stride_n, o_stride_h), value1);
       }
     }
@@ -4955,6 +5258,27 @@ __global__ void prepare_kv_hnd_fp8_kernel(
 
 } // namespace
 
+static int select_fp8_d64_block_rows_gfx12(
+    const int64_t q_len,
+    const bool is_causal,
+    const bool value_transposed_hnd) {
+  if (is_causal) {
+    if (q_len <= 64) {
+      return 64;
+    }
+    return 128;
+  }
+  if (q_len <= 64) {
+    return 64;
+  }
+  if ((q_len % 256) == 0 && (q_len >= 2048 || value_transposed_hnd)) {
+    return 256;
+  }
+  return 128;
+}
+
+#if SAGEATTN_GFX12_BUILD_AUX
+
 Tensor transpose_value_fp8_hnd_gfx12(Tensor value) {
   return transpose_value_hnd_gfx12<uint8_t, true>(value);
 }
@@ -5000,9 +5324,160 @@ Tensor transpose_value_fp8_scaled_hnd_gfx12(Tensor value, Tensor value_scale) {
   return output;
 }
 
+std::vector<Tensor> fp8_value_nhd_short_gfx12(
+    Tensor value,
+    double scale_max) {
+  STD_TORCH_CHECK(value.is_cuda(), "gfx12 short NHD value prep expects a CUDA/HIP tensor");
+  STD_TORCH_CHECK(value.dim() == 4, "gfx12 short NHD value prep expects [B, S, H, D]");
+  STD_TORCH_CHECK(value.is_contiguous(), "gfx12 short NHD value prep expects contiguous NHD input");
+  STD_TORCH_CHECK(value.scalar_type() == ScalarType::Half || value.scalar_type() == ScalarType::BFloat16,
+              "gfx12 short NHD value prep supports fp16/bf16 input");
+
+  const int64_t batch = value.size(0);
+  const int64_t seq_len = value.size(1);
+  const int64_t heads = value.size(2);
+  const int64_t head_dim = value.size(3);
+  STD_TORCH_CHECK(head_dim == 64 || head_dim == 128,
+              "gfx12 short NHD fp8 value prep currently supports head_dim 64 or 128");
+  STD_TORCH_CHECK(seq_len == 512 || seq_len == 1024,
+              "gfx12 short NHD fp8 value prep currently supports sequence length 512 or 1024");
+
+  Tensor output = new_empty_like(value, {batch, heads, head_dim, seq_len}, ScalarType::Byte);
+  Tensor value_scale = new_empty_like(value, {batch, heads, head_dim}, ScalarType::Float);
+
+  dim3 block(256);
+  dim3 grid((head_dim + 15) / 16, heads, batch);
+  if (value.scalar_type() == ScalarType::Half) {
+    fp8_value_nhd_short_kernel<__half><<<grid, block, 0>>>(
+        reinterpret_cast<const __half*>(value.data_ptr()),
+        reinterpret_cast<uint8_t*>(output.data_ptr()),
+        reinterpret_cast<float*>(value_scale.data_ptr()),
+        seq_len, heads, head_dim, static_cast<float>(scale_max));
+  } else {
+    fp8_value_nhd_short_kernel<__hip_bfloat16><<<grid, block, 0>>>(
+        reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+        reinterpret_cast<uint8_t*>(output.data_ptr()),
+        reinterpret_cast<float*>(value_scale.data_ptr()),
+        seq_len, heads, head_dim, static_cast<float>(scale_max));
+  }
+  hip_kernel_launch_check();
+  return {output, value_scale};
+}
+
+Tensor mean_nhd_gfx12(Tensor input) {
+  STD_TORCH_CHECK(input.is_cuda(), "gfx12 NHD mean expects a CUDA/HIP tensor");
+  STD_TORCH_CHECK(input.dim() == 4, "gfx12 NHD mean expects [B, S, H, D]");
+  STD_TORCH_CHECK(input.is_contiguous(), "gfx12 NHD mean expects contiguous NHD input");
+  STD_TORCH_CHECK(input.scalar_type() == ScalarType::Half || input.scalar_type() == ScalarType::BFloat16,
+              "gfx12 NHD mean supports fp16/bf16 input");
+
+  const int64_t batch = input.size(0);
+  const int64_t seq_len = input.size(1);
+  const int64_t heads = input.size(2);
+  const int64_t head_dim = input.size(3);
+  Tensor mean = new_empty_like(input, {batch, heads, head_dim}, input.scalar_type());
+
+  dim3 block(256);
+  dim3 grid((head_dim + 15) / 16, heads, batch);
+  if (input.scalar_type() == ScalarType::Half) {
+    mean_nhd_kernel<__half><<<grid, block, 0>>>(
+        reinterpret_cast<const __half*>(input.data_ptr()),
+        reinterpret_cast<__half*>(mean.data_ptr()),
+        seq_len, heads, head_dim);
+  } else {
+    mean_nhd_kernel<__hip_bfloat16><<<grid, block, 0>>>(
+        reinterpret_cast<const __hip_bfloat16*>(input.data_ptr()),
+        reinterpret_cast<__hip_bfloat16*>(mean.data_ptr()),
+        seq_len, heads, head_dim);
+  }
+  hip_kernel_launch_check();
+  return mean;
+}
+
+std::vector<Tensor> mean_and_fp8_value_nhd_short_gfx12(
+    Tensor key,
+    Tensor value,
+    double scale_max) {
+  STD_TORCH_CHECK(key.is_cuda() && value.is_cuda(),
+              "gfx12 short NHD mean/value prep expects CUDA/HIP tensors");
+  STD_TORCH_CHECK(key.dim() == 4 && value.dim() == 4,
+              "gfx12 short NHD mean/value prep expects [B, S, H, D]");
+  STD_TORCH_CHECK(key.is_contiguous() && value.is_contiguous(),
+              "gfx12 short NHD mean/value prep expects contiguous NHD tensors");
+  STD_TORCH_CHECK(key.scalar_type() == value.scalar_type(),
+              "gfx12 short NHD mean/value prep expects matching key/value dtypes");
+  STD_TORCH_CHECK(key.scalar_type() == ScalarType::Half || key.scalar_type() == ScalarType::BFloat16,
+              "gfx12 short NHD mean/value prep supports fp16/bf16 input");
+  STD_TORCH_CHECK(key.size(0) == value.size(0) &&
+                  key.size(1) == value.size(1) &&
+                  key.size(2) == value.size(2) &&
+                  key.size(3) == value.size(3),
+              "gfx12 short NHD mean/value prep expects matching key/value shapes");
+
+  const int64_t batch = value.size(0);
+  const int64_t seq_len = value.size(1);
+  const int64_t heads = value.size(2);
+  const int64_t head_dim = value.size(3);
+  STD_TORCH_CHECK(head_dim == 64 || head_dim == 128,
+              "gfx12 short NHD mean/value prep currently supports head_dim 64 or 128");
+  STD_TORCH_CHECK(seq_len == 512 || seq_len == 1024,
+              "gfx12 short NHD mean/value prep currently supports sequence length 512 or 1024");
+
+  Tensor key_mean = new_empty_like(key, {batch, heads, head_dim}, key.scalar_type());
+  Tensor output = new_empty_like(value, {batch, heads, head_dim, seq_len}, ScalarType::Byte);
+  Tensor value_scale = new_empty_like(value, {batch, heads, head_dim}, ScalarType::Float);
+
+  const int seq_lanes = head_dim == 64 ? 32 : 16;
+  dim3 block(32 * seq_lanes);
+  dim3 grid((head_dim + 31) / 32, heads, batch);
+  if (value.scalar_type() == ScalarType::Half) {
+    if (head_dim == 64) {
+      mean_and_fp8_value_nhd_short_kernel<__half, 32><<<grid, block, 0>>>(
+          reinterpret_cast<const __half*>(key.data_ptr()),
+          reinterpret_cast<const __half*>(value.data_ptr()),
+          reinterpret_cast<__half*>(key_mean.data_ptr()),
+          reinterpret_cast<uint8_t*>(output.data_ptr()),
+          reinterpret_cast<float*>(value_scale.data_ptr()),
+          seq_len, heads, head_dim, static_cast<float>(scale_max));
+    } else {
+      mean_and_fp8_value_nhd_short_kernel<__half, 16><<<grid, block, 0>>>(
+          reinterpret_cast<const __half*>(key.data_ptr()),
+          reinterpret_cast<const __half*>(value.data_ptr()),
+          reinterpret_cast<__half*>(key_mean.data_ptr()),
+          reinterpret_cast<uint8_t*>(output.data_ptr()),
+          reinterpret_cast<float*>(value_scale.data_ptr()),
+          seq_len, heads, head_dim, static_cast<float>(scale_max));
+    }
+  } else {
+    if (head_dim == 64) {
+      mean_and_fp8_value_nhd_short_kernel<__hip_bfloat16, 32><<<grid, block, 0>>>(
+          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+          reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+          reinterpret_cast<__hip_bfloat16*>(key_mean.data_ptr()),
+          reinterpret_cast<uint8_t*>(output.data_ptr()),
+          reinterpret_cast<float*>(value_scale.data_ptr()),
+          seq_len, heads, head_dim, static_cast<float>(scale_max));
+    } else {
+      mean_and_fp8_value_nhd_short_kernel<__hip_bfloat16, 16><<<grid, block, 0>>>(
+          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
+          reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
+          reinterpret_cast<__hip_bfloat16*>(key_mean.data_ptr()),
+          reinterpret_cast<uint8_t*>(output.data_ptr()),
+          reinterpret_cast<float*>(value_scale.data_ptr()),
+          seq_len, heads, head_dim, static_cast<float>(scale_max));
+    }
+  }
+  hip_kernel_launch_check();
+  return {key_mean, output, value_scale};
+}
+
 Tensor transpose_value_f16_hnd_gfx12(Tensor value) {
   return transpose_value_hnd_gfx12<__half, false>(value);
 }
+
+#endif // SAGEATTN_GFX12_BUILD_AUX
+
+#if SAGEATTN_GFX12_BUILD_PREPARE
 
 template <typename OutT, bool ToFp8>
 std::vector<Tensor> prepare_qkv_hnd_gfx12(
@@ -5707,24 +6182,9 @@ std::vector<Tensor> prepare_k_hnd_packed_gfx12(Tensor key) {
   return {key_out, key_scale, byte_workspace, scale_workspace};
 }
 
-static int select_fp8_d64_block_rows_gfx12(
-    const int64_t q_len,
-    const bool is_causal,
-    const bool value_transposed_hnd) {
-  if (is_causal) {
-    if (q_len <= 64) {
-      return 64;
-    }
-    return 128;
-  }
-  if (q_len <= 64) {
-    return 64;
-  }
-  if ((q_len % 256) == 0 && (q_len >= 2048 || value_transposed_hnd)) {
-    return 256;
-  }
-  return 128;
-}
+#endif // SAGEATTN_GFX12_BUILD_PREPARE
+
+#if SAGEATTN_GFX12_BUILD_AUX
 
 __global__ void convert_f16_to_bf16_kernel(
     const __half* __restrict__ input,
@@ -5822,6 +6282,10 @@ std::vector<Tensor> quant_q_nhd_per_warp_gfx12(Tensor query) {
   return {query_out, query_scale};
 }
 
+#endif // SAGEATTN_GFX12_BUILD_AUX
+
+#if SAGEATTN_GFX12_BUILD_PREPARE
+
 std::vector<Tensor> quant_qk_int8_hnd_gfx12(Tensor query, Tensor key) {
   STD_TORCH_CHECK(query.is_cuda() && key.is_cuda(), "gfx12 Q/K quantization expects CUDA/HIP tensors");
   STD_TORCH_CHECK(query.dim() == 4 && key.dim() == 4, "gfx12 Q/K quantization expects [B, H, S, D]");
@@ -5904,7 +6368,7 @@ std::vector<Tensor> quant_qk_int8_hnd_gfx12(Tensor query, Tensor key) {
   return {query_out, query_scale, key_out, key_scale};
 }
 
-static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
+static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_dispatch(
     Tensor query,
     Tensor key,
     Tensor value,
@@ -5915,8 +6379,9 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     int is_causal,
     float sm_scale,
     int64_t valid_kv_len,
-    const float* value_scale_ptr = nullptr,
-    int value_transposed_hnd_hint = -1);
+    Tensor value_scale,
+    int value_transposed_hnd_hint,
+    int pv_accum_mode);
 
 Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     Tensor query,
@@ -5926,7 +6391,8 @@ Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     int64_t value_is_fp8,
     int64_t use_raw_f16_value,
     double sm_scale,
-    int64_t valid_kv_len) {
+    int64_t valid_kv_len,
+    int64_t pv_accum_mode) {
   STD_TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda(),
               "native gfx12 prepare+attention expects CUDA/HIP tensors");
   STD_TORCH_CHECK(query.dim() == 4 && key.dim() == 4 && value.dim() == 4,
@@ -6485,9 +6951,10 @@ Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     hip_kernel_launch_check();
   } else if (use_raw_f16_value) {
     std::vector<Tensor> prepared = quant_qk_int8_hnd_gfx12(query, key);
-    qk_int8_sv_f16_d64_native_attn_gfx12_impl(
+    qk_int8_sv_f16_d64_native_attn_gfx12_dispatch(
         prepared[0], prepared[2], value, output, prepared[1], prepared[3],
-        kHND, is_causal, sm_scale, kv_len, nullptr, 0);
+        kHND, is_causal, sm_scale, kv_len, Tensor(), 0,
+        static_cast<int>(pv_accum_mode));
   } else {
     const bool use_f16_separate_prepared =
         is_causal && head_dim == 64 && q_len == 4096 &&
@@ -6496,13 +6963,19 @@ Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         use_f16_separate_prepared ?
              prepare_qkv_hnd_gfx12<__half, false>(query, key, value) :
              prepare_qkv_hnd_packed_gfx12<__half, false>(query, key, value);
-    qk_int8_sv_f16_d64_native_attn_gfx12_impl(
+    qk_int8_sv_f16_d64_native_attn_gfx12_dispatch(
         prepared[0], prepared[2], prepared[4], output, prepared[1], prepared[3],
-        kHND, is_causal, sm_scale, kv_len, nullptr, 1);
+        kHND, is_causal, sm_scale, kv_len, Tensor(), 1,
+        static_cast<int>(pv_accum_mode));
   }
   return output;
 }
 
+#endif // SAGEATTN_GFX12_BUILD_PREPARE
+
+#if SAGEATTN_GFX12_BUILD_ATTN_F16 || SAGEATTN_GFX12_BUILD_ATTN_FP8
+
+template <bool PerThreadQK = false>
 static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     Tensor query,
     Tensor key,
@@ -6514,17 +6987,27 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     int is_causal,
     float sm_scale,
     int64_t valid_kv_len,
-    const float* value_scale_ptr,
-    int value_transposed_hnd_hint) {
+    Tensor value_scale,
+    int value_transposed_hnd_hint,
+    int pv_accum_mode) {
   STD_TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && output.is_cuda(),
               "native gfx12 tensors must be CUDA/HIP tensors");
   STD_TORCH_CHECK(query.scalar_type() == ScalarType::Char, "query must be int8");
   STD_TORCH_CHECK(key.scalar_type() == ScalarType::Char, "key must be int8");
   const bool value_is_fp8 = value.scalar_type() == ScalarType::Byte;
+#if SAGEATTN_GFX12_BUILD_ATTN_F16 && !SAGEATTN_GFX12_BUILD_ATTN_FP8
+  STD_TORCH_CHECK(!value_is_fp8, "native gfx12 fp16 attention TU expects fp16 values");
+#endif
+#if SAGEATTN_GFX12_BUILD_ATTN_FP8 && !SAGEATTN_GFX12_BUILD_ATTN_F16
+  STD_TORCH_CHECK(value_is_fp8, "native gfx12 fp8 attention TU expects fp8 values");
+#endif
   STD_TORCH_CHECK(value.scalar_type() == ScalarType::Half || value_is_fp8,
               "value must be fp16 or raw OCP e4m3 fp8 bytes");
-  STD_TORCH_CHECK(value_scale_ptr == nullptr || value_is_fp8,
+  const bool has_value_scale = value_scale.defined() && value_scale.numel() > 0;
+  STD_TORCH_CHECK(!has_value_scale || value_is_fp8,
               "value_scale is only valid for the fp8 value path");
+  const float* value_scale_ptr =
+      has_value_scale ? reinterpret_cast<const float*>(value_scale.data_ptr()) : nullptr;
   const bool output_is_bf16 = output.scalar_type() == ScalarType::BFloat16;
   STD_TORCH_CHECK(output.scalar_type() == ScalarType::Half || (value_is_fp8 && output_is_bf16),
               "output must be fp16, or bf16 for the fp8 value path");
@@ -6662,6 +7145,79 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   const bool use_f16_streamk =
       head_dim == 64 && !value_is_fp8 && is_causal && value_transposed_hnd &&
       q_len == 4096 && block_rows == 256;
+  if constexpr (PerThreadQK) {
+    STD_TORCH_CHECK(value_transposed_hnd,
+                "gfx12 per-thread QK path expects transposed HND values");
+#define SAGEATTN_LAUNCH_PERTHREAD_FP8_OUT(HD_, BR_, CAUSAL_, OUT_T_) \
+    qk_int8_sv_f8_native_2q_kernel<64, HD_, 0, ((HD_) / 16), true, BR_, true, CAUSAL_, OUT_T_, int8_t, false, int8_t, uint8_t, false, false, 0, false, false, 2, false, true><<<grid, block, 0>>>( \
+        reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+        reinterpret_cast<uint8_t*>(value.data_ptr()), \
+        reinterpret_cast<OUT_T_*>(output.data_ptr()), \
+        reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), value_scale_ptr, \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+        key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+        value.stride(0), value.stride(2), value.stride(1), \
+        output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+        query_scale.stride(0), query_scale.stride(1), \
+        key_scale.stride(0), key_scale.stride(1), \
+        tensor_layout, sm_scale, true)
+#define SAGEATTN_LAUNCH_PERTHREAD_FP8(HD_, BR_, CAUSAL_) \
+    if (output_is_bf16) { \
+      SAGEATTN_LAUNCH_PERTHREAD_FP8_OUT(HD_, BR_, CAUSAL_, __hip_bfloat16); \
+    } else { \
+      SAGEATTN_LAUNCH_PERTHREAD_FP8_OUT(HD_, BR_, CAUSAL_, __half); \
+    }
+#define SAGEATTN_LAUNCH_PERTHREAD_F16(HD_, BR_, CAUSAL_) \
+    qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, 4, CAUSAL_, false, false, int8_t, false, int8_t, false, false, false, false, false, HD_, false, true><<<grid, block, 0>>>( \
+        reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+        reinterpret_cast<const __half*>(value.data_ptr()), \
+        reinterpret_cast<__half*>(output.data_ptr()), \
+        reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+        key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+        value.stride(0), value.stride(2), value.stride(1), \
+        output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+        query_scale.stride(0), query_scale.stride(1), \
+        key_scale.stride(0), key_scale.stride(1), \
+        tensor_layout, sm_scale, true)
+#if SAGEATTN_GFX12_BUILD_ATTN_F16 && SAGEATTN_GFX12_BUILD_ATTN_FP8
+#define SAGEATTN_DISPATCH_PERTHREAD_HEADS(BR_, CAUSAL_) \
+    if (value_is_fp8) { \
+      if (head_dim == 16) { SAGEATTN_LAUNCH_PERTHREAD_FP8(16, BR_, CAUSAL_); } \
+      else if (head_dim == 64) { SAGEATTN_LAUNCH_PERTHREAD_FP8(64, BR_, CAUSAL_); } \
+      else { SAGEATTN_LAUNCH_PERTHREAD_FP8(128, BR_, CAUSAL_); } \
+    } else { \
+      if (head_dim == 16) { SAGEATTN_LAUNCH_PERTHREAD_F16(16, BR_, CAUSAL_); } \
+      else if (head_dim == 64) { SAGEATTN_LAUNCH_PERTHREAD_F16(64, BR_, CAUSAL_); } \
+      else { SAGEATTN_LAUNCH_PERTHREAD_F16(128, BR_, CAUSAL_); } \
+    }
+#elif SAGEATTN_GFX12_BUILD_ATTN_FP8
+#define SAGEATTN_DISPATCH_PERTHREAD_HEADS(BR_, CAUSAL_) \
+    if (head_dim == 16) { SAGEATTN_LAUNCH_PERTHREAD_FP8(16, BR_, CAUSAL_); } \
+    else if (head_dim == 64) { SAGEATTN_LAUNCH_PERTHREAD_FP8(64, BR_, CAUSAL_); } \
+    else { SAGEATTN_LAUNCH_PERTHREAD_FP8(128, BR_, CAUSAL_); }
+#else
+#define SAGEATTN_DISPATCH_PERTHREAD_HEADS(BR_, CAUSAL_) \
+    if (head_dim == 16) { SAGEATTN_LAUNCH_PERTHREAD_F16(16, BR_, CAUSAL_); } \
+    else if (head_dim == 64) { SAGEATTN_LAUNCH_PERTHREAD_F16(64, BR_, CAUSAL_); } \
+    else { SAGEATTN_LAUNCH_PERTHREAD_F16(128, BR_, CAUSAL_); }
+#endif
+    if (block_rows == 64) {
+      if (is_causal) { SAGEATTN_DISPATCH_PERTHREAD_HEADS(64, true); }
+      else { SAGEATTN_DISPATCH_PERTHREAD_HEADS(64, false); }
+    } else {
+      if (is_causal) { SAGEATTN_DISPATCH_PERTHREAD_HEADS(128, true); }
+      else { SAGEATTN_DISPATCH_PERTHREAD_HEADS(128, false); }
+    }
+#undef SAGEATTN_DISPATCH_PERTHREAD_HEADS
+#undef SAGEATTN_LAUNCH_PERTHREAD_F16
+#undef SAGEATTN_LAUNCH_PERTHREAD_FP8
+#undef SAGEATTN_LAUNCH_PERTHREAD_FP8_OUT
+    hip_kernel_launch_check();
+    return output;
+  }
 #define SAGEATTN_LAUNCH_FP8_2Q_OUT(BC_, HD_, HND_, BR_, OUT_T_) \
   if (is_causal) { \
     qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), HND_, BR_, false, true, OUT_T_><<<grid, block, 0>>>( \
@@ -6918,6 +7474,7 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query_scale.stride(0), query_scale.stride(1), \
       key_scale.stride(0), key_scale.stride(1), \
       tensor_layout, sm_scale)
+#if SAGEATTN_GFX12_BUILD_ATTN_F16
   if (use_f16_causal_1q) {
     STD_TORCH_CHECK(hnd_contiguous, "fp16 single-q causal path requires contiguous HND tensors");
     const bool use_f16_1q_pv_accum = use_f16_pv_accum;
@@ -6946,7 +7503,14 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       else { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(64, false, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD); }
     }
 #undef SAGEATTN_DISPATCH_F16_1Q_CAUSAL
-  } else if (use_fp8_2q && value_transposed_hnd) {
+  }
+#endif // SAGEATTN_GFX12_BUILD_ATTN_F16
+#if SAGEATTN_GFX12_BUILD_ATTN_FP8
+#if SAGEATTN_GFX12_BUILD_ATTN_F16
+  else if (use_fp8_2q && value_transposed_hnd) {
+#else
+  if (use_fp8_2q && value_transposed_hnd) {
+#endif
     STD_TORCH_CHECK(hnd_contiguous, "transposed fp8 value path requires contiguous HND Q/K/O");
     STD_TORCH_CHECK(block_cols == 32 || block_cols == 64,
                 "transposed fp8 value path currently supports BC32/BC64");
@@ -7107,7 +7671,15 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     } else {
       SAGEATTN_LAUNCH_FP8_2Q(64, 64, false, 128);
     }
-  } else if (use_2q && value_transposed_hnd) {
+  }
+#if SAGEATTN_GFX12_BUILD_ATTN_FP8 && !SAGEATTN_GFX12_BUILD_ATTN_F16
+  else {
+    STD_TORCH_CHECK(false, "native gfx12 fp8 attention dispatch could not select a kernel");
+  }
+#endif
+#endif // SAGEATTN_GFX12_BUILD_ATTN_FP8
+#if SAGEATTN_GFX12_BUILD_ATTN_F16
+  else if (use_2q && value_transposed_hnd) {
     STD_TORCH_CHECK(hnd_contiguous, "transposed fp16 value path requires contiguous HND Q/K/O");
     if (head_dim == 128) {
       if (block_rows == 32) {
@@ -7225,26 +7797,38 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   } else {
     SAGEATTN_LAUNCH_F16_1Q(64, 64);
   }
+#endif // SAGEATTN_GFX12_BUILD_ATTN_F16
   hip_kernel_launch_check();
   return new_empty_like(query, {0}, ScalarType::Float);
 }
 
-static const float* checked_value_scale_ptr_gfx12(
+#if SAGEATTN_GFX12_BUILD_ATTN_F16
+
+Tensor qk_int8_sv_f16_d64_native_attn_gfx12_dispatch(
+    Tensor query,
+    Tensor key,
+    Tensor value,
+    Tensor output,
+    Tensor query_scale,
+    Tensor key_scale,
+    int tensor_layout,
+    int is_causal,
+    float sm_scale,
+    int64_t valid_kv_len,
     Tensor value_scale,
-    int64_t batch,
-    int64_t kv_heads,
-    int64_t head_dim) {
-  STD_TORCH_CHECK(value_scale.is_cuda(), "value_scale must be a CUDA/HIP tensor");
-  STD_TORCH_CHECK(value_scale.scalar_type() == ScalarType::Float,
-              "value_scale must be fp32");
-  STD_TORCH_CHECK(value_scale.dim() == 3 && value_scale.is_contiguous(),
-              "value_scale must be contiguous [B, H_kv, D]");
-  STD_TORCH_CHECK(value_scale.size(0) == batch &&
-                  value_scale.size(1) == kv_heads &&
-                  value_scale.size(2) == head_dim,
-              "value_scale shape must match [B, H_kv, D]");
-  return reinterpret_cast<const float*>(value_scale.data_ptr());
+    int value_transposed_hnd_hint,
+    int pv_accum_mode) {
+  return qk_int8_sv_f16_d64_native_attn_gfx12_impl(
+      query, key, value, output, query_scale, key_scale, tensor_layout,
+      is_causal, sm_scale, valid_kv_len, value_scale,
+      value_transposed_hnd_hint, pv_accum_mode);
 }
+
+#endif // SAGEATTN_GFX12_BUILD_ATTN_F16
+
+#endif // SAGEATTN_GFX12_BUILD_ATTN_F16 || SAGEATTN_GFX12_BUILD_ATTN_FP8
+
+#if SAGEATTN_GFX12_BUILD_RAWQ_FP8
 
 static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
     Tensor query,
@@ -7252,12 +7836,13 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
     Tensor value,
     Tensor output,
     Tensor key_scale,
-    const float* value_scale_ptr,
+    Tensor value_scale,
     int tensor_layout,
     int is_causal,
     float sm_scale,
     int64_t valid_kv_len,
-    int value_transposed_hnd_hint) {
+    int value_transposed_hnd_hint,
+    int key_hnd_layout) {
   STD_TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && output.is_cuda(),
               "raw-Q gfx12 tensors must be CUDA/HIP tensors");
   STD_TORCH_CHECK(query.dim() == 4 && key.dim() == 4 && value.dim() == 4 && output.dim() == 4,
@@ -7275,6 +7860,10 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
   STD_TORCH_CHECK(key_scale.scalar_type() == ScalarType::Float,
               "raw-Q gfx12 attention key_scale must be fp32");
   STD_TORCH_CHECK(tensor_layout == kHND || tensor_layout == kNHD, "invalid tensor_layout");
+  STD_TORCH_CHECK(key_hnd_layout == 0 || key_hnd_layout == 1,
+              "key_hnd_layout must be 0 or 1");
+  STD_TORCH_CHECK(tensor_layout == kNHD || key_hnd_layout == 0,
+              "key_hnd_layout is only needed for NHD query/output tensors");
   STD_TORCH_CHECK(query.is_contiguous() && key.is_contiguous() &&
                   value.is_contiguous() && output.is_contiguous(),
               "raw-Q gfx12 attention expects contiguous tensors");
@@ -7286,8 +7875,11 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
   const int64_t q_heads = tensor_layout == kNHD ? query.size(2) : query.size(1);
   const int64_t q_len = tensor_layout == kNHD ? query.size(1) : query.size(2);
   const int64_t out_q_len = tensor_layout == kNHD ? output.size(1) : output.size(2);
-  const int64_t kv_heads = tensor_layout == kNHD ? key.size(2) : key.size(1);
-  const int64_t padded_kv_len = tensor_layout == kNHD ? key.size(1) : key.size(2);
+  const bool key_hnd_contiguous = tensor_layout == kHND || key_hnd_layout != 0;
+  const int64_t kv_heads = key_hnd_contiguous ? key.size(1) :
+      (tensor_layout == kNHD ? key.size(2) : key.size(1));
+  const int64_t padded_kv_len = key_hnd_contiguous ? key.size(2) :
+      (tensor_layout == kNHD ? key.size(1) : key.size(2));
   const int64_t kv_len = valid_kv_len > 0 ? valid_kv_len : padded_kv_len;
   STD_TORCH_CHECK(kv_len > 0 && kv_len <= padded_kv_len,
               "valid_kv_len must be in (0, padded_kv_len]");
@@ -7318,21 +7910,29 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
   const bool value_transposed_hnd =
       value_transposed_hnd_hint > 0 ||
       (value_transposed_hnd_hint < 0 && value_shape_transposed_hnd);
-  STD_TORCH_CHECK(key.size(-1) == head_dim && output.size(-1) == head_dim &&
+  STD_TORCH_CHECK(key.size(0) == batch && key.size(-1) == head_dim &&
+                  output.size(-1) == head_dim &&
                   (value_transposed_hnd || value_shape_normal),
               "raw-Q gfx12 Q/K/V/O head_dim mismatch");
+  const bool key_shape_matches =
+      key_hnd_contiguous
+          ? (key.size(1) == kv_heads && key.size(2) == padded_kv_len)
+          : (tensor_layout == kNHD
+                 ? (key.size(1) == padded_kv_len && key.size(2) == kv_heads)
+                 : (key.size(1) == kv_heads && key.size(2) == padded_kv_len));
+  STD_TORCH_CHECK(key_shape_matches, "raw-Q gfx12 key shape mismatch");
   STD_TORCH_CHECK((tensor_layout == kNHD &&
                    ((value_transposed_hnd && output.size(1) >= q_len &&
-                     key.size(2) == kv_heads && output.size(2) == q_heads) ||
+                     output.size(2) == q_heads) ||
                     (!value_transposed_hnd && value.size(1) == padded_kv_len &&
-                     output.size(1) >= q_len && key.size(2) == kv_heads &&
-                     value.size(2) == kv_heads && output.size(2) == q_heads))) ||
+                     output.size(1) >= q_len && value.size(2) == kv_heads &&
+                     output.size(2) == q_heads))) ||
                   (tensor_layout == kHND &&
                    ((value_transposed_hnd && output.size(2) >= q_len &&
-                     key.size(1) == kv_heads && output.size(1) == q_heads) ||
+                     output.size(1) == q_heads) ||
                     (!value_transposed_hnd && value.size(2) == padded_kv_len &&
-                     output.size(2) >= q_len && key.size(1) == kv_heads &&
-                     value.size(1) == kv_heads && output.size(1) == q_heads))),
+                     output.size(2) >= q_len && value.size(1) == kv_heads &&
+                     output.size(1) == q_heads))),
               "raw-Q gfx12 Q/K/V/O shape mismatch");
   STD_TORCH_CHECK((q_heads % kv_heads) == 0, "q_heads must be divisible by kv_heads");
   STD_TORCH_CHECK((padded_kv_len % 64) == 0,
@@ -7342,12 +7942,28 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
   STD_TORCH_CHECK(!is_causal || q_len == padded_kv_len,
               "raw-Q gfx12 causal attention requires q_len == padded_kv_len");
   STD_TORCH_CHECK(key_scale.stride(-1) == 1, "key_scale must have contiguous scale columns");
+  const bool has_value_scale = value_scale.defined() && value_scale.numel() > 0;
+  if (has_value_scale) {
+    STD_TORCH_CHECK(value_scale.is_cuda(), "value_scale must be a CUDA/HIP tensor");
+    STD_TORCH_CHECK(value_scale.scalar_type() == ScalarType::Float,
+                "value_scale must be fp32");
+    STD_TORCH_CHECK(value_scale.dim() == 3 && value_scale.is_contiguous(),
+                "value_scale must be contiguous [B, H_kv, D]");
+    STD_TORCH_CHECK(value_scale.size(0) == batch &&
+                    value_scale.size(1) == kv_heads &&
+                    value_scale.size(2) == head_dim,
+                "value_scale shape must match [B, H_kv, D]");
+  }
+  const float* value_scale_ptr =
+      has_value_scale ? reinterpret_cast<const float*>(value_scale.data_ptr()) : nullptr;
 
   int block_rows = head_dim == 64 ?
-      select_fp8_d64_block_rows_gfx12(q_len, is_causal, false) :
+      select_fp8_d64_block_rows_gfx12(q_len, is_causal, value_transposed_hnd) :
       (q_len <= 64 ? 64 : 128);
-  if (head_dim == 64 && !is_causal && q_len == 1024) {
-    block_rows = 128;
+  if (head_dim == 64 && !is_causal && value_transposed_hnd) {
+    if (q_len == 1024) {
+      block_rows = 256;
+    }
   }
   if (head_dim == 16 && is_causal && q_len <= 1024) {
     block_rows = 64;
@@ -7356,79 +7972,109 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
   STD_TORCH_CHECK(out_q_len >= q_blocks * block_rows,
               "raw-Q gfx12 attention output must cover the padded query tail");
 
-  constexpr int block_cols = 64;
+  const bool use_bc32 =
+      !is_causal && value_transposed_hnd && tensor_layout == kNHD &&
+      !key_hnd_contiguous && head_dim == 128 && q_len == 1024;
   const bool hnd_contiguous = tensor_layout == kHND;
   const dim3 block(block_rows);
   const dim3 grid(q_blocks, q_heads, batch);
 
-#define SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(HD_, HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_) \
-  qk_int8_sv_f8_native_2q_kernel<block_cols, HD_, 0, ((HD_) / 16), HND_, BR_, VT_, CAUSAL_, OUT_T_, QUERY_T_, true, int8_t, uint8_t, false, false, (VT_ ? -1 : 0), false, false, 2, false><<<grid, block, 0>>>( \
+#define SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_EX(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_) \
+  qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), HND_, BR_, VT_, CAUSAL_, OUT_T_, QUERY_T_, true, int8_t, uint8_t, false, false, (VT_ ? -1 : 0), false, false, 2, false, false, KEY_HND_, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_><<<grid, block, 0>>>( \
       reinterpret_cast<const QUERY_T_*>(query.data_ptr()), \
       reinterpret_cast<int8_t*>(key.data_ptr()), reinterpret_cast<uint8_t*>(value.data_ptr()), \
       reinterpret_cast<OUT_T_*>(output.data_ptr()), \
       nullptr, reinterpret_cast<float*>(key_scale.data_ptr()), value_scale_ptr, \
       batch, q_len, kv_len, q_heads, kv_heads, \
       query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
-      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+      key.stride(0), key.stride(key_hnd_contiguous ? 2 : (tensor_layout == kNHD ? 1 : 2)), key.stride(key_hnd_contiguous ? 1 : (tensor_layout == kNHD ? 2 : 1)), \
       value.stride(0), (VT_ ? value.stride(2) : value.stride(tensor_layout == kNHD ? 1 : 2)), (VT_ ? value.stride(1) : value.stride(tensor_layout == kNHD ? 2 : 1)), \
       output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
       0, 0, \
       key_scale.stride(0), key_scale.stride(1), \
       tensor_layout, sm_scale)
-#define SAGEATTN_DISPATCH_RAWQ_FP8_OUT(HD_, HND_, BR_, VT_, CAUSAL_, QUERY_T_) \
+#define SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_) \
+  SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_EX(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_, false, false, false, false)
+#define SAGEATTN_DISPATCH_RAWQ_FP8_OUT(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, QUERY_AT_T_) \
   if (output.scalar_type() == ScalarType::BFloat16) { \
-    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(HD_, HND_, BR_, VT_, CAUSAL_, QUERY_T_, __hip_bfloat16); \
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __hip_bfloat16, QUERY_AT_T_, at::BFloat16); \
   } else { \
-    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(HD_, HND_, BR_, VT_, CAUSAL_, QUERY_T_, __half); \
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __half, QUERY_AT_T_, at::Half); \
   }
-#define SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(HD_, HND_, BR_, VT_, CAUSAL_) \
+#define SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_) \
   if (query.scalar_type() == ScalarType::BFloat16) { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_OUT(HD_, HND_, BR_, VT_, CAUSAL_, __hip_bfloat16); \
+    SAGEATTN_DISPATCH_RAWQ_FP8_OUT(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, __hip_bfloat16, at::BFloat16); \
   } else { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_OUT(HD_, HND_, BR_, VT_, CAUSAL_, __half); \
+    SAGEATTN_DISPATCH_RAWQ_FP8_OUT(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, __half, at::Half); \
   }
-#define SAGEATTN_DISPATCH_RAWQ_FP8_BR(HD_, HND_, VT_, CAUSAL_) \
+#define SAGEATTN_DISPATCH_RAWQ_FP8_BR(BC_, HD_, HND_, KEY_HND_, VT_, CAUSAL_) \
   if (block_rows == 64) { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(HD_, HND_, 64, VT_, CAUSAL_); \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(BC_, HD_, HND_, KEY_HND_, 64, VT_, CAUSAL_); \
   } else if (block_rows == 256) { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(HD_, HND_, 256, VT_, CAUSAL_); \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(BC_, HD_, HND_, KEY_HND_, 256, VT_, CAUSAL_); \
   } else if (block_rows == 512) { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(HD_, HND_, 512, VT_, CAUSAL_); \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(BC_, HD_, HND_, KEY_HND_, 512, VT_, CAUSAL_); \
   } else { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(HD_, HND_, 128, VT_, CAUSAL_); \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(BC_, HD_, HND_, KEY_HND_, 128, VT_, CAUSAL_); \
   }
-#define SAGEATTN_DISPATCH_RAWQ_FP8_HD(HND_, VT_, CAUSAL_) \
+#define SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, HND_, KEY_HND_, VT_, CAUSAL_) \
   if (head_dim == 16) { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_BR(16, HND_, VT_, CAUSAL_); \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR(BC_, 16, HND_, KEY_HND_, VT_, CAUSAL_); \
   } else if (head_dim == 64) { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_BR(64, HND_, VT_, CAUSAL_); \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR(BC_, 64, HND_, KEY_HND_, VT_, CAUSAL_); \
   } else { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_BR(128, HND_, VT_, CAUSAL_); \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR(BC_, 128, HND_, KEY_HND_, VT_, CAUSAL_); \
+  }
+#define SAGEATTN_DISPATCH_RAWQ_FP8_LAYOUT(BC_) \
+  if (hnd_contiguous) { \
+    if (is_causal) { \
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, true, true, true, true); } \
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, true, true, false, true); } \
+    } else { \
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, true, true, true, false); } \
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, true, true, false, false); } \
+    } \
+  } else if (key_hnd_contiguous) { \
+    if (is_causal) { \
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, true, true, true); } \
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, true, false, true); } \
+    } else { \
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, true, true, false); } \
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, true, false, false); } \
+    } \
+  } else { \
+    if (is_causal) { \
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, false, true, true); } \
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, false, false, true); } \
+    } else { \
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, false, true, false); } \
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, false, false, false); } \
+    } \
   }
 
-  if (hnd_contiguous) {
-    if (is_causal) {
-      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(true, true, true); }
-      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(true, false, true); }
-    } else {
-      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(true, true, false); }
-      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(true, false, false); }
-    }
+  const bool use_static_short_nhd =
+      !is_causal && value_transposed_hnd && tensor_layout == kNHD &&
+      !key_hnd_contiguous && q_heads == kv_heads && q_len == kv_len &&
+      q_len == 512 && head_dim == 128 &&
+      query.scalar_type() == ScalarType::Half && output.scalar_type() == ScalarType::Half;
+
+  if (use_static_short_nhd) {
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_EX(64, 128, false, false, 128, true, false,
+                                      __half, __half, at::Half, at::Half,
+                                      true, true, true, true);
+  } else if (use_bc32) {
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(32, 128, false, false, 128, true, false);
   } else {
-    if (is_causal) {
-      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(false, true, true); }
-      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(false, false, true); }
-    } else {
-      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(false, true, false); }
-      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(false, false, false); }
-    }
+    SAGEATTN_DISPATCH_RAWQ_FP8_LAYOUT(64);
   }
 
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_LAYOUT
 #undef SAGEATTN_DISPATCH_RAWQ_FP8_HD
 #undef SAGEATTN_DISPATCH_RAWQ_FP8_BR
 #undef SAGEATTN_DISPATCH_RAWQ_FP8_QUERY
 #undef SAGEATTN_DISPATCH_RAWQ_FP8_OUT
 #undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED
+#undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_EX
   hip_kernel_launch_check();
   return output;
 }
@@ -7443,12 +8089,14 @@ Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
     int64_t is_causal,
     double sm_scale,
     int64_t valid_kv_len,
-    int64_t value_transposed_hnd) {
+    int64_t value_transposed_hnd,
+    int64_t key_hnd_layout) {
   return qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
-      query, key, value, output, key_scale, nullptr,
+      query, key, value, output, key_scale, Tensor(),
       static_cast<int>(tensor_layout), static_cast<int>(is_causal),
       static_cast<float>(sm_scale), valid_kv_len,
-      static_cast<int>(value_transposed_hnd));
+      static_cast<int>(value_transposed_hnd),
+      static_cast<int>(key_hnd_layout));
 }
 
 Tensor qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
@@ -7462,18 +8110,19 @@ Tensor qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
     int64_t is_causal,
     double sm_scale,
     int64_t valid_kv_len,
-    int64_t value_transposed_hnd) {
-  const int64_t head_dim = query.size(-1);
-  const int64_t batch = query.size(0);
-  const int64_t kv_heads = tensor_layout == kNHD ? key.size(2) : key.size(1);
-  const float* value_scale_ptr =
-      checked_value_scale_ptr_gfx12(value_scale, batch, kv_heads, head_dim);
+    int64_t value_transposed_hnd,
+    int64_t key_hnd_layout) {
   return qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
-      query, key, value, output, key_scale, value_scale_ptr,
+      query, key, value, output, key_scale, value_scale,
       static_cast<int>(tensor_layout), static_cast<int>(is_causal),
       static_cast<float>(sm_scale), valid_kv_len,
-      static_cast<int>(value_transposed_hnd));
+      static_cast<int>(value_transposed_hnd),
+      static_cast<int>(key_hnd_layout));
 }
+
+#endif // SAGEATTN_GFX12_BUILD_RAWQ_FP8
+
+#if SAGEATTN_GFX12_BUILD_ATTN_FP8
 
 Tensor qk_int8_sv_f8_scaled_native_attn_gfx12(
     Tensor query,
@@ -7487,16 +8136,15 @@ Tensor qk_int8_sv_f8_scaled_native_attn_gfx12(
     int64_t is_causal,
     double sm_scale,
     int64_t valid_kv_len) {
-  const int64_t head_dim = query.size(-1);
-  const int64_t batch = query.size(0);
-  const int64_t kv_heads = tensor_layout == kNHD ? key.size(2) : key.size(1);
-  const float* value_scale_ptr =
-      checked_value_scale_ptr_gfx12(value_scale, batch, kv_heads, head_dim);
   return qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query, key, value, output, query_scale, key_scale,
       static_cast<int>(tensor_layout), static_cast<int>(is_causal),
-      static_cast<float>(sm_scale), valid_kv_len, value_scale_ptr, 1);
+      static_cast<float>(sm_scale), valid_kv_len, value_scale, 1, -1);
 }
+
+#endif // SAGEATTN_GFX12_BUILD_ATTN_FP8
+
+#if SAGEATTN_GFX12_BUILD_ATTN_F16
 
 Tensor qk_int8_sv_f16_d64_native_attn_gfx12(
     Tensor query,
@@ -7509,10 +8157,121 @@ Tensor qk_int8_sv_f16_d64_native_attn_gfx12(
     int64_t is_causal,
     double sm_scale,
     int64_t valid_kv_len,
-    int64_t value_transposed_hnd) {
+    int64_t value_transposed_hnd,
+    int64_t pv_accum_mode) {
   return qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query, key, value, output, query_scale, key_scale,
       static_cast<int>(tensor_layout), static_cast<int>(is_causal),
-      static_cast<float>(sm_scale), valid_kv_len, nullptr,
-      static_cast<int>(value_transposed_hnd));
+      static_cast<float>(sm_scale), valid_kv_len, Tensor(),
+      static_cast<int>(value_transposed_hnd), static_cast<int>(pv_accum_mode));
 }
+
+Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
+    Tensor query,
+    Tensor key,
+    Tensor value,
+    Tensor output,
+    Tensor key_scale,
+    int64_t tensor_layout,
+    int64_t is_causal,
+    double sm_scale,
+    int64_t valid_kv_len,
+    int64_t pv_accum_mode) {
+  STD_TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && output.is_cuda(),
+              "raw-Q fp16 gfx12 tensors must be CUDA/HIP tensors");
+  STD_TORCH_CHECK(query.scalar_type() == ScalarType::Half ||
+                  query.scalar_type() == ScalarType::BFloat16,
+              "raw-Q fp16 gfx12 query must be fp16 or bf16");
+  STD_TORCH_CHECK(key.scalar_type() == ScalarType::Char, "raw-Q fp16 gfx12 key must be int8");
+  STD_TORCH_CHECK(value.scalar_type() == ScalarType::Half, "raw-Q fp16 gfx12 value must be fp16");
+  STD_TORCH_CHECK(output.scalar_type() == ScalarType::Half, "raw-Q fp16 gfx12 output must be fp16");
+  STD_TORCH_CHECK(key_scale.scalar_type() == ScalarType::Float,
+              "raw-Q fp16 gfx12 key_scale must be fp32");
+  STD_TORCH_CHECK(tensor_layout == kHND || tensor_layout == kNHD, "invalid tensor_layout");
+  STD_TORCH_CHECK(query.dim() == 4 && key.dim() == 4 && value.dim() == 4 && output.dim() == 4,
+              "raw-Q fp16 gfx12 attention expects 4D tensors");
+  const int64_t head_dim = query.size(-1);
+  STD_TORCH_CHECK(head_dim == 16 || head_dim == 64 || head_dim == 128,
+              "raw-Q fp16 gfx12 supports D16/D64/D128");
+  STD_TORCH_CHECK(key.size(-1) == head_dim && value.size(-1) == head_dim &&
+                  output.size(-1) == head_dim,
+              "raw-Q fp16 gfx12 tensors must have matching head_dim");
+  const int64_t batch = query.size(0);
+  const int64_t q_heads = tensor_layout == kNHD ? query.size(2) : query.size(1);
+  const int64_t q_len = tensor_layout == kNHD ? query.size(1) : query.size(2);
+  const int64_t kv_heads = tensor_layout == kNHD ? key.size(2) : key.size(1);
+  const int64_t padded_kv_len = tensor_layout == kNHD ? key.size(1) : key.size(2);
+  const int64_t kv_len = valid_kv_len > 0 ? valid_kv_len : padded_kv_len;
+  STD_TORCH_CHECK(kv_len > 0 && kv_len <= padded_kv_len,
+              "valid_kv_len must be in (0, padded_kv_len]");
+  STD_TORCH_CHECK((padded_kv_len % 64) == 0,
+              "raw-Q fp16 gfx12 requires kv_len to be a multiple of 64");
+  STD_TORCH_CHECK(!is_causal || q_len == padded_kv_len,
+              "raw-Q fp16 gfx12 causal path requires q_len == kv_len");
+  STD_TORCH_CHECK((q_heads % kv_heads) == 0, "q_heads must be divisible by kv_heads");
+  STD_TORCH_CHECK(key_scale.dim() == 3 && key_scale.stride(-1) == 1,
+              "raw-Q fp16 gfx12 key_scale must be [B, H_kv, ceil(K/64)]");
+  STD_TORCH_CHECK(key_scale.size(0) == batch && key_scale.size(1) == kv_heads &&
+                  key_scale.size(2) == (padded_kv_len + 63) / 64,
+              "raw-Q fp16 gfx12 key_scale shape mismatch");
+  STD_TORCH_CHECK(pv_accum_mode >= -1 && pv_accum_mode <= 1,
+              "invalid gfx12 fp16 PV accumulation mode");
+
+  const bool hnd_contiguous = tensor_layout == kHND &&
+      query.is_contiguous() && key.is_contiguous() &&
+      value.is_contiguous() && output.is_contiguous();
+  const int block_rows = q_len <= 64 ? 64 : 128;
+  const dim3 block(block_rows);
+  const dim3 grid((q_len + block_rows - 1) / block_rows, q_heads, batch);
+#define SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_) \
+  qk_int8_sv_f16_d64_native_2q_kernel<64, HND_, BR_, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD, CAUSAL_, false, F16ACC_, QUERY_T_, true, int8_t, false, false, false, false, false, HD_><<<grid, block, 0>>>( \
+      reinterpret_cast<const QUERY_T_*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+      reinterpret_cast<const __half*>(value.data_ptr()), \
+      reinterpret_cast<__half*>(output.data_ptr()), \
+      nullptr, reinterpret_cast<float*>(key_scale.data_ptr()), \
+      batch, q_len, kv_len, q_heads, kv_heads, \
+      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+      value.stride(0), value.stride(tensor_layout == kNHD ? 1 : 2), value.stride(tensor_layout == kNHD ? 2 : 1), \
+      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+      0, 0, key_scale.stride(0), key_scale.stride(1), \
+      tensor_layout, sm_scale)
+#define SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(HD_, HND_, QUERY_T_) \
+  if (is_causal) { \
+    if (pv_accum_mode == 1) { \
+      if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, true, QUERY_T_, true); } \
+      else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, true, QUERY_T_, true); } \
+    } else { \
+      if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, true, QUERY_T_, false); } \
+      else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, true, QUERY_T_, false); } \
+    } \
+  } else if (pv_accum_mode == 1) { \
+    if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, false, QUERY_T_, true); } \
+    else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, false, QUERY_T_, true); } \
+  } else { \
+    if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, false, QUERY_T_, false); } \
+    else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, false, QUERY_T_, false); } \
+  }
+#define SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_DTYPE(QUERY_T_) \
+  if (hnd_contiguous) { \
+    if (head_dim == 16) { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(16, true, QUERY_T_); } \
+    else if (head_dim == 64) { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(64, true, QUERY_T_); } \
+    else { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(128, true, QUERY_T_); } \
+  } else { \
+    if (head_dim == 16) { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(16, false, QUERY_T_); } \
+    else if (head_dim == 64) { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(64, false, QUERY_T_); } \
+    else { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(128, false, QUERY_T_); } \
+  }
+  if (query.scalar_type() == ScalarType::Half) {
+    SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_DTYPE(__half);
+  } else {
+    SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_DTYPE(__hip_bfloat16);
+  }
+#undef SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_DTYPE
+#undef SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND
+#undef SAGEATTN_LAUNCH_RAWQ_F16_VALUE
+  hip_kernel_launch_check();
+  return new_empty_like(query, {0}, ScalarType::Float);
+}
+
+#endif // SAGEATTN_GFX12_BUILD_ATTN_F16

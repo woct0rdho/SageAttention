@@ -165,6 +165,82 @@ def _gfx12_fp8_value_scale_hnd(v_hnd: torch.Tensor, scale_max: float) -> torch.T
     return v_hnd.abs().amax(dim=2).to(torch.float32).div(scale_max).contiguous()
 
 
+def _gfx12_fp8_value_native(
+    gfx12_native: Any,
+    value: torch.Tensor,
+    scale_max: float,
+    tensor_layout: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    value_hnd = value if tensor_layout == "HND" else value.transpose(1, 2).contiguous()
+    value_scale = _gfx12_fp8_value_scale_hnd(value_hnd, scale_max)
+    value_native = gfx12_native.transpose_value_fp8_scaled_hnd(value_hnd, value_scale)
+    return value_native, value_scale
+
+
+def _gfx12_normalize_v2_options(
+    value_dtype: str,
+    pv_accum_dtype: Optional[str],
+    smooth_v: bool,
+) -> Tuple[str, str, bool, float]:
+    value_dtype_normalized = value_dtype.lower()
+    if value_dtype_normalized == "auto":
+        value_dtype_normalized = "fp8"
+    if value_dtype_normalized not in {"fp16", "fp8"}:
+        raise ValueError("gfx12 native value_dtype must be 'auto', 'fp16', or 'fp8'.")
+    if pv_accum_dtype is None:
+        pv_accum_dtype = "fp32+fp16" if value_dtype_normalized == "fp8" else "fp32"
+    if value_dtype_normalized == "fp8":
+        if pv_accum_dtype not in {"fp32+fp16", "fp32", "fp32+fp32"}:
+            raise ValueError("gfx12 fp8 value path supports pv_accum_dtype 'fp32+fp16', 'fp32', or 'fp32+fp32'.")
+        if smooth_v and pv_accum_dtype in {"fp32+fp16", "fp32+fp32"}:
+            warnings.warn(f"pv_accum_dtype is {pv_accum_dtype}, smooth_v will be ignored.")
+            smooth_v = False
+        return value_dtype_normalized, pv_accum_dtype, smooth_v, (
+            _GFX12_FP8_VALUE_SCALE_MAX_FP32_FP16 if pv_accum_dtype == "fp32+fp16" else 448.0
+        )
+    if pv_accum_dtype not in {"fp32", "fp16", "fp16+fp32"}:
+        raise ValueError("gfx12 fp16 value path supports pv_accum_dtype 'fp32', 'fp16', or 'fp16+fp32'.")
+    if smooth_v and pv_accum_dtype in {"fp32", "fp16+fp32"}:
+        warnings.warn(f"pv_accum_dtype is {pv_accum_dtype}, smooth_v will be ignored.")
+        smooth_v = False
+    return value_dtype_normalized, pv_accum_dtype, smooth_v, _GFX12_FP8_VALUE_SCALE_MAX_FP32_FP16
+
+
+def _gfx12_pv_accum_mode(value_dtype: str, pv_accum_dtype: str) -> int:
+    if value_dtype != "fp16":
+        return -1
+    return 1 if pv_accum_dtype == "fp16" else 0
+
+
+def _gfx12_apply_smooth_v(
+    v: torch.Tensor,
+    tensor_layout: str,
+    q_heads: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    seq_dim = 1 if tensor_layout == "NHD" else 2
+    head_dim = 2 if tensor_layout == "NHD" else 1
+    vm = v.mean(dim=seq_dim)
+    centered = (v - vm.unsqueeze(seq_dim)).to(torch.float16)
+    kv_heads = v.size(head_dim)
+    if q_heads % kv_heads != 0:
+        raise ValueError("num_qo_heads must be divisible by num_kv_heads.")
+    if q_heads != kv_heads:
+        vm = torch.repeat_interleave(vm, q_heads // kv_heads, dim=1)
+    return centered, vm
+
+
+def _gfx12_add_smooth_v_mean(
+    out: torch.Tensor,
+    vm: Optional[torch.Tensor],
+    tensor_layout: str,
+) -> torch.Tensor:
+    if vm is None:
+        return out
+    if tensor_layout == "NHD":
+        return out + vm.unsqueeze(1).to(out.dtype)
+    return out + vm.unsqueeze(2).to(out.dtype)
+
+
 def _attention_lse_reference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -243,86 +319,44 @@ def sageattn_qk_int8_pv_gfx12_native(
       not affect the default return_lse=False fast path.
     """
 
-    if kwargs:
-        unsupported = ", ".join(sorted(key for key, value in kwargs.items() if value is not None))
-        if unsupported:
-            raise TypeError(f"Unsupported non-None gfx12 SageAttention arguments: {unsupported}")
     if qk_quant_gran not in {"per_warp", "per_thread"}:
         raise ValueError("qk_quant_gran must be either 'per_warp' or 'per_thread'.")
-    if qk_quant_gran != "per_warp":
-        raise NotImplementedError("gfx12 native currently supports qk_quant_gran='per_warp'.")
-    if smooth_v:
-        raise NotImplementedError("gfx12 native does not support smooth_v yet.")
-    value_dtype_normalized = value_dtype.lower()
-    if value_dtype_normalized == "auto":
-        value_dtype_normalized = "fp8"
-    if pv_accum_dtype is None:
-        pv_accum_dtype = "fp32+fp16" if value_dtype_normalized == "fp8" else "fp32"
-    if value_dtype_normalized == "fp8" and pv_accum_dtype not in {"fp32+fp16", "fp32", "fp32+fp32"}:
-        raise ValueError("gfx12 fp8 value path supports pv_accum_dtype 'fp32+fp16', 'fp32', or 'fp32+fp32'.")
-    if value_dtype_normalized == "fp8" and pv_accum_dtype != "fp32+fp16":
-        raise NotImplementedError("gfx12 fp8 value path currently supports pv_accum_dtype='fp32+fp16'.")
-    if value_dtype_normalized == "fp16" and pv_accum_dtype not in {"fp32", "fp16", "fp16+fp32"}:
-        raise ValueError("gfx12 fp16 value path supports pv_accum_dtype 'fp32', 'fp16', or 'fp16+fp32'.")
-    if value_dtype_normalized == "fp16" and pv_accum_dtype != "fp32":
-        raise NotImplementedError("gfx12 fp16 value path currently supports pv_accum_dtype='fp32'.")
-    fp8_value_scale_max = _GFX12_FP8_VALUE_SCALE_MAX_FP32_FP16
+    value_dtype_normalized, pv_accum_dtype, smooth_v, fp8_value_scale_max = (
+        _gfx12_normalize_v2_options(value_dtype, pv_accum_dtype, smooth_v)
+    )
+    pv_accum_mode = _gfx12_pv_accum_mode(value_dtype_normalized, pv_accum_dtype)
     gfx12_native = _get_gfx12_native_extension()
     gfx12_prepare_attn_hnd = _qattn_gfx12_prepare_attn_hnd
-
-    lse_q = q
-    lse_k = k
-    lse_sm_scale = float(sm_scale if sm_scale is not None else q.size(-1) ** -0.5)
-
-    def _with_lse(out: torch.Tensor):
-        if not return_lse:
-            return out
-        return out, _attention_lse_reference(
-            lse_q, lse_k, tensor_layout, bool(is_causal), lse_sm_scale
-        )
-
-    if (
-        tensor_layout == "HND"
-        and value_dtype_normalized == "fp16"
-        and not smooth_k
-        and not return_lse
-        and q.dim() == 4
-        and k.dim() == 4
-        and v.dim() == 4
-        and q.is_cuda
-        and q.is_contiguous()
-        and k.is_contiguous()
-        and v.is_contiguous()
-        and q.dtype == torch.float16
-        and q.dtype == k.dtype == v.dtype
-        and q.device == k.device == v.device
-        and q.size(-1) in (16, 64)
-        and q.size(2) % 64 == 0
-        and k.size(2) % 64 == 0
-    ):
-        torch.cuda.set_device(v.device)
-        use_raw_f16_value = is_causal and q.size(-1) == 64 and q.size(2) <= 512
-        return gfx12_prepare_attn_hnd(
-            q,
-            k,
-            v,
-            int(is_causal),
-            0,
-            int(use_raw_f16_value),
-            float(sm_scale if sm_scale is not None else q.size(-1) ** -0.5),
-        )
 
     assert q.is_cuda, "Input tensors must be on cuda/HIP."
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
     assert q.dtype in [torch.float16, torch.bfloat16], "gfx12 native path supports fp16/bf16 inputs."
     assert tensor_layout in ["HND", "NHD"], "tensor_layout must be either 'HND' or 'NHD'."
+    input_dtype = q.dtype
+
+    if smooth_v:
+        q_heads = q.size(2) if tensor_layout == "NHD" else q.size(1)
+        v, smooth_v_mean = _gfx12_apply_smooth_v(v, tensor_layout, q_heads)
+    else:
+        smooth_v_mean = None
+
+    lse_q = q
+    lse_k = k
+    lse_sm_scale = float(sm_scale if sm_scale is not None else q.size(-1) ** -0.5)
+
+    def _with_lse(out: torch.Tensor):
+        out = _gfx12_add_smooth_v_mean(out, smooth_v_mean, tensor_layout)
+        if not return_lse:
+            return out
+        return out, _attention_lse_reference(
+            lse_q, lse_k, tensor_layout, bool(is_causal), lse_sm_scale
+        )
+
     torch.cuda.set_device(v.device)
 
-    input_dtype = q.dtype
+    assert v.dtype in [torch.float16, torch.bfloat16], "gfx12 native path supports fp16/bf16 value inputs."
     value_dtype = value_dtype_normalized
-    if value_dtype not in {"fp16", "fp8"}:
-        raise ValueError("gfx12 native value_dtype must be 'auto', 'fp16', or 'fp8'.")
     if sm_scale is None and q.dim() == 4:
         sm_scale = q.size(-1) ** -0.5
 
@@ -332,6 +366,7 @@ def sageattn_qk_int8_pv_gfx12_native(
         and q.dim() == 4
         and k.dim() == 4
         and v.dim() == 4
+        and q.dtype == k.dtype == v.dtype
         and q.is_contiguous()
         and k.is_contiguous()
         and v.is_contiguous()
@@ -356,12 +391,14 @@ def sageattn_qk_int8_pv_gfx12_native(
             int(value_dtype == "fp8"),
             int(use_raw_f16_value),
             float(sm_scale),
+            0,
+            pv_accum_mode,
         )
         if input_dtype == torch.bfloat16:
             out = out if out.dtype == torch.bfloat16 else gfx12_native.convert_f16_to_bf16(out)
         return _with_lse(out)
 
-    if tensor_layout == "NHD" and smooth_k and not (
+    if tensor_layout == "NHD" and smooth_k and qk_quant_gran == "per_warp" and not (
         value_dtype == "fp16" and q.size(-1) > 64
     ):
         q_nhd = q.contiguous()
@@ -394,11 +431,45 @@ def sageattn_qk_int8_pv_gfx12_native(
         if value_dtype == "fp8" and head_dim not in (16, 64, 128):
             raise ValueError("gfx12 fp8 value path currently supports head_dim 16, 64, or 128.")
 
-        k_mean = k_nhd.mean(dim=1, keepdim=True)
+        use_short_nhd_fp8_prep = (
+            value_dtype == "fp8"
+            and not is_causal
+            and input_dtype == torch.float16
+            and qo_len == kv_len
+            and kv_len in (512, 1024)
+            and head_dim in (64, 128)
+        )
+        value_native = None
+        value_scale = None
+        if use_short_nhd_fp8_prep:
+            k_mean_flat, value_native, value_scale = (
+                gfx12_native.mean_and_fp8_value_nhd_short(
+                    k_nhd, v_nhd, float(fp8_value_scale_max)
+                )
+            )
+            k_mean = k_mean_flat.unsqueeze(1)
+        else:
+            k_mean = k_nhd.mean(dim=1, keepdim=True)
+            k_mean_flat = k_mean.squeeze(1)
         use_rawq_tail = value_dtype == "fp8" and not is_causal and head_dim == 128
-        if use_rawq_tail:
+        use_mixed_key_hnd = value_dtype == "fp8" and (
+            (
+                is_causal
+                and (
+                    (head_dim == 64 and qo_len >= 8192)
+                    or (head_dim == 128 and qo_len >= 4096)
+                )
+            )
+        )
+        use_rawq_f16_value = (
+            value_dtype == "fp16"
+            and not is_causal
+            and head_dim == 64
+            and qk_quant_gran == "per_warp"
+        )
+        if use_rawq_tail or use_rawq_f16_value:
             q_attn = q_nhd
-            q_out_len = ((qo_len + 127) // 128) * 128
+            q_out_len = ((qo_len + 127) // 128) * 128 if use_rawq_tail else qo_len
             kv_pad_len = ((kv_len + 63) // 64) * 64 - kv_len
             if kv_pad_len > 0:
                 k_nhd = torch.cat([k_nhd, k_mean.expand(-1, kv_pad_len, -1, -1)], dim=1)
@@ -409,22 +480,33 @@ def sageattn_qk_int8_pv_gfx12_native(
             )
             q_attn = q_nhd
             q_out_len = q_nhd.size(1)
-        k_int8 = torch.empty_like(k_nhd, dtype=torch.int8)
-        k_scale = torch.empty(
-            (k_nhd.size(0), k_nhd.size(2), (k_nhd.size(1) + 63) // 64),
-            device=k_nhd.device,
-            dtype=torch.float32,
-        )
-        _quant_fused.quant_per_block_int8_fuse_sub_mean_cuda(
-            k_nhd, k_mean.squeeze(1), k_int8, k_scale, 64, 0
-        )
-        value_scale = None
-        if value_dtype == "fp8":
-            v_hnd_for_value = v_nhd.transpose(1, 2).contiguous()
-            value_scale = _gfx12_fp8_value_scale_hnd(v_hnd_for_value, fp8_value_scale_max)
-            value_native = gfx12_native.transpose_value_fp8_scaled_hnd(
-                v_hnd_for_value, value_scale
+        if use_mixed_key_hnd:
+            k_attn = k_nhd.transpose(1, 2).contiguous()
+            k_mean_attn = k_mean.transpose(1, 2).contiguous()
+            k_int8 = torch.empty_like(k_attn, dtype=torch.int8)
+            k_scale = torch.empty(
+                (k_attn.size(0), k_attn.size(1), (k_attn.size(2) + 63) // 64),
+                device=k_attn.device,
+                dtype=torch.float32,
             )
+            _quant_fused.quant_per_block_int8_fuse_sub_mean_cuda(
+                k_attn, k_mean_attn.squeeze(2), k_int8, k_scale, 64, 1
+            )
+        else:
+            k_int8 = torch.empty_like(k_nhd, dtype=torch.int8)
+            k_scale = torch.empty(
+                (k_nhd.size(0), k_nhd.size(2), (k_nhd.size(1) + 63) // 64),
+                device=k_nhd.device,
+                dtype=torch.float32,
+            )
+            _quant_fused.quant_per_block_int8_fuse_sub_mean_cuda(
+                k_nhd, k_mean_flat, k_int8, k_scale, 64, 0
+            )
+        if value_dtype == "fp8":
+            if value_native is None:
+                value_native, value_scale = _gfx12_fp8_value_native(
+                    gfx12_native, v_nhd, fp8_value_scale_max, "NHD"
+                )
         else:
             value_native = v_nhd if input_dtype == torch.float16 else v_nhd.to(torch.float16)
         out = torch.empty(
@@ -445,22 +527,38 @@ def sageattn_qk_int8_pv_gfx12_native(
                 float(sm_scale),
                 kv_len,
                 1,
+                int(use_mixed_key_hnd),
             )
         else:
-            q_int8, q_scale = gfx12_native.quant_q_nhd_per_warp(q_attn)
-            gfx12_native.qk_int8_sv_f16_d64_native_attn(
-                q_int8,
-                k_int8,
-                value_native,
-                out,
-                q_scale,
-                k_scale,
-                0,
-                int(is_causal),
-                float(sm_scale),
-                kv_len,
-                0,
-            )
+            if head_dim == 64 and qk_quant_gran == "per_warp":
+                gfx12_native.qk_rawq_int8_sv_f16_native_attn(
+                    q_attn,
+                    k_int8,
+                    value_native,
+                    out,
+                    k_scale,
+                    0,
+                    int(is_causal),
+                    float(sm_scale),
+                    kv_len,
+                    pv_accum_mode,
+                )
+            else:
+                q_int8, q_scale = gfx12_native.quant_q_nhd_per_warp(q_attn)
+                gfx12_native.qk_int8_sv_f16_d64_native_attn(
+                    q_int8,
+                    k_int8,
+                    value_native,
+                    out,
+                    q_scale,
+                    k_scale,
+                    0,
+                    int(is_causal),
+                    float(sm_scale),
+                    kv_len,
+                    0,
+                    pv_accum_mode,
+                )
         out = out[:, :qo_len, :, :head_dim_og]
         if input_dtype == torch.bfloat16 and out.dtype != torch.bfloat16:
             out = gfx12_native.convert_f16_to_bf16(out.contiguous() if not out.is_contiguous() else out)
@@ -485,7 +583,9 @@ def sageattn_qk_int8_pv_gfx12_native(
         raise ValueError("gfx12 causal path currently requires q_len == kv_len.")
 
     head_dim = head_dim_og
-    if head_dim < 64 and (smooth_k or head_dim != 16):
+    if head_dim < 64 and (
+        smooth_k or head_dim != 16 or value_dtype == "fp8" or q_hnd.dtype != v_hnd.dtype
+    ):
         pad = 64 - head_dim
         q_hnd = F.pad(q_hnd, (0, pad))
         k_hnd = F.pad(k_hnd, (0, pad))
@@ -516,29 +616,50 @@ def sageattn_qk_int8_pv_gfx12_native(
         and padded_qo_len <= 512
     )
 
+    def _quant_qk_hnd(q_src: torch.Tensor, k_src: torch.Tensor, km_src: Optional[torch.Tensor]):
+        if qk_quant_gran == "per_thread":
+            return per_thread_int8_triton(
+                q_src, k_src, km_src, BLKQ=128,
+                WARPQ=(16 if (head_dim == 128 and pv_accum_dtype == "fp16+fp32") else 32),
+                BLKK=64, WARPK=64, tensor_layout="HND"
+            )
+        return per_warp_int8_cuda(
+            q_src, k_src, km_src, BLKQ=128, WARPQ=32, BLKK=64, tensor_layout="HND"
+        )
+
     if not smooth_k:
         if value_dtype == "fp8":
-            q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(
-                q_hnd, k_hnd, None, BLKQ=128, WARPQ=32, BLKK=64, tensor_layout="HND"
+            q_int8, q_scale, k_int8, k_scale = _quant_qk_hnd(q_hnd, k_hnd, None)
+            value_native, value_scale = _gfx12_fp8_value_native(
+                gfx12_native, v_hnd, fp8_value_scale_max, "HND"
             )
-            value_scale = _gfx12_fp8_value_scale_hnd(v_hnd, fp8_value_scale_max)
-            value_native = gfx12_native.transpose_value_fp8_scaled_hnd(v_hnd, value_scale)
             out = torch.empty_like(q_hnd, dtype=torch.float16)
             gfx12_native.qk_int8_sv_f8_scaled_native_attn(
                 q_int8, k_int8, value_native, out, q_scale, k_scale, value_scale,
                 1, int(is_causal), float(sm_scale), kv_len
             )
         else:
-            out = gfx12_prepare_attn_hnd(
-                q_hnd,
-                k_hnd,
-                v_hnd,
-                int(is_causal),
-                0,
-                int(use_raw_f16_value),
-                float(sm_scale),
-                kv_len,
-            )
+            if qk_quant_gran == "per_warp" and q_hnd.dtype == k_hnd.dtype == v_hnd.dtype:
+                out = gfx12_prepare_attn_hnd(
+                    q_hnd,
+                    k_hnd,
+                    v_hnd,
+                    int(is_causal),
+                    0,
+                    int(use_raw_f16_value),
+                    float(sm_scale),
+                    kv_len,
+                    pv_accum_mode,
+                )
+            else:
+                q_int8, q_scale, k_int8, k_scale = _quant_qk_hnd(q_hnd, k_hnd, None)
+                value_native = gfx12_native.transpose_value_f16_hnd(v_hnd)
+                out = torch.empty_like(q_hnd, dtype=torch.float16)
+                gfx12_native.qk_int8_sv_f16_d64_native_attn(
+                    q_int8, k_int8, value_native, out, q_scale, k_scale,
+                    1, int(is_causal), float(sm_scale), kv_len, 1,
+                    pv_accum_mode
+                )
     else:
         use_rawq_hnd_fp8 = (
             value_dtype == "fp8"
@@ -550,7 +671,7 @@ def sageattn_qk_int8_pv_gfx12_native(
                 or padded_qo_len >= 8192
             )
         )
-        if use_rawq_hnd_fp8:
+        if use_rawq_hnd_fp8 and qk_quant_gran == "per_warp":
             k_int8 = torch.empty_like(k_hnd, dtype=torch.int8)
             k_scale = torch.empty(
                 (k_hnd.size(0), k_hnd.size(1), (k_hnd.size(2) + 63) // 64),
@@ -560,8 +681,9 @@ def sageattn_qk_int8_pv_gfx12_native(
             _quant_fused.quant_per_block_int8_fuse_sub_mean_cuda(
                 k_hnd, k_mean.squeeze(2), k_int8, k_scale, 64, 1
             )
-            value_scale = _gfx12_fp8_value_scale_hnd(v_hnd, fp8_value_scale_max)
-            value_native = gfx12_native.transpose_value_fp8_scaled_hnd(v_hnd, value_scale)
+            value_native, value_scale = _gfx12_fp8_value_native(
+                gfx12_native, v_hnd, fp8_value_scale_max, "HND"
+            )
             out = torch.empty_like(
                 q_hnd,
                 dtype=torch.bfloat16 if input_dtype == torch.bfloat16 else torch.float16,
@@ -577,13 +699,12 @@ def sageattn_qk_int8_pv_gfx12_native(
                 out = out.transpose(1, 2).contiguous()
             return _with_lse(out)
 
-        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(
-            q_hnd, k_hnd, k_mean, BLKQ=128, WARPQ=32, BLKK=64, tensor_layout="HND"
-        )
+        q_int8, q_scale, k_int8, k_scale = _quant_qk_hnd(q_hnd, k_hnd, k_mean)
         out = torch.empty_like(q_hnd, dtype=torch.float16)
         if value_dtype == "fp8":
-            value_scale = _gfx12_fp8_value_scale_hnd(v_hnd, fp8_value_scale_max)
-            value_native = gfx12_native.transpose_value_fp8_scaled_hnd(v_hnd, value_scale)
+            value_native, value_scale = _gfx12_fp8_value_native(
+                gfx12_native, v_hnd, fp8_value_scale_max, "HND"
+            )
             gfx12_native.qk_int8_sv_f8_scaled_native_attn(
                 q_int8, k_int8, value_native, out, q_scale, k_scale, value_scale,
                 1, int(is_causal), float(sm_scale), kv_len
@@ -592,7 +713,8 @@ def sageattn_qk_int8_pv_gfx12_native(
             value_native = gfx12_native.transpose_value_f16_hnd(v_hnd)
             gfx12_native.qk_int8_sv_f16_d64_native_attn(
                 q_int8, k_int8, value_native, out, q_scale, k_scale,
-                1, int(is_causal), float(sm_scale), kv_len, 1
+                1, int(is_causal), float(sm_scale), kv_len, 1,
+                pv_accum_mode
             )
     out = out[..., :qo_len, :head_dim_og]
     if input_dtype == torch.bfloat16 and out.dtype != torch.bfloat16:
@@ -673,27 +795,18 @@ def sageattn(
         return sageattn_qk_int8_pv_gfx12_native(
             q, k, v, tensor_layout=tensor_layout, is_causal=is_causal,
             sm_scale=sm_scale, return_lse=return_lse, **kwargs)
-    elif arch == "sm75":
-        return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
-    elif arch in {"sm80", "sm86", "sm87"}:
+    if arch == "sm80":
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
+    elif arch == "sm86":
+        return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
     elif arch == "sm89":
-        if get_cuda_version() < (12, 8):
-            pv_accum_dtype = "fp32+fp32"
-        else:
-            # SageAttention2++
-            pv_accum_dtype = "fp32+fp16"
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype=pv_accum_dtype)
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16")
     elif arch == "sm90":
         return sageattn_qk_int8_pv_fp8_cuda_sm90(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32")
-    elif arch in {"sm100", "sm120", "sm121"}:
-        if get_cuda_version() < (12, 8):
-            # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
-            pv_accum_dtype = "fp32"
-        else:
-            # SageAttention2++
-            pv_accum_dtype = "fp32+fp16"
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype=pv_accum_dtype)
+    elif arch == "sm120":
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16") # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
+    elif arch == "sm121":
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16") # sm121 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm121.
     else:
         raise ValueError(f"Unsupported CUDA architecture: {arch}")
 
@@ -1152,17 +1265,17 @@ def sageattn_qk_int8_pv_fp16_cuda(
 
     if pv_accum_dtype == 'fp32':
         v = v.to(torch.float16)
-        lse = _qattn_sm80.qk_int8_sv_f16_accum_f32_attn(q_int8, k_int8, v, o, q_scale, k_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        lse = sm80_compile.qk_int8_sv_f16_accum_f32_attn(q_int8, k_int8, v, o, q_scale, k_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
     elif pv_accum_dtype == "fp16":
         if smooth_v:
             smoothed_v, vm = sub_mean(v, tensor_layout=tensor_layout)
-            lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(q_int8, k_int8, smoothed_v, o, q_scale, k_scale, vm, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+            lse = sm80_compile.qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(q_int8, k_int8, smoothed_v, o, q_scale, k_scale, vm, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
         else:
             v = v.to(torch.float16)
-            lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_attn(q_int8, k_int8, v, o, q_scale, k_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+            lse = sm80_compile.qk_int8_sv_f16_accum_f16_attn(q_int8, k_int8, v, o, q_scale, k_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
     elif pv_accum_dtype == "fp16+fp32":
         v = v.to(torch.float16)
-        lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_attn_inst_buf(q_int8, k_int8, v, o, q_scale, k_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        lse = sm80_compile.qk_int8_sv_f16_accum_f16_attn_inst_buf(q_int8, k_int8, v, o, q_scale, k_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
     else:
         raise ValueError(f"Unsupported pv_accum_dtype: {pv_accum_dtype}")
 
@@ -1351,13 +1464,13 @@ def sageattn_qk_int8_pv_fp8_cuda(
 
     if pv_accum_dtype == "fp32":
         if smooth_v:
-            lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, vm, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+            lse = sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, vm, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
         else:
-            lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+            lse = sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
     elif pv_accum_dtype == "fp32+fp32":
-        lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        lse = sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
     elif pv_accum_dtype == "fp32+fp16":
-        lse = _qattn_sm89.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        lse = sm89_compile.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
 
     o = o[..., :head_dim_og]
 
@@ -1525,9 +1638,9 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
 
     if pv_accum_dtype == "fp32":
         raise NotImplementedError("Please use pv_accum_dtype='fp32+fp32' for sm90.")
-        lse = _qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        lse = sm90_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
     elif pv_accum_dtype == "fp32+fp32":
-        lse = _qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        lse = sm90_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
 
     o = o[..., :head_dim_og]
 

@@ -21,6 +21,7 @@ def qk_int8_sv_f16_d64_native_attn_fake_impl(
     sm_scale: float,
     valid_kv_len: int = 0,
     value_transposed_hnd: int = -1,
+    pv_accum_mode: int = -1,
 ) -> torch.Tensor:
     return _empty_lse(query)
 
@@ -37,8 +38,25 @@ def qk_rawq_int8_sv_f8_native_attn_fake_impl(
     sm_scale: float,
     valid_kv_len: int = 0,
     value_transposed_hnd: int = -1,
+    key_hnd_layout: int = 0,
 ) -> torch.Tensor:
     return output
+
+
+@torch.library.register_fake("sageattention_qattn_gfx12_native::qk_rawq_int8_sv_f16_native_attn")
+def qk_rawq_int8_sv_f16_native_attn_fake_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    key_scale: torch.Tensor,
+    tensor_layout: int,
+    is_causal: int,
+    sm_scale: float,
+    valid_kv_len: int = 0,
+    pv_accum_mode: int = -1,
+) -> torch.Tensor:
+    return _empty_lse(query)
 
 
 @torch.library.register_fake("sageattention_qattn_gfx12_native::qk_int8_sv_f8_scaled_native_attn")
@@ -71,6 +89,7 @@ def qk_rawq_int8_sv_f8_scaled_native_attn_fake_impl(
     sm_scale: float,
     valid_kv_len: int = 0,
     value_transposed_hnd: int = -1,
+    key_hnd_layout: int = 0,
 ) -> torch.Tensor:
     return output
 
@@ -85,6 +104,7 @@ def qk_int8_sv_f16_d64_prepare_attn_hnd_fake_impl(
     use_raw_f16_value: int,
     sm_scale: float,
     valid_kv_len: int = 0,
+    pv_accum_mode: int = -1,
 ) -> torch.Tensor:
     dtype = torch.bfloat16 if value_is_fp8 and query.dtype == torch.bfloat16 else torch.float16
     return torch.empty(query.shape, dtype=dtype, device=query.device)
@@ -116,6 +136,38 @@ def transpose_value_fp8_scaled_hnd_fake_impl(value: torch.Tensor, value_scale: t
         dtype=torch.uint8,
         device=value.device,
     )
+
+
+@torch.library.register_fake("sageattention_qattn_gfx12_native::fp8_value_nhd_short")
+def fp8_value_nhd_short_fake_impl(value: torch.Tensor, scale_max: float) -> list[torch.Tensor]:
+    batch, seq_len, heads, head_dim = value.shape
+    return [
+        torch.empty((batch, heads, head_dim, seq_len), dtype=torch.uint8, device=value.device),
+        torch.empty((batch, heads, head_dim), dtype=torch.float32, device=value.device),
+    ]
+
+
+@torch.library.register_fake("sageattention_qattn_gfx12_native::mean_nhd")
+def mean_nhd_fake_impl(input: torch.Tensor) -> torch.Tensor:
+    return torch.empty(
+        (input.size(0), input.size(2), input.size(3)),
+        dtype=input.dtype,
+        device=input.device,
+    )
+
+
+@torch.library.register_fake("sageattention_qattn_gfx12_native::mean_and_fp8_value_nhd_short")
+def mean_and_fp8_value_nhd_short_fake_impl(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale_max: float,
+) -> list[torch.Tensor]:
+    batch, seq_len, heads, head_dim = value.shape
+    return [
+        torch.empty((batch, heads, head_dim), dtype=key.dtype, device=key.device),
+        torch.empty((batch, heads, head_dim, seq_len), dtype=torch.uint8, device=value.device),
+        torch.empty((batch, heads, head_dim), dtype=torch.float32, device=value.device),
+    ]
 
 
 @torch.library.register_fake("sageattention_qattn_gfx12_native::transpose_value_f16_hnd")

@@ -154,6 +154,10 @@ if not SKIP_CUDA_BUILD:
         ] + LIMITED_API_FLAGS
         for arch in amd_arches:
             HIP_FLAGS.append(f"--offload-arch={arch}")
+        HIP_FLAGS.append(f"--rocm-path={rocm_home}")
+        rocm_device_lib_path = os.path.join(rocm_home, "lib", "llvm", "amdgcn", "bitcode")
+        if os.path.isdir(rocm_device_lib_path):
+            HIP_FLAGS.append(f"--rocm-device-lib-path={rocm_device_lib_path}")
 
         append_env_flags(CXX_FLAGS, "CXX_APPEND_FLAGS")
         append_env_flags(HIP_FLAGS, "NVCC_APPEND_FLAGS")
@@ -167,7 +171,11 @@ if not SKIP_CUDA_BUILD:
                     name="sageattention._qattn_gfx12_native",
                     sources=[
                         "csrc/qattn/pybind_gfx12_native.cpp",
-                        "csrc/qattn/qk_int_sv_gfx12_native.cu",
+                        "csrc/qattn/qk_int_sv_gfx12_native_aux.cu",
+                        "csrc/qattn/qk_int_sv_gfx12_native_prepare.cu",
+                        "csrc/qattn/qk_int_sv_gfx12_native_attn_f16.cu",
+                        "csrc/qattn/qk_int_sv_gfx12_native_attn_fp8.cu",
+                        "csrc/qattn/qk_int_sv_gfx12_native_rawq_fp8.cu",
                     ],
                     include_dirs=include_dirs,
                     extra_compile_args={

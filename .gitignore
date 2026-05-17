@@ -5,6 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
+*.pyd
 
 # Distribution / packaging
 .Python
@@ -174,3 +175,16 @@ cython_debug/
 .pypirc
 
 /wheelhouse
+csrc/cp_async_hip.cuh
+csrc/fused/fused.hip
+csrc/fused/pybind_hip.cpp
+csrc/numeric_conversion_hip.cuh
+csrc/qattn/qk_int_sv_gfx12_native.hip
+csrc/qattn/qk_int_sv_gfx12_native_*.hip
+csrc/reduction_utils_hip.cuh
+evaluate/
+*.pkl
+*.vscode/
+bench_qk_int8_pv_fp8_cuda_head96.py
+*test.py
+*unmask.py
