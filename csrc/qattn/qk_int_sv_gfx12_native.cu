@@ -2119,7 +2119,8 @@ template <int BlockCols,
           bool SameQKHeads = false,
           bool NoQueryTail = false,
           bool PrefetchStreamVRegs = false,
-          bool DirectStreamProbs = false>
+          bool DirectStreamProbs = false,
+          bool DirectPvOutFragAccum = false>
 SAGEATTN_NATIVE_2Q_WAVES_PER_EU(HeadDim, IsCausal) __global__
 SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2q_kernel(
     const QueryT* __restrict__ q,
@@ -2697,6 +2698,15 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                   if (fully_future[qg][gc]) {
                     continue;
                   }
+                  if constexpr (DirectPvOutFragAccum) {
+                    if constexpr (F16PvAccum) {
+                      out_frag[qg][dt] = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(
+                          p_regs_current[qg], v_regs, out_frag[qg][dt]);
+                    } else {
+                      out_frag[qg][dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                          p_regs_current[qg], v_regs, out_frag[qg][dt]);
+                    }
+                  } else {
                   PvAccumVec acc;
 #pragma unroll
                   for (int elem = 0; elem < 8; ++elem) {
@@ -2712,6 +2722,7 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
 #pragma unroll
                   for (int elem = 0; elem < 8; ++elem) {
                     out_frag[qg][dt][elem] = acc[elem];
+                  }
                   }
                 }
               };
@@ -2819,6 +2830,15 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                   if (fully_future[qg][gc]) {
                     continue;
                   }
+                  if constexpr (DirectPvOutFragAccum) {
+                    if constexpr (F16PvAccum) {
+                      out_frag[qg][dt] = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(
+                          p_regs[qg][gc], v_regs, out_frag[qg][dt]);
+                    } else {
+                      out_frag[qg][dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                          p_regs[qg][gc], v_regs, out_frag[qg][dt]);
+                    }
+                  } else {
                   PvAccumVec acc;
 #pragma unroll
                   for (int elem = 0; elem < 8; ++elem) {
@@ -2834,6 +2854,7 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
 #pragma unroll
                   for (int elem = 0; elem < 8; ++elem) {
                     out_frag[qg][dt][elem] = acc[elem];
+                  }
                   }
                 }
               };
@@ -7949,7 +7970,7 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   }
 #endif // SAGEATTN_GFX12_BUILD_ATTN_F16
   hip_kernel_launch_check();
-  return new_empty_like(query, {0}, ScalarType::Float);
+  return output;
 }
 
 #if SAGEATTN_GFX12_BUILD_ATTN_F16
@@ -8398,8 +8419,8 @@ Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
       q_len == padded_kv_len && kv_len == padded_kv_len &&
       (head_dim == 64 || head_dim == 128);
 
-#define SAGEATTN_LAUNCH_RAWQ_F16_VALUE(BC_, HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, PVORDER_, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_, PREFETCH_STREAM_V_, DIRECT_STREAM_PROBS_) \
-  qk_int8_sv_f16_d64_native_2q_kernel<BC_, HND_, BR_, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD, CAUSAL_, false, F16ACC_, QUERY_T_, true, int8_t, false, PVORDER_, false, STREAM_, false, HD_, false, false, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_, PREFETCH_STREAM_V_, DIRECT_STREAM_PROBS_><<<grid, block, 0>>>( \
+#define SAGEATTN_LAUNCH_RAWQ_F16_VALUE(BC_, HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, PVORDER_, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_, PREFETCH_STREAM_V_, DIRECT_STREAM_PROBS_, DIRECT_PV_OUTFRAG_) \
+  qk_int8_sv_f16_d64_native_2q_kernel<BC_, HND_, BR_, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD, CAUSAL_, false, F16ACC_, QUERY_T_, true, int8_t, false, PVORDER_, false, STREAM_, false, HD_, false, false, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_, PREFETCH_STREAM_V_, DIRECT_STREAM_PROBS_, DIRECT_PV_OUTFRAG_><<<grid, block, 0>>>( \
       reinterpret_cast<const QUERY_T_*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
       reinterpret_cast<const __half*>(value.data_ptr()), \
       reinterpret_cast<__half*>(output.data_ptr()), \
@@ -8412,9 +8433,9 @@ Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
       0, 0, key_scale.stride(0), key_scale.stride(1), \
       tensor_layout, static_cast<float>(sm_scale))
 #define SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT(HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_) \
-  SAGEATTN_LAUNCH_RAWQ_F16_VALUE(64, HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, false, false, false, false, false, false, false)
-#define SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, PREFETCH_STREAM_V_, DIRECT_STREAM_PROBS_) \
-  SAGEATTN_LAUNCH_RAWQ_F16_VALUE(BC_, HD_, false, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, true, true, true, true, true, PREFETCH_STREAM_V_, DIRECT_STREAM_PROBS_)
+  SAGEATTN_LAUNCH_RAWQ_F16_VALUE(64, HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, false, false, false, false, false, false, false, false)
+#define SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, PREFETCH_STREAM_V_, DIRECT_STREAM_PROBS_, DIRECT_PV_OUTFRAG_) \
+  SAGEATTN_LAUNCH_RAWQ_F16_VALUE(BC_, HD_, false, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, true, true, true, true, true, PREFETCH_STREAM_V_, DIRECT_STREAM_PROBS_, DIRECT_PV_OUTFRAG_)
 #define SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(HD_, HND_, QUERY_T_) \
   if (is_causal) { \
     if (pv_accum_mode == 1) { \
@@ -8436,22 +8457,25 @@ Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
 #define SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_BC_BR_DTYPE(BC_, HD_, BR_, QUERY_T_) \
   if (is_causal && pv_accum_mode == 1) { \
     if ((HD_) == 128 && use_d128_short_stream && (BR_) == 128) { \
-      SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, true, true, true, false); \
-    } else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, true, false, false, false); } \
+      SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, true, true, true, false, false); \
+    } else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, true, false, false, false, false); } \
   } else if (is_causal) { \
     if ((HD_) == 128 && use_d128_short_stream && (BR_) == 128) { \
-      if (use_direct_stream_probs) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, false, true, true, true); } \
-      else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, false, true, true, false); } \
+      if (use_direct_stream_probs) { \
+        SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, false, true, true, true, true); \
+      } else { \
+        SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, false, true, true, false, true); \
+      } \
     } else if ((HD_) == 128 && (BR_) == 128 && use_d128_long_stream) { \
-      SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, false, true, true, false); \
-    } else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, false, false, false, false); } \
+      SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, false, true, true, false, false); \
+    } else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, false, false, false, false, false); } \
   } else if (pv_accum_mode == 1) { \
-    SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, false, QUERY_T_, true, false, false, false); \
+    SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, false, QUERY_T_, true, false, false, false, false); \
   } else { \
     if ((HD_) == 64 && use_d64_noncausal_stream_direct) { \
-      SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, false, QUERY_T_, false, true, true, true); \
+      SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, false, QUERY_T_, false, true, true, true, false); \
     } else { \
-      SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, false, QUERY_T_, false, false, false, false); \
+      SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, false, QUERY_T_, false, false, false, false, false); \
     } \
   }
 #define SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_BC_DTYPE(BC_, HD_, QUERY_T_) \
@@ -8493,7 +8517,7 @@ Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
 #undef SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT
 #undef SAGEATTN_LAUNCH_RAWQ_F16_VALUE
   hip_kernel_launch_check();
-  return new_empty_like(query, {0}, ScalarType::Float);
+  return output;
 }
 
 #endif // SAGEATTN_GFX12_BUILD_ATTN_F16

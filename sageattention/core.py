@@ -559,7 +559,8 @@ def sageattn_qk_int8_pv_gfx12_native(
                     0,
                     pv_accum_mode,
                 )
-        out = out[:, :qo_len, :, :head_dim_og]
+        if q_out_len != qo_len or head_dim != head_dim_og:
+            out = out[:, :qo_len, :, :head_dim_og]
         if input_dtype == torch.bfloat16 and out.dtype != torch.bfloat16:
             out = gfx12_native.convert_f16_to_bf16(out.contiguous() if not out.is_contiguous() else out)
         elif input_dtype != torch.float16:
