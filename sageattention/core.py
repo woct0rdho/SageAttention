@@ -492,7 +492,17 @@ def sageattn_qk_int8_pv_gfx12_native(
             )
             k_mean = k_mean_flat.unsqueeze(1)
         elif value_dtype == "fp16" and head_dim in (64, 128):
-            k_mean_flat = gfx12_native.mean_nhd(k_nhd)
+            use_d64_causal_seq32_mean = (
+                input_dtype == torch.float16
+                and is_causal
+                and head_dim == 64
+                and qo_len == kv_len
+                and kv_len in (2048, 4096, 8192)
+            )
+            if use_d64_causal_seq32_mean:
+                k_mean_flat = gfx12_native.mean_nhd_d64_seq32(k_nhd)
+            else:
+                k_mean_flat = gfx12_native.mean_nhd(k_nhd)
             k_mean = k_mean_flat.unsqueeze(1)
         else:
             k_mean = k_nhd.mean(dim=1, keepdim=True)

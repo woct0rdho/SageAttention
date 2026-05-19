@@ -109,6 +109,8 @@ std::vector<Tensor> fp8_value_nhd_short_gfx12(
 
 Tensor mean_nhd_gfx12(Tensor input);
 
+Tensor mean_nhd_d64_seq32_gfx12(Tensor input);
+
 Tensor mean_hnd_gfx12(Tensor input);
 
 std::vector<Tensor> prepare_qkv_hnd_smooth_f16_gfx12(

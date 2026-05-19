@@ -65,6 +65,7 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_gfx12_native, m) {
     m.def("transpose_value_fp8_scaled_hnd(Tensor value, Tensor value_scale) -> Tensor");
     m.def("fp8_value_nhd_short(Tensor value, float scale_max) -> Tensor[]");
     m.def("mean_nhd(Tensor input) -> Tensor");
+    m.def("mean_nhd_d64_seq32(Tensor input) -> Tensor");
     m.def("mean_hnd(Tensor input) -> Tensor");
     m.def("prepare_qkv_hnd_smooth_f16("
             "Tensor query, Tensor key, Tensor value, Tensor key_mean"
@@ -87,6 +88,7 @@ STABLE_TORCH_LIBRARY_IMPL(sageattention_qattn_gfx12_native, CUDA, m) {
     m.impl("transpose_value_fp8_scaled_hnd", TORCH_BOX(transpose_value_fp8_scaled_hnd_gfx12));
     m.impl("fp8_value_nhd_short", TORCH_BOX(fp8_value_nhd_short_gfx12));
     m.impl("mean_nhd", TORCH_BOX(mean_nhd_gfx12));
+    m.impl("mean_nhd_d64_seq32", TORCH_BOX(mean_nhd_d64_seq32_gfx12));
     m.impl("mean_hnd", TORCH_BOX(mean_hnd_gfx12));
     m.impl("prepare_qkv_hnd_smooth_f16", TORCH_BOX(prepare_qkv_hnd_smooth_f16_gfx12));
     m.impl("mean_and_fp8_value_nhd_short", TORCH_BOX(mean_and_fp8_value_nhd_short_gfx12));
