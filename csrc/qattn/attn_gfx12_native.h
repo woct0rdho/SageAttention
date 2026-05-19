@@ -78,6 +78,14 @@ Tensor qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
     int64_t value_transposed_hnd = -1,
     int64_t key_hnd_layout = 0);
 
+Tensor sage_fp8_nhd_short_mha_gfx12(
+    Tensor query,
+    Tensor key,
+    Tensor value,
+    int64_t is_causal,
+    double sm_scale,
+    double scale_max);
+
 Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     Tensor query,
     Tensor key,
@@ -100,6 +108,14 @@ std::vector<Tensor> fp8_value_nhd_short_gfx12(
     double scale_max);
 
 Tensor mean_nhd_gfx12(Tensor input);
+
+Tensor mean_hnd_gfx12(Tensor input);
+
+std::vector<Tensor> prepare_qkv_hnd_smooth_f16_gfx12(
+    Tensor query,
+    Tensor key,
+    Tensor value,
+    Tensor key_mean);
 
 std::vector<Tensor> mean_and_fp8_value_nhd_short_gfx12(
     Tensor key,

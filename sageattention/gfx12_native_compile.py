@@ -94,6 +94,18 @@ def qk_rawq_int8_sv_f8_scaled_native_attn_fake_impl(
     return output
 
 
+@torch.library.register_fake("sageattention_qattn_gfx12_native::sage_fp8_nhd_short_mha")
+def sage_fp8_nhd_short_mha_fake_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    is_causal: int,
+    sm_scale: float,
+    scale_max: float,
+) -> torch.Tensor:
+    return torch.empty_like(query)
+
+
 @torch.library.register_fake("sageattention_qattn_gfx12_native::qk_int8_sv_f16_d64_prepare_attn_hnd")
 def qk_int8_sv_f16_d64_prepare_attn_hnd_fake_impl(
     query: torch.Tensor,
@@ -154,6 +166,33 @@ def mean_nhd_fake_impl(input: torch.Tensor) -> torch.Tensor:
         dtype=input.dtype,
         device=input.device,
     )
+
+
+@torch.library.register_fake("sageattention_qattn_gfx12_native::mean_hnd")
+def mean_hnd_fake_impl(input: torch.Tensor) -> torch.Tensor:
+    return torch.empty(
+        (input.size(0), input.size(1), input.size(3)),
+        dtype=input.dtype,
+        device=input.device,
+    )
+
+
+@torch.library.register_fake("sageattention_qattn_gfx12_native::prepare_qkv_hnd_smooth_f16")
+def prepare_qkv_hnd_smooth_f16_fake_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_mean: torch.Tensor,
+) -> list[torch.Tensor]:
+    batch, q_heads, q_len, _ = query.shape
+    _, kv_heads, kv_len, head_dim = key.shape
+    return [
+        torch.empty_like(query, dtype=torch.int8),
+        torch.empty((batch, q_heads, (q_len + 127) // 128 * 4), dtype=torch.float32, device=query.device),
+        torch.empty_like(key, dtype=torch.int8),
+        torch.empty((batch, kv_heads, (kv_len + 63) // 64), dtype=torch.float32, device=key.device),
+        torch.empty((batch, kv_heads, head_dim, kv_len), dtype=torch.float16, device=value.device),
+    ]
 
 
 @torch.library.register_fake("sageattention_qattn_gfx12_native::mean_and_fp8_value_nhd_short")
