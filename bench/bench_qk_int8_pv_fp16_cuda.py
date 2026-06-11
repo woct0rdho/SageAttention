@@ -20,7 +20,7 @@ headdim = args.head_dim
 print(f"CUDA QK Int8 PV FP16 Benchmark")
 print(f"batch: {batch}, head: {head}, headdim: {headdim}, pv_accum_dtype: {args.pv_accum_dtype}")
 
-WARP_Q = 16 if (headdim == 128 and args.pv_accum_dtype == "fp16+fp32") else 32
+WARP_Q = 16 if (headdim > 64 and args.pv_accum_dtype == "fp16+fp32") else 32
 WARP_K = 64
 
 if args.pv_accum_dtype == 'fp32':
