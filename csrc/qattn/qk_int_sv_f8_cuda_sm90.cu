@@ -730,6 +730,8 @@ Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
               static_assert(QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp) || QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread), "Unsupported quantization granularity");
             }
 
+            const auto device_guard = make_device_guard(query);
+            const auto stream = get_current_cuda_stream(query);
             CUtensorMap tma_map_Q = create_tensor_map_4D<CTA_Q, HEAD_DIM>(reinterpret_cast<int8_t*>(query.data_ptr()), batch_size, num_qo_heads, qo_len, HEAD_DIM, stride_bz_q, stride_h_q, stride_seq_q);
             CUtensorMap tma_map_K = create_tensor_map_4D<CTA_K, HEAD_DIM>(reinterpret_cast<int8_t*>(key.data_ptr()), batch_size, num_kv_heads, kv_len, HEAD_DIM, stride_bz_k, stride_h_k, stride_seq_k);
             CUtensorMap tma_map_V = create_tensor_map_4D<HEAD_DIM, CTA_K>(reinterpret_cast<int8_t*>(value.data_ptr()), batch_size, num_kv_heads, HEAD_DIM, value.size(3), stride_bz_v, stride_h_v, stride_d_v);
@@ -739,9 +741,9 @@ Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
             cudaFuncSetAttribute(
                 kernel,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
-            
+              
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-            kernel<<<grid, NUM_THREADS, sMemSize>>>(
+            kernel<<<grid, NUM_THREADS, sMemSize, stream>>>(
               tma_map_Q,
               tma_map_K,
               tma_map_V,
@@ -906,6 +908,8 @@ Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
 
             CHECK_SHAPE(value_scale, batch_size, num_kv_heads, head_dim);
 
+            const auto device_guard = make_device_guard(query);
+            const auto stream = get_current_cuda_stream(query);
             CUtensorMap tma_map_Q = create_tensor_map_4D<CTA_Q, HEAD_DIM>(reinterpret_cast<int8_t*>(query.data_ptr()), batch_size, num_qo_heads, qo_len, HEAD_DIM, stride_bz_q, stride_h_q, stride_seq_q);
             CUtensorMap tma_map_K = create_tensor_map_4D<CTA_K, HEAD_DIM>(reinterpret_cast<int8_t*>(key.data_ptr()), batch_size, num_kv_heads, kv_len, HEAD_DIM, stride_bz_k, stride_h_k, stride_seq_k);
             CUtensorMap tma_map_V = create_tensor_map_4D<HEAD_DIM, CTA_K>(reinterpret_cast<int8_t*>(value.data_ptr()), batch_size, num_kv_heads, HEAD_DIM, value.size(3), stride_bz_v, stride_h_v, stride_d_v);
@@ -915,9 +919,9 @@ Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
             cudaFuncSetAttribute(
                 kernel,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
-            
+              
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-            kernel<<<grid, NUM_THREADS, sMemSize>>>(
+            kernel<<<grid, NUM_THREADS, sMemSize, stream>>>(
               tma_map_Q,
               tma_map_K,
               tma_map_V,

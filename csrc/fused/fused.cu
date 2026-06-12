@@ -500,8 +500,10 @@ void quant_per_block_int8_scale_cuda(
         constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
 
         dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+        const auto device_guard = make_device_guard(input);
+        const auto stream = get_current_cuda_stream(input);
 
-        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, true, false, c_type><<<grid, block>>>(
+        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, true, false, c_type><<<grid, block, 0, stream>>>(
           reinterpret_cast<c_type*>(input.data_ptr()),
           nullptr,
           reinterpret_cast<int8_t*>(output.data_ptr()),
@@ -582,8 +584,10 @@ void quant_per_block_int8_cuda(
         constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
 
         dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+        const auto device_guard = make_device_guard(input);
+        const auto stream = get_current_cuda_stream(input);
 
-        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<grid, block>>>(
+        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<grid, block, 0, stream>>>(
           reinterpret_cast<c_type*>(input.data_ptr()),
           nullptr,
           reinterpret_cast<int8_t*>(output.data_ptr()),
@@ -672,8 +676,10 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
         constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
 
         dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+        const auto device_guard = make_device_guard(input);
+        const auto stream = get_current_cuda_stream(input);
 
-        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, true, c_type><<<grid, block>>>(
+        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, true, c_type><<<grid, block, 0, stream>>>(
           reinterpret_cast<c_type*>(input.data_ptr()),
           reinterpret_cast<c_type*>(mean.data_ptr()),
           reinterpret_cast<int8_t*>(output.data_ptr()),
@@ -757,8 +763,10 @@ void quant_per_warp_int8_cuda(
           constexpr int num_pack_per_thread = (WARP_BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
 
           dim3 block(WARP_BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+          const auto device_guard = make_device_guard(input);
+          const auto stream = get_current_cuda_stream(input);
 
-          QuantInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<grid, block>>>(
+          QuantInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<grid, block, 0, stream>>>(
             reinterpret_cast<c_type*>(input.data_ptr()),
             nullptr,
             reinterpret_cast<int8_t*>(output.data_ptr()),
@@ -842,8 +850,10 @@ void sub_mean_cuda(
         constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
 
         dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+        const auto device_guard = make_device_guard(input);
+        const auto stream = get_current_cuda_stream(input);
 
-        SubMeanKernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread><<<grid, block>>>(
+        SubMeanKernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread><<<grid, block, 0, stream>>>(
           reinterpret_cast<c_type*>(input.data_ptr()),
           reinterpret_cast<c_type*>(mean.data_ptr()),
           reinterpret_cast<half*>(output.data_ptr()),
@@ -921,8 +931,10 @@ void transpose_pad_permute_cuda(
       static_assert(CTA_SIZE * HEAD_DIM <= 8192);
 
       dim3 block(CTA_SIZE * (HEAD_DIM / 8));
+      const auto device_guard = make_device_guard(input);
+      const auto stream = get_current_cuda_stream(input);
 
-      TransposePadPermuteKernel<HEAD_DIM, CTA_SIZE, true, c_type><<<grid, block>>>(
+      TransposePadPermuteKernel<HEAD_DIM, CTA_SIZE, true, c_type><<<grid, block, 0, stream>>>(
         reinterpret_cast<c_type*>(input.data_ptr()),
         reinterpret_cast<c_type*>(output.data_ptr()),
         num_tokens,
@@ -995,7 +1007,10 @@ void scale_fuse_quant_cuda(
   auto input_dtype = input.scalar_type();
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-    MeanScaleKernel<64, false, c_type><<<grid, block>>>(
+    const auto device_guard = make_device_guard(input);
+    const auto stream = get_current_cuda_stream(input);
+
+    MeanScaleKernel<64, false, c_type><<<grid, block, 0, stream>>>(
       reinterpret_cast<c_type*>(input.data_ptr()),
       reinterpret_cast<int8_t*>(output.data_ptr()),
       nullptr,
@@ -1078,7 +1093,10 @@ void mean_scale_fuse_quant_cuda(
   auto input_dtype = input.scalar_type();
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-    MeanScaleKernel<64, true, c_type><<<grid, block>>>(
+    const auto device_guard = make_device_guard(input);
+    const auto stream = get_current_cuda_stream(input);
+
+    MeanScaleKernel<64, true, c_type><<<grid, block, 0, stream>>>(
       reinterpret_cast<c_type*>(input.data_ptr()),
       reinterpret_cast<int8_t*>(output.data_ptr()),
       reinterpret_cast<float*>(mean.data_ptr()),

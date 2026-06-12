@@ -157,8 +157,10 @@ Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(Tensor query,
 
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
+            const auto device_guard = make_device_guard(query);
+            const auto stream = get_current_cuda_stream(query);
 
-            kernel_func<<<grid, block, smem_max>>>(
+            kernel_func<<<grid, block, smem_max, stream>>>(
               reinterpret_cast<int8_t*>(query.data_ptr()), 
               reinterpret_cast<int8_t*>(key.data_ptr()),
               reinterpret_cast<int8_t*>(value.data_ptr()),
