@@ -584,11 +584,20 @@ def sageattn_qk_int8_pv_fp16_cuda(
     else:
         km = None
 
-    warp_q = 16 if (q.size(-1) > 64 and pv_accum_dtype == "fp16+fp32") else 32
+    head_dim = q.size(-1)
+    blk_q, blk_k, warp_q, warp_k = 128, 64, 32, 64
+    if pv_accum_dtype in ["fp16", "fp32"] and head_dim == 256:
+        warp_q = 16
+    elif pv_accum_dtype == "fp16+fp32":
+        if head_dim == 128 and not is_causal:
+            blk_k, warp_q, warp_k = 32, 32, 32
+        elif head_dim > 64:
+            warp_q = 16
+
     if qk_quant_gran == "per_warp":
-        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=warp_q, BLKK=64)
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=blk_q, WARPQ=warp_q, BLKK=blk_k)
     elif qk_quant_gran == "per_thread":
-        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=warp_q, BLKK=64, WARPK=64)
+        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=blk_q, WARPQ=warp_q, BLKK=blk_k, WARPK=warp_k)
 
     o = torch.empty(q.size(), dtype=dtype, device=q.device)
 
@@ -763,10 +772,12 @@ def sageattn_qk_int8_pv_fp8_cuda(
     else:
         km = None
 
+    head_dim = q.size(-1)
+    warp_q = 16 if head_dim == 256 else 32
     if qk_quant_gran == "per_warp":
-        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64)
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=warp_q, BLKK=64)
     elif qk_quant_gran == "per_thread":
-        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64)
+        q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=warp_q, BLKK=64, WARPK=64)
 
     o = torch.empty(q.size(), dtype=dtype, device=q.device)
 
