@@ -51,28 +51,70 @@ on:
       is_python_abi3:
         description: Is Python ABI3
         required: false
-        type: string
-        default: ''
+        type: boolean
+        default: false
 
 jobs:
-  build-sageattn3:
+  resolve-ref:
     runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      commit_sha: ${{ steps.resolve.outputs.commit_sha }}
     steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.git_tag }}
+          path: SageAttention
+
+      - id: resolve
+        shell: powershell
+        run: |
+          cd SageAttention
+          "commit_sha=$(git rev-parse HEAD)" >> $Env:GITHUB_OUTPUT
+
+  build-sageattn3:
+    name: Build ${{ inputs.git_tag }} @ ${{ needs.resolve-ref.outputs.commit_sha }}
+    needs: resolve-ref
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Configure Git
+        shell: powershell
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve-ref.outputs.commit_sha }}
+          path: SageAttention
+          submodules: recursive
+
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
-      # https://github.com/Jimver/cuda-toolkit/issues/395
-      # - uses: Jimver/cuda-toolkit@v0.2.22
-      - uses: N-Storm/cuda-toolkit@v0.2.28
+      - uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: ${{ inputs.cuda_major }}.${{ inputs.cuda_minor }}.${{ inputs.cuda_patch }}
           use-github-cache: false
 
       - uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Build wheel
+      - name: Build wheels
         shell: powershell
+        env:
+          CUDA_MAJOR_VERSION: ${{ inputs.cuda_major }}
+          CUDA_MINOR_VERSION: ${{ inputs.cuda_minor }}
+          CUDA_PATCH_VERSION: ${{ inputs.cuda_patch }}
+          TORCH_MINOR_VERSION: ${{ inputs.torch_minor }}
+          TORCH_PATCH_VERSION: ${{ inputs.torch_patch }}
+          TORCH_IS_NIGHTLY: ${{ inputs.torch_is_nightly }}
+          EXTRA_CUDA_ARCH: ${{ inputs.extra_cuda_arch }}
+          EXTRA_WHEEL_VERSION_SUFFIX: ${{ inputs.extra_wheel_version_suffix }}
+          IS_PYTHON_ABI3: ${{ inputs.is_python_abi3 }}
         run: |
           # Get-ChildItem Env:
           # (Get-WmiObject Win32_Processor).Name
@@ -84,29 +126,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade cibuildwheel simpleindex
 
-          git config --global core.autocrlf false
-          git clone --branch ${{ inputs.git_tag }} --depth 1 https://github.com/woct0rdho/SageAttention.git
           cd SageAttention
           git rev-parse HEAD
-          git submodule update --init --recursive
           cd sageattention3_blackwell
 
-          $Env:CUDA_MAJOR_VERSION = "${{ inputs.cuda_major }}"
-          $Env:CUDA_MINOR_VERSION = "${{ inputs.cuda_minor }}"
-          $Env:TORCH_MINOR_VERSION = "${{ inputs.torch_minor }}"
-          $Env:TORCH_PATCH_VERSION = "${{ inputs.torch_patch }}"
-          $Env:TORCH_IS_NIGHTLY = "${{ inputs.torch_is_nightly }}"
           python update_pyproject.py
 
           Start-Process -NoNewWindow simpleindex simpleindex.toml
           $Env:PIP_INDEX_URL = "http://127.0.0.1:8000"
 
           $Env:DISTUTILS_USE_SDK = "1"
+
           $Env:TORCH_CUDA_ARCH_LIST = "12.0 "
-          $Env:TORCH_CUDA_ARCH_LIST += "${{ inputs.extra_cuda_arch }}"
-          $Env:SAGEATTENTION_WHEEL_VERSION_SUFFIX = "+cu${{ inputs.cuda_major }}${{ inputs.cuda_minor }}torch2.${{ inputs.torch_minor }}.${{ inputs.torch_patch }}"
-          $Env:SAGEATTENTION_WHEEL_VERSION_SUFFIX += "${{ inputs.extra_wheel_version_suffix }}"
-          if ("${{ inputs.is_python_abi3 }}")
+          $Env:TORCH_CUDA_ARCH_LIST += $Env:EXTRA_CUDA_ARCH
+
+          $Env:SAGEATTENTION_WHEEL_VERSION_SUFFIX = "+cu{0}{1}torch2.{2}.{3}" -f $Env:CUDA_MAJOR_VERSION, $Env:CUDA_MINOR_VERSION, $Env:TORCH_MINOR_VERSION, $Env:TORCH_PATCH_VERSION
+          $Env:SAGEATTENTION_WHEEL_VERSION_SUFFIX += $Env:EXTRA_WHEEL_VERSION_SUFFIX
+
+          if ($Env:IS_PYTHON_ABI3 -eq "true")
           {
             $Env:CIBW_BUILD = "{cp310-win_amd64,}"
           }
@@ -114,11 +151,49 @@ jobs:
           {
             $Env:CIBW_BUILD = "{cp310-win_amd64,cp311-win_amd64,cp312-win_amd64,cp313-win_amd64,cp314-win_amd64}"
           }
+
           $Env:CIBW_BUILD_VERBOSITY = "1"
           # Sometimes torch may conflict with cibuildwheel's pinned dependency versions
           # $Env:CIBW_DEPENDENCY_VERSIONS = "latest"
           cibuildwheel .
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/attest@v4
         with:
-          path: SageAttention/sageattention3_blackwell/wheelhouse/*
+          subject-path: SageAttention/sageattention3_blackwell/wheelhouse/*.whl
+
+      # Currently actions/upload-artifact only supports uploading one file at a time when archive is disabled
+      - uses: actions/upload-artifact@v7
+        if: ${{ inputs.is_python_abi3 }}
+        with:
+          path: SageAttention/sageattention3_blackwell/wheelhouse/*.whl
+          archive: false
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !inputs.is_python_abi3 }}
+        with:
+          path: SageAttention/sageattention3_blackwell/wheelhouse/*-cp310-cp310-win_amd64.whl
+          archive: false
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !inputs.is_python_abi3 }}
+        with:
+          path: SageAttention/sageattention3_blackwell/wheelhouse/*-cp311-cp311-win_amd64.whl
+          archive: false
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !inputs.is_python_abi3 }}
+        with:
+          path: SageAttention/sageattention3_blackwell/wheelhouse/*-cp312-cp312-win_amd64.whl
+          archive: false
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !inputs.is_python_abi3 }}
+        with:
+          path: SageAttention/sageattention3_blackwell/wheelhouse/*-cp313-cp313-win_amd64.whl
+          archive: false
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !inputs.is_python_abi3 }}
+        with:
+          path: SageAttention/sageattention3_blackwell/wheelhouse/*-cp314-cp314-win_amd64.whl
+          archive: false
