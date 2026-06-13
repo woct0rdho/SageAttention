@@ -8,3 +8,6 @@ requires = [
     # torch version will be added by update_pyproject.py
     "torch",
 ]
+
+[tool.cibuildwheel.windows]
+repair-wheel-command = ""
