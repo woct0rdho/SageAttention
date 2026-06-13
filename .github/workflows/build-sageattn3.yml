@@ -56,7 +56,7 @@ on:
 
 jobs:
   resolve-ref:
-    runs-on: windows-latest
+    runs-on: windows-2022
     permissions:
       contents: read
     outputs:
@@ -76,7 +76,7 @@ jobs:
   build-sageattn3:
     name: Build ${{ inputs.git_tag }} @ ${{ needs.resolve-ref.outputs.commit_sha }}
     needs: resolve-ref
-    runs-on: windows-latest
+    runs-on: windows-2022
     permissions:
       contents: read
       id-token: write
