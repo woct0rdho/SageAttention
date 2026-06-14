@@ -8,17 +8,17 @@ The latest wheels support GTX 16xx, RTX 20xx/30xx/40xx/50xx, A100, H100, AGX Ori
 
 1. Know how to use pip to install packages in the correct Python environment, see https://github.com/woct0rdho/triton-windows
 2. Install triton-windows
-3. Install a wheel in the release page: https://github.com/woct0rdho/SageAttention/releases
+3. Install a wheel on the release page: https://github.com/woct0rdho/SageAttention/releases
     * Unlike triton-windows, you need to manually choose a wheel in the GitHub release page for SageAttention
     * Choose the wheel for your PyTorch version. For example, 'torch2.7.0' in the filename
-        * The torch minor version (2.6/2.7 ...) must be correct, but the patch version (2.7.0/2.7.1 ...) can be different from yours
+        * The recent wheels use libtorch stable ABI and have `torch2.10.0andhigher` in the filenames, so they support all versions of PyTorch >= 2.10
     * No need to worry about the CUDA minor version (12.8/12.9 ...). It can be different from yours, because SageAttention does not yet use any breaking API
-        * But there is a difference between CUDA 12 and 13
-    * No need to worry about the Python minor version (3.10/3.11 ...). The recent wheels use Python Stable ABI (also known as ABI3) and have `cp39-abi3` in the filenames, so they support Python >= 3.9
+        * But there is a difference between CUDA major version 12 and 13
+    * No need to worry about the Python minor version (3.10/3.11 ...). The recent wheels use Python stable ABI (also known as ABI3) and have `cp310-abi3` in the filenames, so they support all versions of Python >= 3.10
 
 If you see any error, please open an issue at https://github.com/woct0rdho/SageAttention/issues
 
-Recently we've simplified the installation by a lot. There is no need to install Visual Studio or CUDA toolkit to use Triton and SageAttention (unless you want to step into the world of building from source)
+We've simplified the installation by a lot. There is no need to install Visual Studio or CUDA toolkit to use Triton and SageAttention (unless you want to step into the world of building from source).
 
 ## Use notes
 
@@ -26,11 +26,9 @@ Before using SageAttention in larger projects like ComfyUI, please run [test_sag
 
 To use SageAttention in ComfyUI, you just need to add `--use-sage-attention` when starting ComfyUI.
 
-Some recent models, such as Wan and Qwen-Image, may produce black or noise output when SageAttention is used, because some intermediate values overflow SageAttention's quantization. In this case, you may use the `PatchSageAttentionKJ` node in KJNodes, and choose `sageattn_qk_int8_pv_fp16_cuda`, which is the least likely to overflow.
+Some models such as Wan and Qwen-Image may produce black or noise output when SageAttention is used, because some intermediate values overflow SageAttention's quantization. In this case, you may use the `PatchSageAttentionKJ` node in KJNodes, and choose `sageattn_qk_int8_pv_fp16_cuda`, which is the least likely to overflow.
 
-Also, if you want to run Flux or Qwen-Image, try [Nunchaku](https://github.com/mit-han-lab/ComfyUI-nunchaku) if you haven't. It's faster and more accurate than GGUF Q4_0 + SageAttention.
-
-If you want to run Wan, try [RadialAttention](https://github.com/woct0rdho/ComfyUI-RadialAttn) if you haven't. It's also faster than SageAttention.
+You may also adjust `pv_accum_dtype`. `pv_accum_dtype="fp16+fp32"` (or `"fp32+fp16"` in some interfaces) is faster than `pv_accum_dtype="fp32"`, and `pv_accum_dtype="fp16"` is even faster, but more likely to cause black/noise/degraded output.
 
 ## Build from source
 
@@ -39,11 +37,11 @@ If you want to run Wan, try [RadialAttention](https://github.com/woct0rdho/Comfy
 If you need to build and run SageAttention on your own machine:
 1. Install Visual Studio (MSVC and Windows SDK), and CUDA toolkit
 2. Clone this repo
-   * Checkout `abi3_stable` branch if you want ABI3 and libtorch stable ABI, which supports PyTorch >= 2.9
+   * Checkout `abi3_stable` branch if you want ABI3 and libtorch stable ABI, which supports PyTorch >= 2.10
    * Checkout `abi3` branch if you want ABI3, which supports PyTorch >= 2.4
-   * The purpose of ABI3 and libtorch stable ABI is to avoid building many wheels. There is no functional difference from the main branch
-4. Install the dependencies in [`pyproject.toml`](https://github.com/woct0rdho/SageAttention/blob/main/pyproject.toml), including the desired torch version such as `torch 2.7.1+cu128`
-5. Run `python setup.py install --verbose` to install directly, or `python setup.py bdist_wheel --verbose` to build a wheel. This avoids the environment checks of pip
+   * There is no Python API difference between `main/abi3/abi3_stable` branches, but I recommend `abi3_stable` whenever possible, because it's more compatible with other PyTorch features such as `torch.compile` and multi-GPU
+3. Install the dependencies in [`pyproject.toml`](https://github.com/woct0rdho/SageAttention/blob/main/pyproject.toml), including the desired torch version such as `torch 2.10.0+cu128`
+4. Run `python setup.py install --verbose` to install directly, or `python setup.py bdist_wheel --verbose` to build a wheel. This avoids the environment checks of pip
 
 ## Dev notes
 
@@ -53,4 +51,6 @@ If you need to build and run SageAttention on your own machine:
 * For Turing GPUs (GTX 16xx, RTX 20xx), SageAttention 2 runs Triton kernels, which are the same as SageAttention 1. If you want to help improve the CUDA kernels for Turing, you may see https://github.com/Ph0rk0z/SageAttention2/tree/updates
 * Volta GPUs (V100) are not supported because they do not have int8 tensor core
 * The wheels do not use CXX11 ABI
-* We cannot publish the wheels to PyPI, because PyPI does not support multiple PyTorch/CUDA variants for the same version of SageAttention. Some people are working on this, see https://astral.sh/blog/introducing-pyx and https://wheelnext.dev/proposals/pep817_wheel_variant_support/
+* We cannot publish the wheels to PyPI, because PyPI does not support multiple PyTorch/CUDA variants for the same version of SageAttention. People are working on this, see https://astral.sh/blog/introducing-pyx and https://wheelnext.dev/proposals/pep817_wheel_variant_support/
+* The recent wheels are bitwise reproducible given the same MSVC/WinSDK/PyTorch/CUDA/cibuildwheel versions. They're built with `/experimental:deterministic`, `/Brepro`, `/pathmap`
+* The recent wheels are built with attestation. Given the .whl file, you can query the attestation from GitHub's server and see the workflow's commit hash and the link to job metadata. The checked out code's commit hash is kept in the job name, even after the build log expires
