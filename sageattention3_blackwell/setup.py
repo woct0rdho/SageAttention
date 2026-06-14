@@ -13,6 +13,21 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 PACKAGE_NAME = "sageattn3"
 
+
+def get_git_commit_timestamp():
+    try:
+        timestamp = subprocess.check_output(
+            ["git", "-C", this_dir, "log", "-1", "--format=%ct"]
+        ).strip().decode("utf-8")
+    except Exception:
+        return None
+    return timestamp if timestamp.isdigit() else None
+
+
+# Make wheel ZIP metadata deterministic
+# If SOURCE_DATE_EPOCH is unspecified, then query with git, then fallback to Unix epoch
+os.environ.setdefault("SOURCE_DATE_EPOCH", get_git_commit_timestamp() or "315532800")
+
 # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
 FORCE_BUILD = os.getenv("FAHOPPER_FORCE_BUILD", "FALSE") == "TRUE"
@@ -46,6 +61,19 @@ def append_nvcc_threads(nvcc_extra_args):
     return nvcc_extra_args + ["--threads", f"{os.cpu_count()}"]
 
 
+def add_windows_reproducible_path_flags(cxx_flags, nvcc_flags, path_mappings):
+    if os.name != "nt":
+        return
+
+    cxx_flags.append("/experimental:deterministic")
+    nvcc_flags.extend(["-Xcompiler", "/experimental:deterministic"])
+
+    for source, target in path_mappings:
+        source = os.path.normpath(os.path.realpath(source))
+        cxx_flags.append(f"/pathmap:{source}={target}")
+        nvcc_flags.extend(["-Xcompiler", f"/pathmap:{source}={target}"])
+
+
 cmdclass = {}
 ext_modules = []
 
@@ -74,6 +102,14 @@ if not SKIP_CUDA_BUILD:
                 continue
             compute_capabilities.add(f"{major}.{minor}")
 
+    def capability_sort_key(capability):
+        base = capability.split("+")[0]
+        major, minor = base.split(".")
+        return (int(major), int(minor), capability)
+
+    # Sort compute_capabilities for reproducible build
+    compute_capabilities = sorted(compute_capabilities, key=capability_sort_key)
+
     def has_capability(target):
         return any(cc.startswith(target) for cc in compute_capabilities)
 
@@ -98,8 +134,10 @@ if not SKIP_CUDA_BUILD:
     if os.name == "nt":
         # TODO: Detect MSVC rather than OS
         CXX_FLAGS = ["/O2", "/std:c++17", "/permissive-"]
+        LINK_FLAGS = ["/Brepro"]
     else:
         CXX_FLAGS = ["-O3", "-std=c++17"]
+        LINK_FLAGS = []
 
     nvcc_flags = [
         "-O3",
@@ -113,8 +151,8 @@ if not SKIP_CUDA_BUILD:
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
         "--use_fast_math",
-        "--ptxas-options=--verbose,--warn-on-local-memory-usage",  # printing out number of registers
-        "-lineinfo",
+        # "--ptxas-options=--verbose,--warn-on-local-memory-usage",  # printing out number of registers
+        # "-lineinfo",  # Disabled for reproducible build
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
         "-DNDEBUG",  # Important, otherwise performance is severely impacted
         "-DQBLKSIZE=128",
@@ -130,9 +168,19 @@ if not SKIP_CUDA_BUILD:
     if os.name == "nt":
         # https://github.com/pytorch/pytorch/issues/148317
         nvcc_flags += [
+            "-Xcompiler=/Zc:preprocessor",
             "-D_WIN32=1",
             "-DUSE_CUDA=1",
         ]
+
+    add_windows_reproducible_path_flags(
+        CXX_FLAGS,
+        nvcc_flags,
+        [
+            (this_dir, r"C:\reproducible\path\SageAttention\sageattention3_blackwell"),
+            (os.path.dirname(os.path.abspath(torch.__file__)), r"C:\reproducible\path\torch"),
+        ],
+    )
 
     include_dirs = [
         cutlass_dir / "include",
@@ -149,6 +197,7 @@ if not SKIP_CUDA_BUILD:
                     nvcc_flags + ["-DEXECMODE=0"] + cc_flag
                 ),
             },
+            extra_link_args=LINK_FLAGS,
             include_dirs=include_dirs,
             # Without this we get and error about cuTensorMapEncodeTiled not defined
             libraries=["cuda"]
@@ -164,6 +213,7 @@ if not SKIP_CUDA_BUILD:
                     nvcc_flags + ["-DEXECMODE=0"] + cc_flag
                 ),
             },
+            extra_link_args=LINK_FLAGS,
             include_dirs=include_dirs,
             # Without this we get and error about cuTensorMapEncodeTiled not defined
             libraries=["cuda"]
