@@ -2468,8 +2468,8 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
     const int tensor_layout,
     const float sm_scale,
     const bool per_thread_qk = false) {
-  static_assert(HeadDim == 16 || HeadDim == 64 || HeadDim == 128,
-                "native gfx12 fp16 2q kernel supports D16/D64/D128.");
+  static_assert(HeadDim == 16 || HeadDim == 64 || HeadDim == 128 || HeadDim == 256,
+                "native gfx12 fp16 2q kernel supports D16/D64/D128/D256.");
   constexpr int BR = BlockRows;
   constexpr int RM = 16;
   constexpr int RowsPerWave = 32;
@@ -3778,8 +3778,8 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
     const int tensor_layout,
     const float sm_scale,
     const bool per_thread_qk = false) {
-  static_assert(HeadDim == 16 || HeadDim == 64 || HeadDim == 128,
-                "native gfx12 fp8 2q kernel supports D16/D64/D128.");
+  static_assert(HeadDim == 16 || HeadDim == 64 || HeadDim == 128 || HeadDim == 256,
+                "native gfx12 fp8 2q kernel supports D16/D64/D128/D256.");
   static_assert(BlockCols == 16 || BlockCols == 32 || BlockCols == 64 ||
                     BlockCols == 128,
                 "native gfx12 fp8 2q kernel supports BC16/BC32/BC64/BC128.");
@@ -8783,8 +8783,8 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
               "raw-Q gfx12 attention expects contiguous tensors");
 
   const int64_t head_dim = query.size(-1);
-  STD_TORCH_CHECK(head_dim == 16 || head_dim == 64 || head_dim == 128,
-              "raw-Q gfx12 fp8 path supports head_dim 16, 64, or 128");
+  STD_TORCH_CHECK(head_dim == 16 || head_dim == 64 || head_dim == 128 || head_dim == 256,
+              "raw-Q gfx12 fp8 path supports head_dim 16, 64, 128, or 256");
   const int64_t batch = query.size(0);
   const int64_t q_heads = tensor_layout == kNHD ? query.size(2) : query.size(1);
   const int64_t q_len = tensor_layout == kNHD ? query.size(1) : query.size(2);
@@ -8893,8 +8893,8 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
   const dim3 grid(q_blocks, q_heads, batch);
   const hipStream_t stream = current_hip_stream(query);
 
-#define SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_EX(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_, INVL_) \
-  qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), HND_, BR_, VT_, CAUSAL_, OUT_T_, QUERY_T_, true, int8_t, uint8_t, false, false, (VT_ ? -1 : 0), false, false, 2, false, false, KEY_HND_, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_, INVL_><<<grid, block, 0, stream>>>( \
+#define SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_SLICE(BC_, HD_, VBASE_, VTILES_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_, INVL_) \
+  qk_int8_sv_f8_native_2q_kernel<BC_, HD_, VBASE_, VTILES_, HND_, BR_, VT_, CAUSAL_, OUT_T_, QUERY_T_, true, int8_t, uint8_t, false, false, (VT_ ? -1 : 0), false, false, 2, false, false, KEY_HND_, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_, INVL_><<<grid, block, 0, stream>>>( \
       reinterpret_cast<const QUERY_T_*>(query.data_ptr()), \
       reinterpret_cast<int8_t*>(key.data_ptr()), reinterpret_cast<uint8_t*>(value.data_ptr()), \
       reinterpret_cast<OUT_T_*>(output.data_ptr()), \
@@ -8907,8 +8907,35 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
       0, 0, \
       key_scale.stride(0), key_scale.stride(1), \
       tensor_layout, sm_scale)
+#define SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_EX(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_, INVL_) \
+  SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_SLICE(BC_, HD_, 0, ((HD_) / 16), HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_, INVL_)
+#define SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_) \
+  do { \
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_SLICE(BC_, 256, 0, 8, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_, false, false, false, false, false); \
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_SLICE(BC_, 256, 8, 8, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_, false, false, false, false, false); \
+  } while (false)
 #define SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_) \
   SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_EX(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_, false, false, false, false, false)
+#define SAGEATTN_DISPATCH_RAWQ_FP8_OUT_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, QUERY_AT_T_) \
+  if (output.scalar_type() == ScalarType::BFloat16) { \
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __hip_bfloat16, QUERY_AT_T_, at::BFloat16); \
+  } else { \
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __half, QUERY_AT_T_, at::Half); \
+  }
+#define SAGEATTN_DISPATCH_RAWQ_FP8_QUERY_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_) \
+  if (query.scalar_type() == ScalarType::BFloat16) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_OUT_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, __hip_bfloat16, at::BFloat16); \
+  } else { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_OUT_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, __half, at::Half); \
+  }
+#define SAGEATTN_DISPATCH_RAWQ_FP8_BR_D256(BC_, HND_, KEY_HND_, VT_, CAUSAL_) \
+  if (block_rows == 64) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY_D256(BC_, HND_, KEY_HND_, 64, VT_, CAUSAL_); \
+  } else if (block_rows == 256) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY_D256(BC_, HND_, KEY_HND_, 256, VT_, CAUSAL_); \
+  } else { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY_D256(BC_, HND_, KEY_HND_, 128, VT_, CAUSAL_); \
+  }
 #define SAGEATTN_DISPATCH_RAWQ_FP8_OUT(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, QUERY_AT_T_) \
   if (output.scalar_type() == ScalarType::BFloat16) { \
     SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __hip_bfloat16, QUERY_AT_T_, at::BFloat16); \
@@ -8934,8 +8961,10 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
     SAGEATTN_DISPATCH_RAWQ_FP8_BR(BC_, 16, HND_, KEY_HND_, VT_, CAUSAL_); \
   } else if (head_dim == 64) { \
     SAGEATTN_DISPATCH_RAWQ_FP8_BR(BC_, 64, HND_, KEY_HND_, VT_, CAUSAL_); \
-  } else { \
+  } else if (head_dim == 128) { \
     SAGEATTN_DISPATCH_RAWQ_FP8_BR(BC_, 128, HND_, KEY_HND_, VT_, CAUSAL_); \
+  } else { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR_D256(BC_, HND_, KEY_HND_, VT_, CAUSAL_); \
   }
 #define SAGEATTN_DISPATCH_RAWQ_FP8_LAYOUT(BC_) \
   if (hnd_contiguous) { \
@@ -9006,8 +9035,13 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
 #undef SAGEATTN_DISPATCH_RAWQ_FP8_BR
 #undef SAGEATTN_DISPATCH_RAWQ_FP8_QUERY
 #undef SAGEATTN_DISPATCH_RAWQ_FP8_OUT
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_BR_D256
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_QUERY_D256
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_OUT_D256
 #undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED
+#undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256
 #undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_EX
+#undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_SLICE
   hip_kernel_launch_check();
   return output;
 }
@@ -9192,8 +9226,8 @@ Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
   STD_TORCH_CHECK(query.dim() == 4 && key.dim() == 4 && value.dim() == 4 && output.dim() == 4,
               "raw-Q fp16 gfx12 attention expects 4D tensors");
   const int64_t head_dim = query.size(-1);
-  STD_TORCH_CHECK(head_dim == 16 || head_dim == 64 || head_dim == 128,
-              "raw-Q fp16 gfx12 supports D16/D64/D128");
+  STD_TORCH_CHECK(head_dim == 16 || head_dim == 64 || head_dim == 128 || head_dim == 256,
+              "raw-Q fp16 gfx12 supports D16/D64/D128/D256");
   STD_TORCH_CHECK(key.size(-1) == head_dim && value.size(-1) == head_dim &&
                   output.size(-1) == head_dim,
               "raw-Q fp16 gfx12 tensors must have matching head_dim");
@@ -9328,11 +9362,13 @@ Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
   } else if (hnd_contiguous) { \
     if (head_dim == 16) { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(16, true, QUERY_T_); } \
     else if (head_dim == 64) { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(64, true, QUERY_T_); } \
-    else { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(128, true, QUERY_T_); } \
+    else if (head_dim == 128) { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(128, true, QUERY_T_); } \
+    else { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(256, true, QUERY_T_); } \
   } else { \
     if (head_dim == 16) { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(16, false, QUERY_T_); } \
     else if (head_dim == 64) { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(64, false, QUERY_T_); } \
-    else { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(128, false, QUERY_T_); } \
+    else if (head_dim == 128) { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(128, false, QUERY_T_); } \
+    else { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(256, false, QUERY_T_); } \
   }
   if (query.scalar_type() == ScalarType::Half) {
     SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_DTYPE(__half);

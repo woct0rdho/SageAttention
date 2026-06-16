@@ -32,6 +32,22 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#define DISPATCH_HEAD_DIM_INT8_QUANT(head_dim, HEAD_DIM, ...)   \
+  if (head_dim == 64) {                                         \
+    constexpr int HEAD_DIM = 64;                                \
+    __VA_ARGS__                                                 \
+  } else if (head_dim == 128) {                                 \
+    constexpr int HEAD_DIM = 128;                               \
+    __VA_ARGS__                                                 \
+  } else if (head_dim == 256) {                                 \
+    constexpr int HEAD_DIM = 256;                               \
+    __VA_ARGS__                                                 \
+  } else {                                                      \
+    std::ostringstream err_msg;                                 \
+    err_msg << "Unsupported head dim: " << int(head_dim);       \
+    throw std::invalid_argument(err_msg.str());                 \
+  }
+
 #if defined(__HIP_PLATFORM_AMD__)
 using nv_bfloat16 = __hip_bfloat16;
 using nv_bfloat162 = __hip_bfloat162;
@@ -670,7 +686,7 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
     DISPATCH_BLOCK_SIZE(block_size, BLOCK_SIZE, {
-      DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+      DISPATCH_HEAD_DIM_INT8_QUANT(head_dim, HEAD_DIM, {
 
         CHECK_SHAPE(mean, batch_size, num_heads, head_dim);
         CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
