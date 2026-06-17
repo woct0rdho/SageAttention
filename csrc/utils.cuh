@@ -15,7 +15,21 @@
  */
 
 #pragma once
+
+#include <cuda_runtime_api.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
+
+inline c10::cuda::CUDAGuard make_device_guard(const torch::Tensor &tensor) {
+  return c10::cuda::CUDAGuard(tensor.get_device());
+}
+
+inline cudaStream_t get_current_cuda_stream(const torch::Tensor &tensor) {
+  // This is needed because torch.compile may launch kernels on non-default streams.
+  // Use this while a tensor-device guard is alive for multi-GPU correctness.
+  return c10::cuda::getCurrentCUDAStream(tensor.get_device()).stream();
+}
 
 #define CHECK_CUDA(x) \
   TORCH_CHECK(x.is_cuda(), "Tensor " #x " must be on CUDA")
