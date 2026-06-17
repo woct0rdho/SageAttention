@@ -66,15 +66,14 @@ if not SKIP_CUDA_BUILD:
     # Compiler flags.
     if os.name == "nt":
         # TODO: Detect MSVC rather than OS
-        CXX_FLAGS = ["/O2", "/openmp", "/std:c++17", "/permissive-", "-DENABLE_BF16"]
+        CXX_FLAGS = ["/O2", "/permissive-", "-DENABLE_BF16"]
         LINK_FLAGS = ["/Brepro"]
     else:
-        CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
+        CXX_FLAGS = ["-O3", "-DENABLE_BF16"]
         LINK_FLAGS = []
 
     NVCC_FLAGS_COMMON = [
         "-O3",
-        "-std=c++17",
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "--use_fast_math",

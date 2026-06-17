@@ -133,15 +133,14 @@ if not SKIP_CUDA_BUILD:
 
     if os.name == "nt":
         # TODO: Detect MSVC rather than OS
-        CXX_FLAGS = ["/O2", "/std:c++17", "/permissive-"]
+        CXX_FLAGS = ["/O2", "/permissive-"]
         LINK_FLAGS = ["/Brepro"]
     else:
-        CXX_FLAGS = ["-O3", "-std=c++17"]
+        CXX_FLAGS = ["-O3"]
         LINK_FLAGS = []
 
     nvcc_flags = [
         "-O3",
-        "-std=c++17",
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_BFLOAT16_OPERATORS__",
