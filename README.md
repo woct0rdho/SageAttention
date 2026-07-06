@@ -41,7 +41,8 @@ If you need to build and run SageAttention on your own machine:
    * Checkout `abi3` branch if you want ABI3, which supports PyTorch >= 2.4
    * There is no Python API difference between `main/abi3/abi3_stable` branches, but I recommend `abi3_stable` whenever possible, because it's more compatible with other PyTorch features such as `torch.compile` and multi-GPU
 3. Install the dependencies in [`pyproject.toml`](https://github.com/woct0rdho/SageAttention/blob/main/pyproject.toml), including the desired torch version such as `torch 2.10.0+cu128`
-4. Run `python setup.py install --verbose` to install directly, or `python setup.py bdist_wheel --verbose` to build a wheel. This avoids the environment checks of pip
+4. Run `python setup.py install --verbose` to install directly, or `python setup.py bdist_wheel --verbose` to build a wheel
+   * This avoids the environment checks of pip. There are warnings like `Please avoid running ``setup.py`` directly`, but currently it's the simplest way to deal with the exact version of torch
 
 ## Dev notes
 
