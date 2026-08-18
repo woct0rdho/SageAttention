@@ -6,6 +6,8 @@ The latest wheels support GTX 16xx, RTX 20xx/30xx/40xx/50xx, A100, H100, AGX Ori
 
 ## Installation
 
+**Update:** If you're using ComfyUI, you no longer need to install my SageAttention wheel. You can use the SageAttention in comfy-kitchen.
+
 1. Know how to use pip to install packages in the correct Python environment, see https://github.com/woct0rdho/triton-windows
 2. Install triton-windows
 3. Install a wheel on the release page: https://github.com/woct0rdho/SageAttention/releases
