@@ -44,6 +44,12 @@ try:
 except:
     SM90_ENABLED = False
 
+from .gfx12 import (
+    get_gfx12_arch_versions,
+    gfx12_sageattn,
+    sageattn_qk_int8_pv_gfx12_native,
+)
+
 from .quant import per_block_int8 as per_block_int8_cuda
 from .quant import per_warp_int8 as per_warp_int8_cuda
 from .quant import sub_mean
@@ -60,6 +66,8 @@ def get_cuda_version():
 
 
 def get_cuda_arch_versions():
+    if torch.version.hip is not None:
+        return get_gfx12_arch_versions()
     cuda_archs = []
     for i in range(torch.cuda.device_count()):
         major, minor = torch.cuda.get_device_capability(i)
@@ -155,7 +163,9 @@ def sageattn(
     """
         
     arch = _cuda_archs[q.device.index]
-    if arch == "sm75":
+    if arch.startswith("gfx12"):
+        return gfx12_sageattn(q, k, v, tensor_layout, is_causal, sm_scale, return_lse, kwargs)
+    elif arch == "sm75":
         return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
     elif arch in {"sm80", "sm86", "sm87"}:
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")

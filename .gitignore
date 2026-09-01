@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 
 # C extensions
+*.pyd
 *.so
 
 # Distribution / packaging
@@ -174,3 +175,8 @@ cython_debug/
 .pypirc
 
 /wheelhouse
+
+# hipify generated
+*.hip
+*_hip.cpp
+*_hip.cuh
