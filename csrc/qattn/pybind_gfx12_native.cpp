@@ -27,30 +27,30 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_gfx12_native, m) {
             "Tensor query_scale, Tensor key_scale, int tensor_layout, "
             "int is_causal, float sm_scale, int valid_kv_len=0, "
             "int value_transposed_hnd=-1, int pv_accum_mode=-1"
-          ") -> Tensor(a!)");
+          ") -> ()");
     m.def("qk_rawq_int8_sv_f8_native_attn("
             "Tensor query, Tensor key, Tensor value, Tensor(a!) output, "
             "Tensor key_scale, int tensor_layout, int is_causal, "
             "float sm_scale, int valid_kv_len=0, int value_transposed_hnd=-1, "
             "int key_hnd_layout=0"
-          ") -> Tensor(a!)");
+          ") -> ()");
     m.def("qk_rawq_int8_sv_f16_native_attn("
             "Tensor query, Tensor key, Tensor value, Tensor(a!) output, "
             "Tensor key_scale, int tensor_layout, int is_causal, "
             "float sm_scale, int valid_kv_len=0, int pv_accum_mode=-1"
-          ") -> Tensor(a!)");
+          ") -> ()");
     m.def("qk_int8_sv_f8_scaled_native_attn("
             "Tensor query, Tensor key, Tensor value, Tensor(a!) output, "
             "Tensor query_scale, Tensor key_scale, Tensor value_scale, "
             "int tensor_layout, int is_causal, float sm_scale, "
             "int valid_kv_len=0"
-          ") -> Tensor(a!)");
+          ") -> ()");
     m.def("qk_rawq_int8_sv_f8_scaled_native_attn("
             "Tensor query, Tensor key, Tensor value, Tensor(a!) output, "
             "Tensor key_scale, Tensor value_scale, int tensor_layout, "
             "int is_causal, float sm_scale, int valid_kv_len=0, "
             "int value_transposed_hnd=-1, int key_hnd_layout=0"
-          ") -> Tensor(a!)");
+          ") -> ()");
     m.def("sage_fp8_nhd_short_mha("
             "Tensor query, Tensor key, Tensor value, int is_causal, "
             "float sm_scale, float scale_max"
