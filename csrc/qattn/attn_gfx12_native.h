@@ -12,7 +12,7 @@
 
 using torch::stable::Tensor;
 
-Tensor qk_int8_sv_f16_d64_native_attn_gfx12(
+void qk_int8_sv_f16_d64_native_attn_gfx12(
     Tensor query,
     Tensor key,
     Tensor value,
@@ -26,7 +26,7 @@ Tensor qk_int8_sv_f16_d64_native_attn_gfx12(
     int64_t value_transposed_hnd = -1,
     int64_t pv_accum_mode = -1);
 
-Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
+void qk_rawq_int8_sv_f8_native_attn_gfx12(
     Tensor query,
     Tensor key,
     Tensor value,
@@ -39,7 +39,7 @@ Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
     int64_t value_transposed_hnd = -1,
     int64_t key_hnd_layout = 0);
 
-Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
+void qk_rawq_int8_sv_f16_native_attn_gfx12(
     Tensor query,
     Tensor key,
     Tensor value,
@@ -51,7 +51,7 @@ Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
     int64_t valid_kv_len = 0,
     int64_t pv_accum_mode = -1);
 
-Tensor qk_int8_sv_f8_scaled_native_attn_gfx12(
+void qk_int8_sv_f8_scaled_native_attn_gfx12(
     Tensor query,
     Tensor key,
     Tensor value,
@@ -64,7 +64,7 @@ Tensor qk_int8_sv_f8_scaled_native_attn_gfx12(
     double sm_scale,
     int64_t valid_kv_len = 0);
 
-Tensor qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
+void qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
     Tensor query,
     Tensor key,
     Tensor value,

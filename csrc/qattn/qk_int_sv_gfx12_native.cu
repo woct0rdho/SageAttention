@@ -9081,7 +9081,7 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
   return output;
 }
 
-Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
+void qk_rawq_int8_sv_f8_native_attn_gfx12(
     Tensor query,
     Tensor key,
     Tensor value,
@@ -9094,14 +9094,14 @@ Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
     int64_t value_transposed_hnd,
     int64_t key_hnd_layout) {
   check_same_device(query, key, value, output, key_scale);
-  return qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
+  qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
       query, key, value, output, key_scale, Tensor(),
       static_cast<int>(tensor_layout), static_cast<int>(is_causal),
       static_cast<float>(sm_scale), valid_kv_len, static_cast<int>(value_transposed_hnd),
       static_cast<int>(key_hnd_layout));
 }
 
-Tensor qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
+void qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
     Tensor query,
     Tensor key,
     Tensor value,
@@ -9115,7 +9115,7 @@ Tensor qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
     int64_t value_transposed_hnd,
     int64_t key_hnd_layout) {
   check_same_device(query, key, value, output, key_scale, value_scale);
-  return qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
+  qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
       query, key, value, output, key_scale, value_scale,
       static_cast<int>(tensor_layout), static_cast<int>(is_causal),
       static_cast<float>(sm_scale), valid_kv_len, static_cast<int>(value_transposed_hnd),
@@ -9199,7 +9199,7 @@ Tensor sage_fp8_nhd_short_mha_gfx12(
 
 #if SAGEATTN_GFX12_BUILD_ATTN_FP8
 
-Tensor qk_int8_sv_f8_scaled_native_attn_gfx12(
+void qk_int8_sv_f8_scaled_native_attn_gfx12(
     Tensor query,
     Tensor key,
     Tensor value,
@@ -9212,7 +9212,7 @@ Tensor qk_int8_sv_f8_scaled_native_attn_gfx12(
     double sm_scale,
     int64_t valid_kv_len) {
   check_same_device(query, key, value, output, query_scale, key_scale, value_scale);
-  return qk_int8_sv_f16_d64_native_attn_gfx12_impl(
+  qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query, key, value, output, query_scale, key_scale, static_cast<int>(tensor_layout),
       static_cast<int>(is_causal), static_cast<float>(sm_scale), valid_kv_len, value_scale, 1, -1);
 }
@@ -9221,7 +9221,7 @@ Tensor qk_int8_sv_f8_scaled_native_attn_gfx12(
 
 #if SAGEATTN_GFX12_BUILD_ATTN_F16
 
-Tensor qk_int8_sv_f16_d64_native_attn_gfx12(
+void qk_int8_sv_f16_d64_native_attn_gfx12(
     Tensor query,
     Tensor key,
     Tensor value,
@@ -9235,13 +9235,13 @@ Tensor qk_int8_sv_f16_d64_native_attn_gfx12(
     int64_t value_transposed_hnd,
     int64_t pv_accum_mode) {
   check_same_device(query, key, value, output, query_scale, key_scale);
-  return qk_int8_sv_f16_d64_native_attn_gfx12_impl(
+  qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query, key, value, output, query_scale, key_scale, static_cast<int>(tensor_layout),
       static_cast<int>(is_causal), static_cast<float>(sm_scale), valid_kv_len, Tensor(),
       static_cast<int>(value_transposed_hnd), static_cast<int>(pv_accum_mode));
 }
 
-Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
+void qk_rawq_int8_sv_f16_native_attn_gfx12(
     Tensor query,
     Tensor key,
     Tensor value,
@@ -9437,7 +9437,6 @@ Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
 #undef SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT
 #undef SAGEATTN_LAUNCH_RAWQ_F16_VALUE
   hip_kernel_launch_check();
-  return output;
 }
 
 #endif // SAGEATTN_GFX12_BUILD_ATTN_F16
