@@ -155,6 +155,12 @@ def _gfx12_fp8_value_native(
     return value_native, value_scale
 
 
+def _warn_smooth_v_ignored(pv_accum_dtype: str) -> None:
+    # Dynamo cannot trace warnings.warn, so skip it under torch.compile
+    if not torch.compiler.is_compiling():
+        warnings.warn(f"pv_accum_dtype is {pv_accum_dtype}, smooth_v will be ignored.")
+
+
 def _gfx12_normalize_v2_options(
     value_dtype: str,
     pv_accum_dtype: Optional[str],
@@ -171,7 +177,7 @@ def _gfx12_normalize_v2_options(
         if pv_accum_dtype not in {"fp32+fp16", "fp32", "fp32+fp32"}:
             raise ValueError("gfx12 fp8 value path supports pv_accum_dtype 'fp32+fp16', 'fp32', or 'fp32+fp32'.")
         if smooth_v and pv_accum_dtype in {"fp32+fp16", "fp32+fp32"}:
-            warnings.warn(f"pv_accum_dtype is {pv_accum_dtype}, smooth_v will be ignored.")
+            _warn_smooth_v_ignored(pv_accum_dtype)
             smooth_v = False
         return value_dtype_normalized, pv_accum_dtype, smooth_v, (
             _GFX12_FP8_VALUE_SCALE_MAX_FP32_FP16 if pv_accum_dtype == "fp32+fp16" else 448.0
@@ -179,7 +185,7 @@ def _gfx12_normalize_v2_options(
     if pv_accum_dtype not in {"fp32", "fp16", "fp16+fp32"}:
         raise ValueError("gfx12 fp16 value path supports pv_accum_dtype 'fp32', 'fp16', or 'fp16+fp32'.")
     if smooth_v and pv_accum_dtype in {"fp32", "fp16+fp32"}:
-        warnings.warn(f"pv_accum_dtype is {pv_accum_dtype}, smooth_v will be ignored.")
+        _warn_smooth_v_ignored(pv_accum_dtype)
         smooth_v = False
     return value_dtype_normalized, pv_accum_dtype, smooth_v, _GFX12_FP8_VALUE_SCALE_MAX_FP32_FP16
 
