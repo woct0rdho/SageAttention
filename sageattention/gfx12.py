@@ -501,7 +501,6 @@ def sageattn_qk_int8_pv_gfx12_native(
         )
         use_rawq_f16_value = (
             value_dtype == "fp16"
-            and input_dtype == torch.float16
             and head_dim in (64, 128, 256)
             and qk_quant_gran == "per_warp"
             and (
