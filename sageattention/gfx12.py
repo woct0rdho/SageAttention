@@ -59,6 +59,7 @@ def _try_gfx12_fp8_nhd_short_mha(
     is_causal: bool,
     sm_scale: float,
     fp8_value_scale_max: float,
+    smooth_k: bool = True,
 ) -> Optional[torch.Tensor]:
     if not (
         q.is_cuda
@@ -80,7 +81,8 @@ def _try_gfx12_fp8_nhd_short_mha(
 
     gfx12_native = _get_gfx12_native_extension()
     return gfx12_native.sage_fp8_nhd_short_mha(
-        q, k, v, int(is_causal), float(sm_scale), float(fp8_value_scale_max)
+        q, k, v, int(is_causal), float(sm_scale), float(fp8_value_scale_max),
+        int(smooth_k)
     )
 
 
@@ -436,15 +438,14 @@ def sageattn_qk_int8_pv_gfx12_native(
         if value_dtype == "fp8" and head_dim not in (16, 64, 128, 256):
             raise ValueError("gfx12 fp8 value path currently supports head_dim 16, 64, 128, or 256.")
 
-        # both fused prep kernels compute the key mean internally
         use_gfx12_fp8_nhd_mha_wrapper = (
-            smooth_k
-            and value_dtype == "fp8"
+            value_dtype == "fp8"
             and input_dtype == torch.float16
             and qo_len == kv_len
             and kv_len in (512, 1024, 2048, 4096, 8192)
             and head_dim in (64, 128)
         )
+        # mean_and_fp8_value_nhd_short always subtracts the mean, unlike the wrapper
         use_short_nhd_fp8_prep = (
             smooth_k
             and value_dtype == "fp8"
@@ -455,7 +456,8 @@ def sageattn_qk_int8_pv_gfx12_native(
         )
         if use_gfx12_fp8_nhd_mha_wrapper and head_dim_og in (64, 128) and h_qo == h_kv:
             out = _try_gfx12_fp8_nhd_short_mha(
-                q_nhd, k_nhd, v_nhd, is_causal, float(sm_scale), fp8_value_scale_max
+                q_nhd, k_nhd, v_nhd, is_causal, float(sm_scale), fp8_value_scale_max,
+                smooth_k
             )
             if out is not None:
                 return _with_lse(out)
@@ -861,7 +863,6 @@ def gfx12_sageattn(
         not return_lse
         and tensor_layout == "NHD"
         and set(kwargs).issubset(fast_path_keys)
-        and kwargs.get("smooth_k", True)
         and kwargs.get("qk_quant_gran", "per_warp") == "per_warp"
         and not kwargs.get("smooth_v", False)
         and q.is_cuda
@@ -889,7 +890,8 @@ def gfx12_sageattn(
     ):
         fast_sm_scale = float(sm_scale if sm_scale is not None else q.size(-1) ** -0.5)
         out = _try_gfx12_fp8_nhd_short_mha(
-            q, k, v, is_causal, fast_sm_scale, _GFX12_FP8_VALUE_SCALE_MAX_FP32_FP16
+            q, k, v, is_causal, fast_sm_scale, _GFX12_FP8_VALUE_SCALE_MAX_FP32_FP16,
+            kwargs.get("smooth_k", True)
         )
         if out is not None:
             return out

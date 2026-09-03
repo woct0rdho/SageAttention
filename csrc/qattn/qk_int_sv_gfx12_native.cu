@@ -770,7 +770,7 @@ __device__ __forceinline__ int32_t pack_f32x4_to_ocp_fp8(
     const float x2,
     const float x3);
 
-template <typename T, int SeqLanes>
+template <typename T, int SeqLanes, bool ComputeMean>
 __global__ void mean_and_fp8_value_nhd_short_kernel(
     const T* __restrict__ key,
     const T* __restrict__ value,
@@ -801,7 +801,9 @@ __global__ void mean_and_fp8_value_nhd_short_kernel(
   if (d < head_dim) {
     for (int64_t s = s_lane; s < seq_len; s += SeqLanes) {
       const int64_t offset = ((b * seq_len + s) * heads + h) * head_dim + d;
-      local_sum += value_to_float(key[offset]);
+      if constexpr (ComputeMean) {
+        local_sum += value_to_float(key[offset]);
+      }
       local_amax = fmaxf(local_amax, fabsf(value_to_float(value[offset])));
     }
   }
@@ -819,12 +821,14 @@ __global__ void mean_and_fp8_value_nhd_short_kernel(
     }
     const int64_t value_d = d_base + tid;
     if (value_d < head_dim) {
-      const float mean = sum / static_cast<float>(seq_len);
       const int64_t mean_offset = (b * heads + h) * head_dim + value_d;
-      if constexpr (std::is_same<T, __half>::value) {
-        key_mean[mean_offset] = value_from_float_half(mean);
-      } else {
-        key_mean[mean_offset] = value_from_float_bfloat16(mean);
+      if constexpr (ComputeMean) {
+        const float mean = sum / static_cast<float>(seq_len);
+        if constexpr (std::is_same<T, __half>::value) {
+          key_mean[mean_offset] = value_from_float_half(mean);
+        } else {
+          key_mean[mean_offset] = value_from_float_bfloat16(mean);
+        }
       }
       const float scale = amax / scale_max;
       scale_tile[tid] = scale == 0.0f ? 0.0f : 1.0f / scale;
@@ -885,7 +889,7 @@ __global__ void mean_and_fp8_value_nhd_short_kernel(
   }
 }
 
-template <typename T, int HeadDim, int NumPackPerThread>
+template <typename T, int HeadDim, int NumPackPerThread, bool SubMean>
 __global__ void quant_k_nhd_fuse_sub_mean_short_kernel(
     const T* __restrict__ key,
     const T* __restrict__ mean,
@@ -916,11 +920,18 @@ __global__ void quant_k_nhd_fuse_sub_mean_short_kernel(
   const int64_t token_base = static_cast<int64_t>(k_block) * BlockSize + local_token;
   const int64_t mean_off = (static_cast<int64_t>(b) * heads + h) * HeadDim + d;
 
-  *reinterpret_cast<uint4*>(&mean_val[0]) =
-      *reinterpret_cast<const uint4*>(mean + mean_off);
+  if constexpr (SubMean) {
+    *reinterpret_cast<uint4*>(&mean_val[0]) =
+        *reinterpret_cast<const uint4*>(mean + mean_off);
 #pragma unroll
-  for (int i = 0; i < PackElems; ++i) {
-    mean_float[i] = value_to_float(mean_val[i]);
+    for (int i = 0; i < PackElems; ++i) {
+      mean_float[i] = value_to_float(mean_val[i]);
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < PackElems; ++i) {
+      mean_float[i] = 0.0f;
+    }
   }
 
   float local_amax = 0.0000001f;
@@ -6134,10 +6145,11 @@ Tensor mean_hnd_gfx12(Tensor input) {
   return mean;
 }
 
-std::vector<Tensor> mean_and_fp8_value_nhd_short_gfx12(
+std::vector<Tensor> mean_and_fp8_value_nhd_short_impl_gfx12(
     Tensor key,
     Tensor value,
-    double scale_max) {
+    double scale_max,
+    bool compute_mean) {
   STD_TORCH_CHECK(key.is_cuda() && value.is_cuda(),
               "gfx12 short NHD mean/value prep expects CUDA/HIP tensors");
   check_same_device(key, value);
@@ -6173,8 +6185,8 @@ std::vector<Tensor> mean_and_fp8_value_nhd_short_gfx12(
   dim3 grid((head_dim + 31) / 32, heads, batch);
   auto [device_guard, stream] = current_hip_stream(key);
 
-#define SAGEATTN_LAUNCH_MEAN_FP8_VALUE_SHORT(T_, LANES_) \
-  mean_and_fp8_value_nhd_short_kernel<T_, LANES_><<<grid, block, 0, stream>>>( \
+#define SAGEATTN_LAUNCH_MEAN_FP8_VALUE_SHORT(T_, LANES_, MEAN_) \
+  mean_and_fp8_value_nhd_short_kernel<T_, LANES_, MEAN_><<<grid, block, 0, stream>>>( \
       reinterpret_cast<const T_*>(key.data_ptr()), \
       reinterpret_cast<const T_*>(value.data_ptr()), \
       reinterpret_cast<T_*>(key_mean.data_ptr()), \
@@ -6184,20 +6196,43 @@ std::vector<Tensor> mean_and_fp8_value_nhd_short_gfx12(
 
   if (value.scalar_type() == ScalarType::Half) {
     if (head_dim == 64) {
-      SAGEATTN_LAUNCH_MEAN_FP8_VALUE_SHORT(__half, 32);
+      if (compute_mean) {
+        SAGEATTN_LAUNCH_MEAN_FP8_VALUE_SHORT(__half, 32, true);
+      } else {
+        SAGEATTN_LAUNCH_MEAN_FP8_VALUE_SHORT(__half, 32, false);
+      }
     } else {
-      SAGEATTN_LAUNCH_MEAN_FP8_VALUE_SHORT(__half, 16);
+      if (compute_mean) {
+        SAGEATTN_LAUNCH_MEAN_FP8_VALUE_SHORT(__half, 16, true);
+      } else {
+        SAGEATTN_LAUNCH_MEAN_FP8_VALUE_SHORT(__half, 16, false);
+      }
     }
   } else {
     if (head_dim == 64) {
-      SAGEATTN_LAUNCH_MEAN_FP8_VALUE_SHORT(__hip_bfloat16, 32);
+      if (compute_mean) {
+        SAGEATTN_LAUNCH_MEAN_FP8_VALUE_SHORT(__hip_bfloat16, 32, true);
+      } else {
+        SAGEATTN_LAUNCH_MEAN_FP8_VALUE_SHORT(__hip_bfloat16, 32, false);
+      }
     } else {
-      SAGEATTN_LAUNCH_MEAN_FP8_VALUE_SHORT(__hip_bfloat16, 16);
+      if (compute_mean) {
+        SAGEATTN_LAUNCH_MEAN_FP8_VALUE_SHORT(__hip_bfloat16, 16, true);
+      } else {
+        SAGEATTN_LAUNCH_MEAN_FP8_VALUE_SHORT(__hip_bfloat16, 16, false);
+      }
     }
   }
 #undef SAGEATTN_LAUNCH_MEAN_FP8_VALUE_SHORT
   hip_kernel_launch_check();
   return {key_mean, output, value_scale};
+}
+
+std::vector<Tensor> mean_and_fp8_value_nhd_short_gfx12(
+    Tensor key,
+    Tensor value,
+    double scale_max) {
+  return mean_and_fp8_value_nhd_short_impl_gfx12(key, value, scale_max, true);
 }
 
 Tensor transpose_value_f16_hnd_gfx12(Tensor value) {
@@ -9122,10 +9157,11 @@ void qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
       static_cast<int>(key_hnd_layout));
 }
 
-std::vector<Tensor> mean_and_fp8_value_nhd_short_gfx12(
+std::vector<Tensor> mean_and_fp8_value_nhd_short_impl_gfx12(
     Tensor key,
     Tensor value,
-    double scale_max);
+    double scale_max,
+    bool compute_mean);
 
 Tensor sage_fp8_nhd_short_mha_gfx12(
     Tensor query,
@@ -9133,7 +9169,8 @@ Tensor sage_fp8_nhd_short_mha_gfx12(
     Tensor value,
     int64_t is_causal,
     double sm_scale,
-    double scale_max) {
+    double scale_max,
+    int64_t smooth_k) {
   STD_TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda(),
               "gfx12 short fp8 wrapper expects CUDA/HIP tensors");
   check_same_device(query, key, value);
@@ -9156,8 +9193,9 @@ Tensor sage_fp8_nhd_short_mha_gfx12(
                   (head_dim == 64 || head_dim == 128),
               "gfx12 fp8 wrapper supports S512/S1024/S2048/S4096/S8192 and D64/D128");
 
+  const bool smooth_key = smooth_k != 0;
   std::vector<Tensor> prep =
-      mean_and_fp8_value_nhd_short_gfx12(key, value, scale_max);
+      mean_and_fp8_value_nhd_short_impl_gfx12(key, value, scale_max, smooth_key);
   Tensor key_mean = prep[0];
   Tensor value_native = prep[1];
   Tensor value_scale = prep[2];
@@ -9167,25 +9205,34 @@ Tensor sage_fp8_nhd_short_mha_gfx12(
 
   const dim3 grid((seq_len + 63) / 64, heads, batch);
   auto [device_guard, stream] = current_hip_stream(key);
+
+#define SAGEATTN_LAUNCH_QUANT_K_SHORT(DIM_, PACK_, SUB_) \
+  quant_k_nhd_fuse_sub_mean_short_kernel<__half, DIM_, PACK_, SUB_> \
+      <<<grid, block, 0, stream>>>( \
+          reinterpret_cast<const __half*>(key.data_ptr()), \
+          reinterpret_cast<const __half*>(key_mean.data_ptr()), \
+          reinterpret_cast<int8_t*>(key_int8.data_ptr()), \
+          reinterpret_cast<float*>(key_scale.data_ptr()), \
+          seq_len, heads)
+
   if (head_dim == 64) {
     constexpr int NumPack = 1;
     dim3 block(64 * (64 / 8) / NumPack);
-    quant_k_nhd_fuse_sub_mean_short_kernel<__half, 64, NumPack><<<grid, block, 0, stream>>>(
-        reinterpret_cast<const __half*>(key.data_ptr()),
-        reinterpret_cast<const __half*>(key_mean.data_ptr()),
-        reinterpret_cast<int8_t*>(key_int8.data_ptr()),
-        reinterpret_cast<float*>(key_scale.data_ptr()),
-        seq_len, heads);
+    if (smooth_key) {
+      SAGEATTN_LAUNCH_QUANT_K_SHORT(64, NumPack, true);
+    } else {
+      SAGEATTN_LAUNCH_QUANT_K_SHORT(64, NumPack, false);
+    }
   } else {
     constexpr int NumPack = 2;
     dim3 block(64 * (128 / 8) / NumPack);
-    quant_k_nhd_fuse_sub_mean_short_kernel<__half, 128, NumPack><<<grid, block, 0, stream>>>(
-        reinterpret_cast<const __half*>(key.data_ptr()),
-        reinterpret_cast<const __half*>(key_mean.data_ptr()),
-        reinterpret_cast<int8_t*>(key_int8.data_ptr()),
-        reinterpret_cast<float*>(key_scale.data_ptr()),
-        seq_len, heads);
+    if (smooth_key) {
+      SAGEATTN_LAUNCH_QUANT_K_SHORT(128, NumPack, true);
+    } else {
+      SAGEATTN_LAUNCH_QUANT_K_SHORT(128, NumPack, false);
+    }
   }
+#undef SAGEATTN_LAUNCH_QUANT_K_SHORT
   hip_kernel_launch_check();
 
   Tensor output = torch::stable::empty_like(query);
