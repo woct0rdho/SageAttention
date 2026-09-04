@@ -1,0 +1,143 @@
+name: Build SageAttention ROCm gfx12
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_tag:
+        description: Git tag
+        required: true
+        type: string
+        default: main
+      rocm_index_url:
+        description: ROCm wheel index
+        required: true
+        type: string
+        default: 'https://nightly.repo.amd.com/rocm/whl-next/'
+      torch_version:
+        description: PyTorch version, empty for the newest on the index
+        required: false
+        type: string
+        default: ''
+      torch_device_extra:
+        description: Torch device extra that pulls the ROCm runtime, empty for index layouts without one
+        required: false
+        type: string
+        default: device-gfx1200
+      gpu_archs:
+        description: AMD GPU architectures
+        required: true
+        type: string
+        default: 'gfx1200;gfx1201'
+      extra_wheel_version_suffix:
+        description: Extra wheel version suffix
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  resolve-ref:
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    outputs:
+      commit_sha: ${{ steps.resolve.outputs.commit_sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.git_tag }}
+          path: SageAttention
+
+      - id: resolve
+        shell: powershell
+        run: |
+          cd SageAttention
+          "commit_sha=$(git rev-parse HEAD)" >> $Env:GITHUB_OUTPUT
+
+  build-sageattn-rocm:
+    name: Build ${{ inputs.git_tag }} @ ${{ needs.resolve-ref.outputs.commit_sha }}
+    needs: resolve-ref
+    runs-on: windows-2022
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Configure Git
+        shell: powershell
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve-ref.outputs.commit_sha }}
+          path: SageAttention
+
+      # The ROCm wheel is abi3 and tagged cp310, so one interpreter covers every
+      # supported Python and cibuildwheel has nothing left to iterate over.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install ROCm PyTorch and the ROCm SDK
+        shell: powershell
+        env:
+          ROCM_INDEX_URL: ${{ inputs.rocm_index_url }}
+          TORCH_VERSION: ${{ inputs.torch_version }}
+          TORCH_DEVICE_EXTRA: ${{ inputs.torch_device_extra }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade numpy packaging setuptools wheel
+
+          # Older index layouts ship no device extras, so treat an empty one as plain torch
+          $TorchSpec = "torch"
+          if ($Env:TORCH_DEVICE_EXTRA)
+          {
+            $TorchSpec = "torch[{0}]" -f $Env:TORCH_DEVICE_EXTRA
+          }
+          if ($Env:TORCH_VERSION)
+          {
+            $TorchSpec += "==" + $Env:TORCH_VERSION
+          }
+
+          # The SDK unpacks to several GB, and a cached copy of it does not fit
+          # next to the extracted one on a hosted runner
+          pip install --pre --no-cache-dir --index-url $Env:ROCM_INDEX_URL $TorchSpec rocm-sdk-devel
+
+          python -c "import torch; print(torch.__version__, torch.version.hip)"
+          rocm-sdk path --root
+
+      - name: Build wheel
+        shell: powershell
+        env:
+          GPU_ARCHS: ${{ inputs.gpu_archs }}
+          EXTRA_WHEEL_VERSION_SUFFIX: ${{ inputs.extra_wheel_version_suffix }}
+        run: |
+          cd SageAttention
+          git rev-parse HEAD
+
+          $TorchVersion = python -c "import torch; print(torch.__version__.split('+')[0])"
+          # The ROCm release the torch build came from, so the wheel name lines up
+          # with what pip list shows, not with the older HIP runtime number
+          $RocmVersion = python -c "import re, torch; local = (torch.__version__.split('+') + [''])[1]; m = re.match(r'rocm(\d+\.\d+)', local); print(m.group(1) if m else '.'.join(torch.version.hip.split('.')[:2]))"
+
+          $Env:SAGEATTENTION_WHEEL_VERSION_SUFFIX = "+rocm{0}torch{1}" -f $RocmVersion, $TorchVersion
+          $Env:SAGEATTENTION_WHEEL_VERSION_SUFFIX += $Env:EXTRA_WHEEL_VERSION_SUFFIX
+
+          $Env:DISTUTILS_USE_SDK = "1"
+
+          # Build isolation would pull the multi GB ROCm stack a second time,
+          # and setup.py needs the same torch the wheel is built against
+          pip wheel . --no-build-isolation --no-deps --wheel-dir wheelhouse
+
+          Get-ChildItem wheelhouse
+
+      - uses: actions/attest@v4
+        with:
+          subject-path: SageAttention/wheelhouse/*.whl
+
+      - uses: actions/upload-artifact@v7
+        with:
+          path: SageAttention/wheelhouse/*.whl
+          archive: false
