@@ -84,7 +84,8 @@ Tensor sage_fp8_nhd_short_mha_gfx12(
     Tensor value,
     int64_t is_causal,
     double sm_scale,
-    double scale_max);
+    double scale_max,
+    int64_t smooth_k = 1);
 
 Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     Tensor query,

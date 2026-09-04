@@ -12,6 +12,7 @@ def sage_fp8_nhd_short_mha_fake_impl(
     is_causal: int,
     sm_scale: float,
     scale_max: float,
+    smooth_k: int = 1,
 ) -> torch.Tensor:
     return torch.empty_like(query)
 

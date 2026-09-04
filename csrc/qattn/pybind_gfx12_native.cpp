@@ -53,7 +53,7 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_gfx12_native, m) {
           ") -> ()");
     m.def("sage_fp8_nhd_short_mha("
             "Tensor query, Tensor key, Tensor value, int is_causal, "
-            "float sm_scale, float scale_max"
+            "float sm_scale, float scale_max, int smooth_k=1"
           ") -> Tensor");
     m.def("qk_int8_sv_f16_d64_prepare_attn_hnd("
             "Tensor query, Tensor key, Tensor value, int is_causal, "
