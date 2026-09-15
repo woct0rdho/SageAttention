@@ -184,7 +184,13 @@ def gfx10x_sageattn(
         if is_gfx103:
             use_direct = False
         else:
-            thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", "2048") or 2048)
+            # On gfx1103 (Radeon 780M, 12-CU) the int8 QK path is faster than the
+            # direct fp16/bf16 path for D128 with kv >= 512 (large/balanced query):
+            # int8 QK doubles compute throughput, and the direct path shows a
+            # severe perf cliff (e.g. ~68 ms vs ~33 ms at S=6144). Keep the direct
+            # path for tiny kv (<= 256) where the int8 prepass overhead dominates
+            # and for the small-Q / large-KV cross case (q_len*2 < kv_len).
+            thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", "256") or 256)
             if q_len * 2 < kv_len_actual:
                 use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128_CROSS", "4096") or 4096))
             else:
