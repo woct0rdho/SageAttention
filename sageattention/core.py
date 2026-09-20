@@ -107,6 +107,7 @@ def sageattn(
     is_causal: bool = False,
     sm_scale: Optional[float] = None,
     return_lse: bool = False,
+    attn_mask: Optional[torch.Tensor] = None,
     **kwargs: Any,
 ):
     """
