@@ -1839,11 +1839,18 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
     const int bn128 = (bn128_ov != 0) ? bn128_ov : bn_auto;
 
     const int bm128_sel = getenv("SAGEATTN_INT8_BM128") ? atoi(getenv("SAGEATTN_INT8_BM128")) : -1;
-    const int bm128_thr = getenv("SAGEATTN_INT8_BM128_THR") ? atoi(getenv("SAGEATTN_INT8_BM128_THR")) : 8192;
+    // BM128 stages the V tile into LDS for the PV pass; BM64 reads V_T directly
+    // from global memory per lane (redundant 32B row reads, hidden only when the
+    // KV tile fits in L2). On gfx1103 (Radeon 780M, 12 CU) measurements show the
+    // crossover at kv_len ~ 2048: below it BM64 wins (less smem/sync overhead),
+    // at/above it BM128 is up to ~1.6x faster (e.g. Anima D128 self-attn at
+    // S=4096: 26.6ms -> 16.4ms). The kv % 512 == 0 restriction is dropped since
+    // BM128 is numerically correct for any kv_len (V_T is padded to 64).
+    const int bm128_thr = getenv("SAGEATTN_INT8_BM128_THR") ? atoi(getenv("SAGEATTN_INT8_BM128_THR")) : 2048;
     bool use_bm128_d128;
     if (bm128_sel == 1) use_bm128_d128 = true;
     else if (bm128_sel == 0) use_bm128_d128 = false;
-    else use_bm128_d128 = (kv512 && kv_len >= bm128_thr);
+    else use_bm128_d128 = (kv_len >= bm128_thr);
 
     #define LAUNCH_ATTN_T(HD, CAUSAL, BM, BN, VTYPE, OTYPE, WPE) \
         do { \
