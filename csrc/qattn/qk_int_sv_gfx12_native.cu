@@ -7410,12 +7410,6 @@ Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     }
     if (block_rows == 64) {
       SAGEATTN_DISPATCH_RAW_QK_F16_CAUSAL(64);
-    } else if (block_rows == 256) {
-      SAGEATTN_DISPATCH_RAW_QK_F16_CAUSAL(256);
-    } else if (block_rows == 512) {
-      SAGEATTN_DISPATCH_RAW_QK_F16_CAUSAL(512);
-    } else if (block_rows == 1024) {
-      SAGEATTN_DISPATCH_RAW_QK_F16_CAUSAL(1024);
     } else {
       SAGEATTN_DISPATCH_RAW_QK_F16_CAUSAL(128);
     }
@@ -7447,10 +7441,6 @@ Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     const bool use_fp8_kvlane =
         use_fused_q && head_dim == 64 && block_cols == 64 && transpose_fp8_value &&
         true;
-    const bool auto_fp8_streamcols4 =
-        use_fused_q && head_dim == 64 && is_causal && block_cols == 64;
-    const bool use_fp8_streamcols4 =
-        use_fused_q && block_cols == 64 && auto_fp8_streamcols4;
     const dim3 block(block_rows);
     const dim3 grid((q_len + block_rows - 1) / block_rows, q_heads, batch);
     auto [device_guard, stream] = current_hip_stream(query);
@@ -7527,33 +7517,20 @@ Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         0, 0, \
         fused_ks_stride_b, fused_ks_stride_h, \
         kHND, sm_scale)
-#define SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SC(BC_, HD_, BR_, CAUSAL_, KVLANE_, SC_) \
-    SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SLICE(BC_, HD_, BR_, CAUSAL_, KVLANE_, SC_, false, false, 0, ((HD_) / 16))
-#define SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL(BC_, HD_, BR_, CAUSAL_, KVLANE_) \
-    if constexpr ((BC_) == 64) { \
-      if (use_fp8_streamcols4) { \
-        SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SC(BC_, HD_, BR_, CAUSAL_, KVLANE_, 4); \
-      } else { \
-        SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SC(BC_, HD_, BR_, CAUSAL_, KVLANE_, 0); \
-      } \
-    } else { \
-      SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SC(BC_, HD_, BR_, CAUSAL_, KVLANE_, 0); \
-    }
-#define SAGEATTN_LAUNCH_FUSED_Q_FP8(BC_, HD_, BR_, CAUSAL_) \
-    if (use_fp8_kvlane) { \
-      SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL(BC_, HD_, BR_, CAUSAL_, true); \
-    } else { \
-      SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL(BC_, HD_, BR_, CAUSAL_, false); \
-    }
+// streamcols4 and the lane-major K/V packing are only ever active for the D64
+// fused-Q route, so the flags are chosen per dispatch branch instead of at
+// runtime. This drops the SC=0/KVLANE=false D64 and SC=4/KVLANE=true D16/D128
+// instantiations that could never be launched.
+#define SAGEATTN_LAUNCH_FUSED_Q_FP8_D64(BC_, HD_, BR_, CAUSAL_) \
+    SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SLICE(BC_, HD_, BR_, CAUSAL_, true, 4, false, false, 0, ((HD_) / 16))
+#define SAGEATTN_LAUNCH_FUSED_Q_FP8_OTHER(BC_, HD_, BR_, CAUSAL_) \
+    SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SLICE(BC_, HD_, BR_, CAUSAL_, false, 0, false, false, 0, ((HD_) / 16))
 
 #define SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC(BC_, VT_, OUT_T_) \
     if (head_dim == 16) { \
       if (block_rows == 64) { \
         if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 64, VT_, true, OUT_T_); } \
         else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 64, VT_, false, OUT_T_); } \
-      } else if (block_rows == 256) { \
-        if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 256, VT_, true, OUT_T_); } \
-        else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 256, VT_, false, OUT_T_); } \
       } else { \
         if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 128, VT_, true, OUT_T_); } \
         else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 128, VT_, false, OUT_T_); } \
@@ -7577,8 +7554,9 @@ Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 128, 128, true, false, OUT_T_); } \
       } \
     } else if (block_rows == 256) { \
-      if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 256, VT_, true, OUT_T_); } \
-      else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 256, VT_, false, OUT_T_); } \
+      STD_TORCH_CHECK(!is_causal, \
+                      "prepared fp8 BR256 path is only valid for non-causal D64"); \
+      SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 256, VT_, false, OUT_T_); \
     } else if (block_rows == 64) { \
       if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 64, VT_, true, OUT_T_); } \
       else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 64, VT_, false, OUT_T_); } \
@@ -7591,22 +7569,22 @@ Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC(64, true, OUT_T_)
 
     if (use_fused_q) {
-#define SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_CAUSAL(BC_, HD_, CAUSAL_) \
-      if (block_rows == 64) { SAGEATTN_LAUNCH_FUSED_Q_FP8(BC_, HD_, 64, CAUSAL_); } \
-      else if (block_rows == 256) { SAGEATTN_LAUNCH_FUSED_Q_FP8(BC_, HD_, 256, CAUSAL_); } \
-      else { SAGEATTN_LAUNCH_FUSED_Q_FP8(BC_, HD_, 128, CAUSAL_); }
-#define SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(BC_, HD_) \
-      if (is_causal) { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_CAUSAL(BC_, HD_, true); } \
-      else { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_CAUSAL(BC_, HD_, false); }
+#define SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_NO_BR256(BC_, HD_, CAUSAL_) \
+      if (block_rows == 64) { SAGEATTN_LAUNCH_FUSED_Q_FP8_OTHER(BC_, HD_, 64, CAUSAL_); } \
+      else { SAGEATTN_LAUNCH_FUSED_Q_FP8_OTHER(BC_, HD_, 128, CAUSAL_); }
+#define SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_D64_CAUSAL(BC_, HD_) \
+      if (block_rows == 64) { SAGEATTN_LAUNCH_FUSED_Q_FP8_D64(BC_, HD_, 64, true); } \
+      else { SAGEATTN_LAUNCH_FUSED_Q_FP8_D64(BC_, HD_, 128, true); }
       if (head_dim == 16) {
-        SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(64, 16);
+        SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_NO_BR256(64, 16, true);
       } else if (head_dim == 128) {
-        SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(64, 128);
+        if (is_causal) { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_NO_BR256(64, 128, true); }
+        else { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_NO_BR256(64, 128, false); }
       } else {
-        SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(64, 64);
+        SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_D64_CAUSAL(64, 64);
       }
-#undef SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD
-#undef SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_CAUSAL
+#undef SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_D64_CAUSAL
+#undef SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_NO_BR256
     } else if (output.scalar_type() == ScalarType::BFloat16) {
       SAGEATTN_DISPATCH_PREPARED_FP8_TV(__hip_bfloat16);
     } else {
@@ -7614,9 +7592,8 @@ Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     }
 #undef SAGEATTN_DISPATCH_PREPARED_FP8_TV
 #undef SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC
-#undef SAGEATTN_LAUNCH_FUSED_Q_FP8
-#undef SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL
-#undef SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SC
+#undef SAGEATTN_LAUNCH_FUSED_Q_FP8_D64
+#undef SAGEATTN_LAUNCH_FUSED_Q_FP8_OTHER
 #undef SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SLICE
 #undef SAGEATTN_LAUNCH_PREPARED_FP8
 #undef SAGEATTN_LAUNCH_PREPARED_FP8_EX
@@ -7790,26 +7767,41 @@ Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         0, 0, \
         prepared[1].stride(0), prepared[1].stride(1), \
         kHND, sm_scale)
-#define SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(BR_, PAD_) \
+// The fused-Q fp16 ladder is split by call site because the live flag
+// combinations depend on q_len and block_rows:
+//   - q_len < 1024: pv-ordered, klane, vlane and streamk are all false.
+//   - klane and streamk require q_len 2048/4096, which the selector always
+//     maps to block_rows 256, and streamk additionally requires q_len 2048.
+//   - in the pv-ordered ladder q_len 2048 implies klane, so the v&&s branch
+//     is unreachable there.
+#define SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL_LOW(BR_, PAD_) \
+    if (use_f16_raw_value) { \
+      SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, false, false); \
+    } else { \
+      SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, false, false, false); \
+    }
+#define SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL_MID(BR_, PAD_) \
+    if (use_f16_raw_value) { \
+      if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, true, false); } \
+      else { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, false, false); } \
+    } else if (use_f16_pv_ordered_qk) { \
+      if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, false, false); } \
+      else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, false, false); } \
+    } else { \
+      STD_TORCH_CHECK(false, "fused-Q fp16 mid ladder requires q_len >= 1024"); \
+    }
+#define SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL_HIGH(BR_, PAD_) \
     if (use_f16_raw_value) { \
       if (use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, true, true); } \
       else if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, true, false); } \
-      else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, false, true); } \
       else { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, false, false); } \
     } else if (use_f16_pv_ordered_qk) { \
       if (use_f16_klane && use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, true, true); } \
       else if (use_f16_klane && use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, false, true); } \
-      else if (use_f16_klane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, true, true); } \
-      else if (use_f16_klane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, false, true); } \
-      else if (use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, true, false); } \
       else if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, false, false); } \
-      else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, true, false); } \
       else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, false, false); } \
     } else { \
-      if (use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, true, true, false); } \
-      else if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, true, false, false); } \
-      else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, false, true, false); } \
-      else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, false, false, false); } \
+      SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, false, false, false); \
     }
     if (!is_causal) {
       STD_TORCH_CHECK(block_cols == 64,
@@ -7836,21 +7828,17 @@ Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL(64, true, false);
       }
     } else if (block_rows == 64) {
-      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(64, 4);
+      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL_LOW(64, 4);
     } else if (block_rows == 256) {
-      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(256, 4);
-    } else if (block_rows == 512) {
-      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(512, 4);
-    } else if (block_rows == 1024) {
-      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(1024, 4);
-    } else if (q_len >= 8192) {
-      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(128, 8);
+      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL_HIGH(256, 4);
     } else if (q_len >= 1024) {
-      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(128, 4);
+      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL_MID(128, 4);
     } else {
-      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(128, 16);
+      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL_LOW(128, 16);
     }
-#undef SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL
+#undef SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL_LOW
+#undef SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL_MID
+#undef SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL_HIGH
 #undef SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_TV_CAUSAL
 #undef SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL
 #undef SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL
@@ -8173,77 +8161,79 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     hip_kernel_launch_check();
     return output;
   }
+#define SAGEATTN_LAUNCH_FP8_2Q_OUT_IMPL(BC_, HD_, HND_, BR_, CAUSAL_, OUT_T_) \
+  qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), HND_, BR_, false, CAUSAL_, OUT_T_><<<grid, block, 0, stream>>>( \
+    reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+    reinterpret_cast<uint8_t*>(value.data_ptr()), \
+    reinterpret_cast<OUT_T_*>(output.data_ptr()), \
+    reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), value_scale_ptr, \
+    batch, q_len, kv_len, q_heads, kv_heads, \
+    query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+    key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+    value.stride(0), value.stride(tensor_layout == kNHD ? 1 : 2), value.stride(tensor_layout == kNHD ? 2 : 1), \
+    output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+    query_scale.stride(0), query_scale.stride(1), \
+    key_scale.stride(0), key_scale.stride(1), \
+    tensor_layout, sm_scale, use_per_thread_qk)
 #define SAGEATTN_LAUNCH_FP8_2Q_OUT(BC_, HD_, HND_, BR_, OUT_T_) \
   if (is_causal) { \
-    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), HND_, BR_, false, true, OUT_T_><<<grid, block, 0, stream>>>( \
-      reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
-      reinterpret_cast<uint8_t*>(value.data_ptr()), \
-      reinterpret_cast<OUT_T_*>(output.data_ptr()), \
-      reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), value_scale_ptr, \
-      batch, q_len, kv_len, q_heads, kv_heads, \
-      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
-      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
-      value.stride(0), value.stride(tensor_layout == kNHD ? 1 : 2), value.stride(tensor_layout == kNHD ? 2 : 1), \
-      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
-      query_scale.stride(0), query_scale.stride(1), \
-      key_scale.stride(0), key_scale.stride(1), \
-      tensor_layout, sm_scale, use_per_thread_qk); \
+    SAGEATTN_LAUNCH_FP8_2Q_OUT_IMPL(BC_, HD_, HND_, BR_, true, OUT_T_); \
   } else { \
-    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), HND_, BR_, false, false, OUT_T_><<<grid, block, 0, stream>>>( \
-      reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
-      reinterpret_cast<uint8_t*>(value.data_ptr()), \
-      reinterpret_cast<OUT_T_*>(output.data_ptr()), \
-      reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), value_scale_ptr, \
-      batch, q_len, kv_len, q_heads, kv_heads, \
-      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
-      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
-      value.stride(0), value.stride(tensor_layout == kNHD ? 1 : 2), value.stride(tensor_layout == kNHD ? 2 : 1), \
-      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
-      query_scale.stride(0), query_scale.stride(1), \
-      key_scale.stride(0), key_scale.stride(1), \
-      tensor_layout, sm_scale, use_per_thread_qk); \
+    SAGEATTN_LAUNCH_FP8_2Q_OUT_IMPL(BC_, HD_, HND_, BR_, false, OUT_T_); \
   }
+#define SAGEATTN_LAUNCH_FP8_2Q_OUT_NONCAUSAL(BC_, HD_, HND_, BR_, OUT_T_) \
+  SAGEATTN_LAUNCH_FP8_2Q_OUT_IMPL(BC_, HD_, HND_, BR_, false, OUT_T_)
 #define SAGEATTN_LAUNCH_FP8_2Q(BC_, HD_, HND_, BR_) \
   if (output_is_bf16) { \
     SAGEATTN_LAUNCH_FP8_2Q_OUT(BC_, HD_, HND_, BR_, __hip_bfloat16); \
   } else { \
     SAGEATTN_LAUNCH_FP8_2Q_OUT(BC_, HD_, HND_, BR_, __half); \
   }
+#define SAGEATTN_LAUNCH_FP8_2Q_NONCAUSAL(BC_, HD_, HND_, BR_) \
+  if (output_is_bf16) { \
+    SAGEATTN_LAUNCH_FP8_2Q_OUT_NONCAUSAL(BC_, HD_, HND_, BR_, __hip_bfloat16); \
+  } else { \
+    SAGEATTN_LAUNCH_FP8_2Q_OUT_NONCAUSAL(BC_, HD_, HND_, BR_, __half); \
+  }
+#define SAGEATTN_LAUNCH_FP8_2Q_TV_OUT_IMPL(BC_, HD_, BR_, CAUSAL_, OUT_T_) \
+  qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), true, BR_, true, CAUSAL_, OUT_T_><<<grid, block, 0, stream>>>( \
+    reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
+    reinterpret_cast<uint8_t*>(value.data_ptr()), \
+    reinterpret_cast<OUT_T_*>(output.data_ptr()), \
+    reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), value_scale_ptr, \
+    batch, q_len, kv_len, q_heads, kv_heads, \
+    query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+    key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+    value.stride(0), value.stride(2), value.stride(1), \
+    output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+    query_scale.stride(0), query_scale.stride(1), \
+    key_scale.stride(0), key_scale.stride(1), \
+    tensor_layout, sm_scale, use_per_thread_qk)
 #define SAGEATTN_LAUNCH_FP8_2Q_TV_OUT(BC_, HD_, BR_, OUT_T_) \
   if (is_causal) { \
-    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), true, BR_, true, true, OUT_T_><<<grid, block, 0, stream>>>( \
-      reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
-      reinterpret_cast<uint8_t*>(value.data_ptr()), \
-      reinterpret_cast<OUT_T_*>(output.data_ptr()), \
-      reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), value_scale_ptr, \
-      batch, q_len, kv_len, q_heads, kv_heads, \
-      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
-      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
-      value.stride(0), value.stride(2), value.stride(1), \
-      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
-      query_scale.stride(0), query_scale.stride(1), \
-      key_scale.stride(0), key_scale.stride(1), \
-      tensor_layout, sm_scale, use_per_thread_qk); \
+    SAGEATTN_LAUNCH_FP8_2Q_TV_OUT_IMPL(BC_, HD_, BR_, true, OUT_T_); \
   } else { \
-    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), true, BR_, true, false, OUT_T_><<<grid, block, 0, stream>>>( \
-      reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
-      reinterpret_cast<uint8_t*>(value.data_ptr()), \
-      reinterpret_cast<OUT_T_*>(output.data_ptr()), \
-      reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), value_scale_ptr, \
-      batch, q_len, kv_len, q_heads, kv_heads, \
-      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
-      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
-      value.stride(0), value.stride(2), value.stride(1), \
-      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
-      query_scale.stride(0), query_scale.stride(1), \
-      key_scale.stride(0), key_scale.stride(1), \
-      tensor_layout, sm_scale, use_per_thread_qk); \
+    SAGEATTN_LAUNCH_FP8_2Q_TV_OUT_IMPL(BC_, HD_, BR_, false, OUT_T_); \
+  }
+#define SAGEATTN_LAUNCH_FP8_2Q_TV_OUT_NONCAUSAL(BC_, HD_, BR_, OUT_T_) \
+  SAGEATTN_LAUNCH_FP8_2Q_TV_OUT_IMPL(BC_, HD_, BR_, false, OUT_T_)
+#define SAGEATTN_LAUNCH_FP8_2Q_TV_CAUSAL(BC_, HD_, BR_) \
+  if (output_is_bf16) { \
+    SAGEATTN_LAUNCH_FP8_2Q_TV_OUT_IMPL(BC_, HD_, BR_, true, __hip_bfloat16); \
+  } else { \
+    SAGEATTN_LAUNCH_FP8_2Q_TV_OUT_IMPL(BC_, HD_, BR_, true, __half); \
   }
 #define SAGEATTN_LAUNCH_FP8_2Q_TV(BC_, HD_, BR_) \
   if (output_is_bf16) { \
     SAGEATTN_LAUNCH_FP8_2Q_TV_OUT(BC_, HD_, BR_, __hip_bfloat16); \
   } else { \
     SAGEATTN_LAUNCH_FP8_2Q_TV_OUT(BC_, HD_, BR_, __half); \
+  }
+#define SAGEATTN_LAUNCH_FP8_2Q_TV_NONCAUSAL(BC_, HD_, BR_) \
+  if (output_is_bf16) { \
+    SAGEATTN_LAUNCH_FP8_2Q_TV_OUT_NONCAUSAL(BC_, HD_, BR_, __hip_bfloat16); \
+  } else { \
+    SAGEATTN_LAUNCH_FP8_2Q_TV_OUT_NONCAUSAL(BC_, HD_, BR_, __half); \
   }
 #define SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID_HD(HD_, BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, GRID_, FLAT_) \
   qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, int8_t, false, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_, HD_, FLAT_><<<GRID_, block, 0, stream>>>( \
@@ -8430,50 +8420,12 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query_scale.stride(0), query_scale.stride(1), \
       key_scale.stride(0), key_scale.stride(1), \
       tensor_layout, sm_scale, use_per_thread_qk)
-#define SAGEATTN_LAUNCH_F16_1Q_CAUSAL(BR_, TRANSPOSED_, TVLOAD_, PAD_, F16ACC_) \
-  qk_int8_sv_f16_d64_native_kernel<64, BR_, true, TRANSPOSED_, PAD_, true, TVLOAD_, F16ACC_><<<grid, block, 0, stream>>>( \
-      reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()), \
-      reinterpret_cast<const __half*>(value.data_ptr()), \
-      reinterpret_cast<__half*>(output.data_ptr()), \
-      reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), \
-      batch, q_len, kv_len, q_heads, kv_heads, \
-      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
-      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
-      value.stride(0), (TRANSPOSED_ ? value.stride(2) : value.stride(tensor_layout == kNHD ? 1 : 2)), \
-      (TRANSPOSED_ ? value.stride(1) : value.stride(tensor_layout == kNHD ? 2 : 1)), \
-      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
-      query_scale.stride(0), query_scale.stride(1), \
-      key_scale.stride(0), key_scale.stride(1), \
-      tensor_layout, sm_scale, use_per_thread_qk)
 #if SAGEATTN_GFX12_BUILD_ATTN_F16
+  // The fp16 single-q causal route is superseded by the 2q ladders below and is
+  // never selected. Keep the branch so the else-if chain stays attached, but do
+  // not instantiate its kernels.
   if (use_f16_causal_1q) {
-    STD_TORCH_CHECK(hnd_contiguous, "fp16 single-q causal path requires contiguous HND tensors");
-    const bool use_f16_1q_pv_accum = use_f16_pv_accum;
-#define SAGEATTN_DISPATCH_F16_1Q_CAUSAL(BR_, TRANSPOSED_, TVLOAD_, PAD_) \
-    if (use_f16_1q_pv_accum) { \
-      SAGEATTN_LAUNCH_F16_1Q_CAUSAL(BR_, TRANSPOSED_, TVLOAD_, PAD_, true); \
-    } else { \
-      SAGEATTN_LAUNCH_F16_1Q_CAUSAL(BR_, TRANSPOSED_, TVLOAD_, PAD_, false); \
-    }
-    if (value_transposed_hnd) {
-      if (q_len >= 4096) {
-        if (block_rows == 128) { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(128, true, false, 8); }
-        else { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(64, true, false, 8); }
-      } else if (q_len >= 1024) {
-        if (block_rows == 128) { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(128, true, false, 4); }
-        else { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(64, true, false, 4); }
-      } else {
-        if (block_rows == 128) { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(128, true, false, 16); }
-        else { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(64, true, false, 16); }
-      }
-    } else if (use_f16_tvload) {
-      if (block_rows == 128) { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(128, false, true, 4); }
-      else { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(64, false, true, 4); }
-    } else {
-      if (block_rows == 128) { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(128, false, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD); }
-      else { SAGEATTN_DISPATCH_F16_1Q_CAUSAL(64, false, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD); }
-    }
-#undef SAGEATTN_DISPATCH_F16_1Q_CAUSAL
+    STD_TORCH_CHECK(false, "fp16 single-q causal path is not available in this build");
   }
 #endif // SAGEATTN_GFX12_BUILD_ATTN_F16
 #if SAGEATTN_GFX12_BUILD_ATTN_FP8
@@ -8488,157 +8440,85 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     STD_TORCH_CHECK(!(block_rows == 256 && block_cols != 64),
                 "transposed fp8 value BR256 path currently supports BC64");
     if (head_dim == 16) {
-      if (block_cols == 32) {
-        if (block_rows == 32) {
-          SAGEATTN_LAUNCH_FP8_2Q_TV(32, 16, 32);
-        } else if (block_rows == 64) {
-          SAGEATTN_LAUNCH_FP8_2Q_TV(32, 16, 64);
-        } else {
-          SAGEATTN_LAUNCH_FP8_2Q_TV(32, 16, 128);
-        }
-      } else if (block_rows == 32) {
-        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 16, 32);
-      } else if (block_rows == 64) {
+      if (block_rows == 64) {
         SAGEATTN_LAUNCH_FP8_2Q_TV(64, 16, 64);
-      } else if (block_rows == 256) {
-        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 16, 256);
-      } else if (block_rows == 512) {
-        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 16, 512);
       } else {
         SAGEATTN_LAUNCH_FP8_2Q_TV(64, 16, 128);
       }
-    } else if (block_rows == 512 && block_cols == 32 && head_dim == 128) {
-      SAGEATTN_LAUNCH_FP8_2Q_TV(32, 128, 512);
-    } else if (block_rows == 512 && block_cols == 32) {
-      SAGEATTN_LAUNCH_FP8_2Q_TV(32, 64, 512);
-    } else if (block_rows == 512 && head_dim == 128) {
-      SAGEATTN_LAUNCH_FP8_2Q_TV(64, 128, 512);
-    } else if (block_rows == 512) {
-      SAGEATTN_LAUNCH_FP8_2Q_TV(64, 64, 512);
-    } else if (block_rows == 256 && head_dim == 128) {
-      SAGEATTN_LAUNCH_FP8_2Q_TV(64, 128, 256);
-    } else if (block_rows == 256) {
-      SAGEATTN_LAUNCH_FP8_2Q_TV(64, 64, 256);
-    } else if (block_cols == 32 && head_dim == 128) {
-      if (block_rows == 32) {
-        SAGEATTN_LAUNCH_FP8_2Q_TV(32, 128, 32);
-      } else if (block_rows == 64) {
-        SAGEATTN_LAUNCH_FP8_2Q_TV(32, 128, 64);
-      } else {
-        SAGEATTN_LAUNCH_FP8_2Q_TV(32, 128, 128);
-      }
-    } else if (block_cols == 32) {
-      if (block_rows == 32) {
-        SAGEATTN_LAUNCH_FP8_2Q_TV(32, 64, 32);
-      } else if (block_rows == 64) {
-        SAGEATTN_LAUNCH_FP8_2Q_TV(32, 64, 64);
-      } else {
-        SAGEATTN_LAUNCH_FP8_2Q_TV(32, 64, 128);
-      }
     } else if (head_dim == 128) {
-      if (block_rows == 32) {
-        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 128, 32);
+      if (block_cols == 32) {
+        STD_TORCH_CHECK(block_rows == 128,
+                        "transposed fp8 D128 BC32 path currently supports BR128");
+        SAGEATTN_LAUNCH_FP8_2Q_TV_CAUSAL(32, 128, 128);
       } else if (block_rows == 64) {
         SAGEATTN_LAUNCH_FP8_2Q_TV(64, 128, 64);
       } else {
         SAGEATTN_LAUNCH_FP8_2Q_TV(64, 128, 128);
       }
     } else {
-      if (block_rows == 32) {
-        SAGEATTN_LAUNCH_FP8_2Q_TV(64, 64, 32);
-      } else if (block_rows == 64) {
+      if (block_rows == 64) {
         SAGEATTN_LAUNCH_FP8_2Q_TV(64, 64, 64);
+      } else if (block_rows == 256) {
+        STD_TORCH_CHECK(!is_causal,
+                        "transposed fp8 D64 BR256 path is only non-causal");
+        SAGEATTN_LAUNCH_FP8_2Q_TV_NONCAUSAL(64, 64, 256);
       } else {
         SAGEATTN_LAUNCH_FP8_2Q_TV(64, 64, 128);
       }
     }
-  } else if (use_fp8_2q && block_rows == 64 && block_cols == 32 && head_dim == 128) {
-    if (hnd_contiguous) {
-      SAGEATTN_LAUNCH_FP8_2Q(32, 128, true, 64);
-    } else {
-      SAGEATTN_LAUNCH_FP8_2Q(32, 128, false, 64);
-    }
-  } else if (use_fp8_2q && block_rows == 64 && block_cols == 32) {
-    if (hnd_contiguous) {
-      SAGEATTN_LAUNCH_FP8_2Q(32, 64, true, 64);
-    } else {
-      SAGEATTN_LAUNCH_FP8_2Q(32, 64, false, 64);
-    }
-  } else if (use_fp8_2q && block_rows == 64 && head_dim == 128) {
-    if (hnd_contiguous) {
-      SAGEATTN_LAUNCH_FP8_2Q(64, 128, true, 64);
-    } else {
-      SAGEATTN_LAUNCH_FP8_2Q(64, 128, false, 64);
-    }
-  } else if (use_fp8_2q && block_rows == 64) {
-    if (hnd_contiguous) {
-      SAGEATTN_LAUNCH_FP8_2Q(64, 64, true, 64);
-    } else {
-      SAGEATTN_LAUNCH_FP8_2Q(64, 64, false, 64);
-    }
-  } else if (use_fp8_2q && block_rows == 256 && head_dim == 128) {
-    if (hnd_contiguous) {
-      SAGEATTN_LAUNCH_FP8_2Q(64, 128, true, 256);
-    } else {
-      SAGEATTN_LAUNCH_FP8_2Q(64, 128, false, 256);
-    }
-  } else if (use_fp8_2q && block_rows == 256) {
-    if (hnd_contiguous) {
-      SAGEATTN_LAUNCH_FP8_2Q(64, 64, true, 256);
-    } else {
-      SAGEATTN_LAUNCH_FP8_2Q(64, 64, false, 256);
-    }
-  } else if (use_fp8_2q && block_cols == 32 && head_dim == 128) {
-    if (hnd_contiguous) {
-      SAGEATTN_LAUNCH_FP8_2Q(32, 128, true, 128);
-    } else {
-      SAGEATTN_LAUNCH_FP8_2Q(32, 128, false, 128);
-    }
-  } else if (use_fp8_2q && block_cols == 32) {
-    if (hnd_contiguous) {
-      SAGEATTN_LAUNCH_FP8_2Q(32, 64, true, 128);
-    } else {
-      SAGEATTN_LAUNCH_FP8_2Q(32, 64, false, 128);
-    }
-  } else if (use_fp8_2q && block_cols == 128 && head_dim == 128) {
-    qk_int8_sv_f8_native_2q_kernel<128, 128, 0, 8><<<grid, block, 0, stream>>>(
-        reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()),
-        reinterpret_cast<uint8_t*>(value.data_ptr()),
-        reinterpret_cast<__half*>(output.data_ptr()),
-        reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), value_scale_ptr,
-        batch, q_len, kv_len, q_heads, kv_heads,
-        query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1),
-        key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1),
-        value.stride(0), value.stride(tensor_layout == kNHD ? 1 : 2), value.stride(tensor_layout == kNHD ? 2 : 1),
-        output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1),
-        query_scale.stride(0), query_scale.stride(1),
-        key_scale.stride(0), key_scale.stride(1),
-        tensor_layout, sm_scale, use_per_thread_qk);
-  } else if (use_fp8_2q && block_cols == 128) {
-    qk_int8_sv_f8_native_2q_kernel<128, 64, 0, 4><<<grid, block, 0, stream>>>(
-        reinterpret_cast<int8_t*>(query.data_ptr()), reinterpret_cast<int8_t*>(key.data_ptr()),
-        reinterpret_cast<uint8_t*>(value.data_ptr()),
-        reinterpret_cast<__half*>(output.data_ptr()),
-        reinterpret_cast<float*>(query_scale.data_ptr()), reinterpret_cast<float*>(key_scale.data_ptr()), value_scale_ptr,
-        batch, q_len, kv_len, q_heads, kv_heads,
-        query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1),
-        key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1),
-        value.stride(0), value.stride(tensor_layout == kNHD ? 1 : 2), value.stride(tensor_layout == kNHD ? 2 : 1),
-        output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1),
-        query_scale.stride(0), query_scale.stride(1),
-        key_scale.stride(0), key_scale.stride(1),
-        tensor_layout, sm_scale, use_per_thread_qk);
-  } else if (use_fp8_2q && head_dim == 128) {
-    if (hnd_contiguous) {
-      SAGEATTN_LAUNCH_FP8_2Q(64, 128, true, 128);
-    } else {
-      SAGEATTN_LAUNCH_FP8_2Q(64, 128, false, 128);
-    }
   } else if (use_fp8_2q) {
-    if (hnd_contiguous) {
-      SAGEATTN_LAUNCH_FP8_2Q(64, 64, true, 128);
+    STD_TORCH_CHECK(block_cols == 64,
+                    "non-transposed fp8 value path currently supports BC64");
+    if (head_dim == 128) {
+      if (block_rows == 64) {
+        if (hnd_contiguous) {
+          SAGEATTN_LAUNCH_FP8_2Q(64, 128, true, 64);
+        } else {
+          SAGEATTN_LAUNCH_FP8_2Q(64, 128, false, 64);
+        }
+      } else {
+        if (hnd_contiguous) {
+          SAGEATTN_LAUNCH_FP8_2Q(64, 128, true, 128);
+        } else {
+          SAGEATTN_LAUNCH_FP8_2Q(64, 128, false, 128);
+        }
+      }
+    } else if (head_dim == 16) {
+      if (block_rows == 64) {
+        if (hnd_contiguous) {
+          SAGEATTN_LAUNCH_FP8_2Q(64, 16, true, 64);
+        } else {
+          SAGEATTN_LAUNCH_FP8_2Q(64, 16, false, 64);
+        }
+      } else {
+        if (hnd_contiguous) {
+          SAGEATTN_LAUNCH_FP8_2Q(64, 16, true, 128);
+        } else {
+          SAGEATTN_LAUNCH_FP8_2Q(64, 16, false, 128);
+        }
+      }
     } else {
-      SAGEATTN_LAUNCH_FP8_2Q(64, 64, false, 128);
+      if (block_rows == 64) {
+        if (hnd_contiguous) {
+          SAGEATTN_LAUNCH_FP8_2Q(64, 64, true, 64);
+        } else {
+          SAGEATTN_LAUNCH_FP8_2Q(64, 64, false, 64);
+        }
+      } else if (block_rows == 256) {
+        STD_TORCH_CHECK(!is_causal,
+                        "non-transposed fp8 D64 BR256 path is only non-causal");
+        if (hnd_contiguous) {
+          SAGEATTN_LAUNCH_FP8_2Q_NONCAUSAL(64, 64, true, 256);
+        } else {
+          SAGEATTN_LAUNCH_FP8_2Q_NONCAUSAL(64, 64, false, 256);
+        }
+      } else {
+        if (hnd_contiguous) {
+          SAGEATTN_LAUNCH_FP8_2Q(64, 64, true, 128);
+        } else {
+          SAGEATTN_LAUNCH_FP8_2Q(64, 64, false, 128);
+        }
+      }
     }
   }
 #if SAGEATTN_GFX12_BUILD_ATTN_FP8 && !SAGEATTN_GFX12_BUILD_ATTN_F16
@@ -8647,20 +8527,25 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   }
 #endif
 #endif // SAGEATTN_GFX12_BUILD_ATTN_FP8
+#undef SAGEATTN_LAUNCH_FP8_2Q_TV_NONCAUSAL
+#undef SAGEATTN_LAUNCH_FP8_2Q_TV
+#undef SAGEATTN_LAUNCH_FP8_2Q_TV_CAUSAL
+#undef SAGEATTN_LAUNCH_FP8_2Q_TV_OUT_NONCAUSAL
+#undef SAGEATTN_LAUNCH_FP8_2Q_TV_OUT
+#undef SAGEATTN_LAUNCH_FP8_2Q_TV_OUT_IMPL
+#undef SAGEATTN_LAUNCH_FP8_2Q_NONCAUSAL
+#undef SAGEATTN_LAUNCH_FP8_2Q
+#undef SAGEATTN_LAUNCH_FP8_2Q_OUT_NONCAUSAL
+#undef SAGEATTN_LAUNCH_FP8_2Q_OUT
+#undef SAGEATTN_LAUNCH_FP8_2Q_OUT_IMPL
 #if SAGEATTN_GFX12_BUILD_ATTN_F16
   else if (use_2q && value_transposed_hnd) {
     STD_TORCH_CHECK(hnd_contiguous, "transposed fp16 value path requires contiguous HND Q/K/O");
     if (head_dim == 128) {
-      if (block_rows == 32) {
-        SAGEATTN_LAUNCH_F16_D128_2Q_TV(64, 32, 4);
-      } else if (block_rows == 64) {
+      if (block_rows == 64) {
         SAGEATTN_LAUNCH_F16_D128_2Q_TV(64, 64, 4);
       } else if (block_rows == 256) {
         SAGEATTN_LAUNCH_F16_D128_2Q_TV(64, 256, 4);
-      } else if (block_rows == 512) {
-        SAGEATTN_LAUNCH_F16_D128_2Q_TV(64, 512, 4);
-      } else if (block_rows == 1024) {
-        SAGEATTN_LAUNCH_F16_D128_2Q_TV(64, 1024, 4);
       } else if (q_len >= 8192) {
         SAGEATTN_LAUNCH_F16_D128_2Q_TV(64, 128, 8);
       } else if (q_len >= 1024) {
@@ -8670,17 +8555,11 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       }
     } else if (head_dim == 16) {
       if (is_causal) {
-        if (block_rows == 32) {
-          SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 32, 4, true, true);
-        } else if (block_rows == 64) {
+        if (block_rows == 64) {
           SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 64, 4, true, true);
-        } else if (block_rows == 256) {
-          SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 256, 4, true, true);
         } else {
           SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 128, 4, true, true);
         }
-      } else if (block_rows == 32) {
-        SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 32, 4, false, true);
       } else if (block_rows == 64) {
         SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 64, 4, false, true);
       } else if (block_rows == 256) {
@@ -8688,44 +8567,16 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       } else {
         SAGEATTN_LAUNCH_F16_D16_2Q_TV(64, 128, 4, false, true);
       }
-    } else if (block_rows == 32) {
-      SAGEATTN_LAUNCH_F16_2Q_TV(64, 32, 4);
     } else if (block_rows == 64) {
       SAGEATTN_LAUNCH_F16_2Q_TV(64, 64, 4);
     } else if (block_rows == 256) {
       SAGEATTN_LAUNCH_F16_2Q_TV(64, 256, 4);
-    } else if (block_rows == 512) {
-      SAGEATTN_LAUNCH_F16_2Q_TV(64, 512, 4);
-    } else if (block_rows == 1024) {
-      SAGEATTN_LAUNCH_F16_2Q_TV(64, 1024, 4);
     } else if (q_len >= 8192) {
       SAGEATTN_LAUNCH_F16_2Q_TV(64, 128, 8);
     } else if (q_len >= 1024) {
       SAGEATTN_LAUNCH_F16_2Q_TV(64, 128, 4);
     } else {
       SAGEATTN_LAUNCH_F16_2Q_TV(64, 128, 16);
-    }
-  } else if (use_2q && block_cols == 128) {
-    if (hnd_contiguous) {
-      if (use_f16_tvload) {
-        if (block_rows == 64) {
-          SAGEATTN_LAUNCH_F16_2Q_TVLOAD(128, 64, 16);
-        } else {
-          SAGEATTN_LAUNCH_F16_2Q_TVLOAD(128, 128, 16);
-        }
-      } else {
-        if (block_rows == 64) {
-          SAGEATTN_LAUNCH_F16_2Q(128, true, 64);
-        } else {
-          SAGEATTN_LAUNCH_F16_2Q(128, true, 128);
-        }
-      }
-    } else {
-      if (block_rows == 64) {
-        SAGEATTN_LAUNCH_F16_2Q(128, false, 64);
-      } else {
-        SAGEATTN_LAUNCH_F16_2Q(128, false, 128);
-      }
     }
   } else if (use_2q) {
     if (hnd_contiguous) {
@@ -8757,10 +8608,6 @@ static Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         SAGEATTN_LAUNCH_F16_2Q(64, false, 128);
       }
     }
-  } else if (block_cols == 128 && block_rows == 128) {
-    SAGEATTN_LAUNCH_F16_1Q(128, 128);
-  } else if (block_cols == 128) {
-    SAGEATTN_LAUNCH_F16_1Q(128, 64);
   } else if (block_rows == 128) {
     SAGEATTN_LAUNCH_F16_1Q(64, 128);
   } else {
@@ -8826,6 +8673,9 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
   STD_TORCH_CHECK(output.scalar_type() == ScalarType::Half ||
                   output.scalar_type() == ScalarType::BFloat16,
               "raw-Q gfx12 attention output must be fp16 or bf16");
+  STD_TORCH_CHECK(output.scalar_type() == ScalarType::Half ||
+                  query.scalar_type() == ScalarType::BFloat16,
+              "raw-Q gfx12 attention supports bf16 output only with a bf16 query");
   STD_TORCH_CHECK(key_scale.scalar_type() == ScalarType::Float,
               "raw-Q gfx12 attention key_scale must be fp32");
   STD_TORCH_CHECK(tensor_layout == kHND || tensor_layout == kNHD, "invalid tensor_layout");
@@ -8977,79 +8827,103 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
 #define SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_) \
   SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_EX(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_, false, false, false, false, false)
 #define SAGEATTN_DISPATCH_RAWQ_FP8_OUT_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, QUERY_AT_T_) \
+  SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __half, QUERY_AT_T_, at::Half)
+#define SAGEATTN_DISPATCH_RAWQ_FP8_OUT_D256_BF16(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, QUERY_AT_T_) \
   if (output.scalar_type() == ScalarType::BFloat16) { \
     SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __hip_bfloat16, QUERY_AT_T_, at::BFloat16); \
   } else { \
-    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __half, QUERY_AT_T_, at::Half); \
+    SAGEATTN_DISPATCH_RAWQ_FP8_OUT_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, QUERY_AT_T_); \
   }
 #define SAGEATTN_DISPATCH_RAWQ_FP8_QUERY_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_) \
   if (query.scalar_type() == ScalarType::BFloat16) { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_OUT_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, __hip_bfloat16, at::BFloat16); \
+    SAGEATTN_DISPATCH_RAWQ_FP8_OUT_D256_BF16(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, __hip_bfloat16, at::BFloat16); \
   } else { \
     SAGEATTN_DISPATCH_RAWQ_FP8_OUT_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, __half, at::Half); \
   }
 #define SAGEATTN_DISPATCH_RAWQ_FP8_BR_D256(BC_, HND_, KEY_HND_, VT_, CAUSAL_) \
   if (block_rows == 64) { \
     SAGEATTN_DISPATCH_RAWQ_FP8_QUERY_D256(BC_, HND_, KEY_HND_, 64, VT_, CAUSAL_); \
-  } else if (block_rows == 256) { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY_D256(BC_, HND_, KEY_HND_, 256, VT_, CAUSAL_); \
   } else { \
     SAGEATTN_DISPATCH_RAWQ_FP8_QUERY_D256(BC_, HND_, KEY_HND_, 128, VT_, CAUSAL_); \
   }
 #define SAGEATTN_DISPATCH_RAWQ_FP8_OUT(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, QUERY_AT_T_) \
+  SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __half, QUERY_AT_T_, at::Half)
+#define SAGEATTN_DISPATCH_RAWQ_FP8_OUT_BF16(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, QUERY_AT_T_) \
   if (output.scalar_type() == ScalarType::BFloat16) { \
     SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __hip_bfloat16, QUERY_AT_T_, at::BFloat16); \
   } else { \
-    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __half, QUERY_AT_T_, at::Half); \
+    SAGEATTN_DISPATCH_RAWQ_FP8_OUT(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, QUERY_AT_T_); \
   }
 #define SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_) \
   if (query.scalar_type() == ScalarType::BFloat16) { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_OUT(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, __hip_bfloat16, at::BFloat16); \
+    SAGEATTN_DISPATCH_RAWQ_FP8_OUT_BF16(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, __hip_bfloat16, at::BFloat16); \
   } else { \
     SAGEATTN_DISPATCH_RAWQ_FP8_OUT(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, __half, at::Half); \
   }
-#define SAGEATTN_DISPATCH_RAWQ_FP8_BR(BC_, HD_, HND_, KEY_HND_, VT_, CAUSAL_) \
+#define SAGEATTN_DISPATCH_RAWQ_FP8_BR_NO_256(BC_, HD_, HND_, KEY_HND_, VT_, CAUSAL_) \
   if (block_rows == 64) { \
     SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(BC_, HD_, HND_, KEY_HND_, 64, VT_, CAUSAL_); \
-  } else if (block_rows == 256) { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(BC_, HD_, HND_, KEY_HND_, 256, VT_, CAUSAL_); \
   } else { \
     SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(BC_, HD_, HND_, KEY_HND_, 128, VT_, CAUSAL_); \
   }
-#define SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, HND_, KEY_HND_, VT_, CAUSAL_) \
-  if (head_dim == 16) { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_BR(BC_, 16, HND_, KEY_HND_, VT_, CAUSAL_); \
-  } else if (head_dim == 64) { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_BR(BC_, 64, HND_, KEY_HND_, VT_, CAUSAL_); \
-  } else if (head_dim == 128) { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_BR(BC_, 128, HND_, KEY_HND_, VT_, CAUSAL_); \
+#define SAGEATTN_DISPATCH_RAWQ_FP8_BR_D64_CAUSAL(BC_, HND_, KEY_HND_, VT_) \
+  if (block_rows == 64) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(BC_, 64, HND_, KEY_HND_, 64, VT_, true); \
   } else { \
-    SAGEATTN_DISPATCH_RAWQ_FP8_BR_D256(BC_, HND_, KEY_HND_, VT_, CAUSAL_); \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(BC_, 64, HND_, KEY_HND_, 128, VT_, true); \
+  }
+#define SAGEATTN_DISPATCH_RAWQ_FP8_BR_D64_NONCAUSAL(BC_, HND_, KEY_HND_, VT_) \
+  if (block_rows == 64) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(BC_, 64, HND_, KEY_HND_, 64, VT_, false); \
+  } else if (block_rows == 256) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(BC_, 64, HND_, KEY_HND_, 256, VT_, false); \
+  } else { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(BC_, 64, HND_, KEY_HND_, 128, VT_, false); \
+  }
+#define SAGEATTN_DISPATCH_RAWQ_FP8_HD_CAUSAL(BC_, HND_, KEY_HND_, VT_) \
+  if (head_dim == 16) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR_NO_256(BC_, 16, HND_, KEY_HND_, VT_, true); \
+  } else if (head_dim == 64) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR_D64_CAUSAL(BC_, HND_, KEY_HND_, VT_); \
+  } else if (head_dim == 128) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR_NO_256(BC_, 128, HND_, KEY_HND_, VT_, true); \
+  } else { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR_D256(BC_, HND_, KEY_HND_, VT_, true); \
+  }
+#define SAGEATTN_DISPATCH_RAWQ_FP8_HD_NONCAUSAL(BC_, HND_, KEY_HND_, VT_) \
+  if (head_dim == 16) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR_NO_256(BC_, 16, HND_, KEY_HND_, VT_, false); \
+  } else if (head_dim == 64) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR_D64_NONCAUSAL(BC_, HND_, KEY_HND_, VT_); \
+  } else if (head_dim == 128) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR_NO_256(BC_, 128, HND_, KEY_HND_, VT_, false); \
+  } else { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR_D256(BC_, HND_, KEY_HND_, VT_, false); \
   }
 #define SAGEATTN_DISPATCH_RAWQ_FP8_LAYOUT(BC_) \
   if (hnd_contiguous) { \
     if (is_causal) { \
-      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, true, true, true, true); } \
-      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, true, true, false, true); } \
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD_CAUSAL(BC_, true, true, true); } \
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD_CAUSAL(BC_, true, true, false); } \
     } else { \
-      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, true, true, true, false); } \
-      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, true, true, false, false); } \
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD_NONCAUSAL(BC_, true, true, true); } \
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD_NONCAUSAL(BC_, true, true, false); } \
     } \
   } else if (key_hnd_contiguous) { \
     if (is_causal) { \
-      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, true, true, true); } \
-      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, true, false, true); } \
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD_CAUSAL(BC_, false, true, true); } \
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD_CAUSAL(BC_, false, true, false); } \
     } else { \
-      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, true, true, false); } \
-      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, true, false, false); } \
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD_NONCAUSAL(BC_, false, true, true); } \
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD_NONCAUSAL(BC_, false, true, false); } \
     } \
   } else { \
     if (is_causal) { \
-      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, false, true, true); } \
-      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, false, false, true); } \
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD_CAUSAL(BC_, false, false, true); } \
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD_CAUSAL(BC_, false, false, false); } \
     } else { \
-      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, false, true, false); } \
-      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(BC_, false, false, false, false); } \
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD_NONCAUSAL(BC_, false, false, true); } \
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD_NONCAUSAL(BC_, false, false, false); } \
     } \
   }
 
@@ -9100,13 +8974,18 @@ static Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
   }
 
 #undef SAGEATTN_DISPATCH_RAWQ_FP8_LAYOUT
-#undef SAGEATTN_DISPATCH_RAWQ_FP8_HD
-#undef SAGEATTN_DISPATCH_RAWQ_FP8_BR
-#undef SAGEATTN_DISPATCH_RAWQ_FP8_QUERY
-#undef SAGEATTN_DISPATCH_RAWQ_FP8_OUT
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_HD_NONCAUSAL
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_HD_CAUSAL
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_BR_D64_NONCAUSAL
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_BR_D64_CAUSAL
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_BR_NO_256
 #undef SAGEATTN_DISPATCH_RAWQ_FP8_BR_D256
 #undef SAGEATTN_DISPATCH_RAWQ_FP8_QUERY_D256
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_OUT_D256_BF16
 #undef SAGEATTN_DISPATCH_RAWQ_FP8_OUT_D256
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_QUERY
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_OUT_BF16
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_OUT
 #undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED
 #undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256
 #undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256_STATIC_TWO
