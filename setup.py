@@ -93,10 +93,80 @@ def configure_rocm(default_rocm_home):
         os.path.join(rocm_home, "bin"),
         sdk_bin,
     ]
+
+    if os.name == "nt":
+        # The ninja link step invokes MSVC's link.exe / rc.exe by bare name.
+        # configure_rocm() runs inside the build subprocess, so the caller's
+        # shell PATH (which may lack a Developer Prompt) is not enough: add the
+        # MSVC and Windows SDK bin dirs explicitly (mirrors the downstream RDNA3
+        # fork). Without them ninja cannot spawn link.exe and fails with
+        # WinError 2 ("system cannot find the file specified").
+        msvc_link_dir = _find_msvc_bin_dir()
+        if msvc_link_dir:
+            path_parts.append(msvc_link_dir)
+        sdk_bin_dir = _find_windows_sdk_bin()
+        if sdk_bin_dir:
+            path_parts.append(sdk_bin_dir)
+
     os.environ["PATH"] = os.pathsep.join(
         unique_paths(path_parts) + [os.environ.get("PATH", "")]
     )
     return rocm_home
+
+
+def _find_msvc_bin_dir():
+    import glob
+    patterns = [
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64",
+        r"C:\Program Files\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64",
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2019\*\VC\Tools\MSVC\*\bin\Hostx64\x64",
+        r"C:\Program Files\Microsoft Visual Studio\2019\*\VC\Tools\MSVC\*\bin\Hostx64\x64",
+    ]
+    for pattern in patterns:
+        matches = sorted(glob.glob(pattern), reverse=True)
+        for m in matches:
+            if os.path.isfile(os.path.join(m, "link.exe")):
+                return m
+    return None
+
+
+def _find_windows_sdk_bin():
+    import glob
+    matches = sorted(
+        glob.glob(r"C:\Program Files (x86)\Windows Kits\10\bin\*\x64"),
+        reverse=True,
+    )
+    for m in matches:
+        if os.path.isfile(os.path.join(m, "rc.exe")):
+            return m
+    return None
+
+
+def _get_msvc_lib_dirs():
+    """Return MSVC + Windows SDK lib dirs that hold the CRT import libs
+    (msvcrt.lib, ucrt.lib, kernel32.lib, ...) required by the link step."""
+    import glob
+    dirs = []
+    msvc_patterns = [
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\lib\x64",
+        r"C:\Program Files\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\lib\x64",
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2019\*\VC\Tools\MSVC\*\lib\x64",
+        r"C:\Program Files\Microsoft Visual Studio\2019\*\VC\Tools\MSVC\*\lib\x64",
+    ]
+    for p in msvc_patterns:
+        matches = sorted(glob.glob(p), reverse=True)
+        if matches:
+            dirs.append(matches[0])
+            break
+    sdk_patterns = [
+        r"C:\Program Files (x86)\Windows Kits\10\Lib\*\ucrt\x64",
+        r"C:\Program Files (x86)\Windows Kits\10\Lib\*\um\x64",
+    ]
+    for sp in sdk_patterns:
+        matches = sorted(glob.glob(sp), reverse=True)
+        if matches:
+            dirs.append(matches[0])
+    return [d for d in dirs if os.path.isdir(d)]
 
 
 def rocm_arches(torch):
@@ -167,6 +237,11 @@ if not SKIP_CUDA_BUILD:
         if os.name == "nt":
             cxx_flags = ["/O2", "/permissive-", "-DENABLE_BF16"]
             link_flags = ["/Brepro"]
+            # The MSVC CRT import libs (msvcrt.lib etc.) live under the MSVC
+            # and Windows SDK lib dirs. Without them the link step fails with
+            # LNK1104: cannot open file "msvcrt.lib". Add them as /LIBPATH.
+            for d in _get_msvc_lib_dirs():
+                link_flags.append(f"/LIBPATH:{d}")
         else:
             abi = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0
             cxx_flags = [
@@ -227,7 +302,68 @@ if not SKIP_CUDA_BUILD:
             clang_driver=True,
         )
 
+        # ROCm/HIP native attention kernels (gfx103x / gfx110x) are ported from the
+        # downstream RDNA3 fork, which compiles them with -std=c++17 and WITHOUT the
+        # -nohipwrapperinc Windows flag. These kernels call device fmaxf/fabsf, which
+        # require HIP's wrapper-provided device math declarations that the upstream
+        # gfx12 (rocwmma) flag set omits. Build them with a dedicated flag set that
+        # mirrors the downstream's base_hip_flags().
+        if os.name == "nt":
+            gfx_native_abi = 0
+        else:
+            gfx_native_abi = abi
+        gfx_native_cxx_flags = [
+            "-O3",
+            "-std=c++17",
+            f"-D_GLIBCXX_USE_CXX11_ABI={gfx_native_abi}",
+        ] + limited_api_flags
+        gfx_native_hip_flags = [
+            "-O3",
+            "-std=c++17",
+            "-ffast-math",
+            "-fgpu-flush-denormals-to-zero",
+            "-fno-offload-uniform-block",
+            "-D__HIP_PLATFORM_AMD__=1",
+            "-U__HIP_NO_HALF_OPERATORS__",
+            "-U__HIP_NO_HALF_CONVERSIONS__",
+            f"-D_GLIBCXX_USE_CXX11_ABI={gfx_native_abi}",
+            "-mllvm", "--lsr-drop-solution=1",
+            "-mllvm", "-enable-post-misched=1",
+            "-mllvm", "-amdgpu-early-inline-all=true",
+            "-mllvm", "-amdgpu-function-calls=false",
+            "-mllvm", "-amdgpu-max-memory-clause=32",
+            "-mllvm", "-amdgpu-vgpr-index-mode=1",
+            "-DSAGEATTN_VT_GLOBAL=1",
+        ] + limited_api_flags
+        for arch in amd_arches:
+            if arch.startswith("gfx103") or arch.startswith("gfx110"):
+                gfx_native_hip_flags.append(f"--offload-arch={arch}")
+        gfx_native_hip_flags.append(f"--rocm-path={rocm_home}")
+        if os.path.isdir(rocm_device_lib_path):
+            gfx_native_hip_flags.append(
+                f"--rocm-device-lib-path={rocm_device_lib_path}"
+            )
+        append_env_flags(gfx_native_cxx_flags, "CXX_APPEND_FLAGS")
+        append_env_flags(gfx_native_hip_flags, "NVCC_APPEND_FLAGS")
+        append_env_flags(gfx_native_hip_flags, "HIPCC_APPEND_FLAGS")
+        add_windows_reproducible_path_flags(
+            gfx_native_cxx_flags,
+            gfx_native_hip_flags,
+            [
+                (os.path.dirname(os.path.abspath(__file__)), r"C:\reproducible\path\SageAttention"),
+                (os.path.dirname(os.path.abspath(torch.__file__)), r"C:\reproducible\path\torch"),
+            ],
+            clang_driver=True,
+        )
+
         include_dirs = unique_paths([os.path.join(rocm_home, "include")])
+
+        # ROCm/HIP native attention backends (gfx103x / gfx110x) include
+        # headers from the repository csrc/ root (e.g. reduction_utils.cuh).
+        rocm_native_include_dirs = unique_paths(
+            include_dirs
+            + [os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")]
+        )
 
         if any(arch.startswith("gfx12") for arch in amd_arches):
             ext_modules.append(
@@ -254,6 +390,42 @@ if not SKIP_CUDA_BUILD:
             warnings.warn(
                 "ROCm build detected, but no gfx12 architecture was selected; "
                 "skipping the gfx12 native attention extension."
+            )
+
+        if any(arch.startswith("gfx110") for arch in amd_arches):
+            ext_modules.append(
+                CUDAExtension(
+                    name="sageattention._qattn_gfx110x",
+                    sources=[
+                        "csrc/qattn/pybind_gfx110x.cpp",
+                        "csrc/qattn/attn_gfx110x.cu",
+                    ],
+                    include_dirs=rocm_native_include_dirs,
+                    extra_compile_args={
+                        "cxx": gfx_native_cxx_flags,
+                        "nvcc": gfx_native_hip_flags,
+                    },
+                    extra_link_args=link_flags,
+                    py_limited_api=True,
+                )
+            )
+
+        if any(arch.startswith("gfx103") for arch in amd_arches):
+            ext_modules.append(
+                CUDAExtension(
+                    name="sageattention._qattn_gfx103x",
+                    sources=[
+                        "csrc/qattn/pybind_gfx103x.cpp",
+                        "csrc/qattn/attn_gfx103x.cu",
+                    ],
+                    include_dirs=rocm_native_include_dirs,
+                    extra_compile_args={
+                        "cxx": gfx_native_cxx_flags,
+                        "nvcc": gfx_native_hip_flags,
+                    },
+                    extra_link_args=link_flags,
+                    py_limited_api=True,
+                )
             )
 
         ext_modules.append(

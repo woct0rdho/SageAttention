@@ -49,6 +49,7 @@ from .gfx12 import (
     gfx12_sageattn,
     sageattn_qk_int8_pv_gfx12_native,
 )
+from .gfx10x import gfx10x_sageattn
 
 from .quant import per_block_int8 as per_block_int8_cuda
 from .quant import per_warp_int8 as per_warp_int8_cuda
@@ -106,6 +107,7 @@ def sageattn(
     is_causal: bool = False,
     sm_scale: Optional[float] = None,
     return_lse: bool = False,
+    attn_mask: Optional[torch.Tensor] = None,
     **kwargs: Any,
 ):
     """
@@ -163,7 +165,9 @@ def sageattn(
     """
         
     arch = _cuda_archs[q.device.index]
-    if arch.startswith("gfx12"):
+    if arch.startswith("gfx103") or arch.startswith("gfx110"):
+        return gfx10x_sageattn(q, k, v, tensor_layout, is_causal, sm_scale, return_lse, kwargs)
+    elif arch.startswith("gfx12"):
         return gfx12_sageattn(q, k, v, tensor_layout, is_causal, sm_scale, return_lse, kwargs)
     elif arch == "sm75":
         return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
@@ -188,6 +192,27 @@ def sageattn(
         return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype=pv_accum_dtype)
     else:
         raise ValueError(f"Unsupported CUDA architecture: {arch}")
+
+
+def sageattn_qk_int8_pv_gfx10x_native(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    sm_scale: Optional[float] = None,
+    return_lse: bool = False,
+    **kwargs: Any,
+) -> torch.Tensor:
+    """ROCm gfx103x / gfx110x native SageAttention path (RDNA2 / RDNA3)."""
+    return gfx10x_sageattn(
+        q, k, v,
+        tensor_layout=tensor_layout,
+        is_causal=is_causal,
+        sm_scale=sm_scale,
+        return_lse=return_lse,
+        **kwargs,
+    )
 
 
 def sageattn_qk_int8_pv_fp16_triton(
