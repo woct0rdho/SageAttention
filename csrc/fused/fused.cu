@@ -42,6 +42,14 @@
 #if defined(__HIP_PLATFORM_AMD__)
 using nv_bfloat16 = __hip_bfloat16;
 using nv_bfloat162 = __hip_bfloat162;
+
+// HIP's <hip/hip_bfloat16.h> exposes the round-to-nearest-even float -> bfloat16
+// conversion as __float2bfloat16, while CUDA's <cuda_bf16.h> names the same
+// conversion __float2bfloat16_rn. Normalize both spellings to one helper so the
+// kernels below stay backend agnostic.
+__device__ __forceinline__ nv_bfloat16 float_to_bfloat16_rn(float val) { return __float2bfloat16(val); }
+#else
+__device__ __forceinline__ nv_bfloat16 float_to_bfloat16_rn(float val) { return __float2bfloat16_rn(val); }
 #endif
 
 using torch::stable::Tensor;
@@ -78,7 +86,7 @@ __device__ __forceinline__ T convert_from_float(float val)
   }
   else if constexpr (std::is_same<T, nv_bfloat16>::value)
   {
-    return __float2bfloat16_rn(val);
+    return float_to_bfloat16_rn(val);
   }
 }
 
